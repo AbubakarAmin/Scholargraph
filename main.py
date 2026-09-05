@@ -7,6 +7,8 @@ import os
 import sys
 import json
 import logging
+import argparse
+import re
 from pathlib import Path
 from typing import TypedDict, Dict, Any, List, Optional
 from datetime import datetime
@@ -15,16 +17,17 @@ from datetime import datetime
 sys.path.append(str(Path(__file__).parent))
 
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
 
 # Import core modules
 from core.config import config, validate_config
 from core.memory import memory
-from core.utils import setup_gemini, log_agent_action
+from core.utils import log_agent_action
+from core.run_log import start_run, get_tracker
+from core.verification import reproducibility_dossier
 
 # Import agents
 from agents.meta_agent import MetaAgent
-from agents.topic_hunter import TopicHunterAgent
+from agents.topic_hunter import TopicHunterAgent, ResearchSourceUnavailable
 from agents.hypothesis_debate import HypothesisDebateSystem
 from agents.planner import PlannerAgent
 from agents.writer import WriterAgent
@@ -77,6 +80,14 @@ class ResearchState(TypedDict):
     final_paper: Optional[Dict[str, Any]]
     latex_output: Optional[str]
 
+    # Bidirectional plan revision + observability
+    plan_revision_requests: List[Dict[str, Any]]
+    run_id: Optional[str]
+    results_redraft_count: int
+    results_verification: Dict[str, Any]
+    reproducibility: Dict[str, Any]
+    terminal_error: Optional[str]
+
 def initialize_state() -> ResearchState:
     """Initialize the research state."""
     return ResearchState(
@@ -97,12 +108,21 @@ def initialize_state() -> ResearchState:
         meta_feedback=[],
         final_paper=None,
         latex_output=None,
-        error_count=0
+        error_count=0,
+        plan_revision_requests=[],
+        run_id=None,
+        results_redraft_count=0,
+        results_verification={},
+        reproducibility={},
+        terminal_error=None,
     )
 
 def topic_discovery_node(state: ResearchState) -> ResearchState:
     """Discover research topics using TopicHunterAgent."""
     log_agent_action("Orchestrator", "start_topic_discovery", {"iteration": state["iteration"]})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("topic_discovery")
     
     try:
         hunter = TopicHunterAgent()
@@ -129,6 +149,15 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
         
         return state
         
+    except ResearchSourceUnavailable as e:
+        message = str(e)
+        logger.warning(message)
+        state["terminal_error"] = message
+        state["meta_feedback"].append(message)
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        log_agent_action("Orchestrator", "research_sources_unavailable", {"message": message})
+        return state
     except Exception as e:
         logger.error(f"Topic discovery failed: {e}")
         # If we've had too many errors, stop
@@ -143,6 +172,9 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
 def hypothesis_debate_node(state: ResearchState) -> ResearchState:
     """Conduct hypothesis debate for the selected topic."""
     log_agent_action("Orchestrator", "start_hypothesis_debate", {"topics_remaining": len(state["topics"])})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("hypothesis_debate")
     
     try:
         if not state["topics"]:
@@ -193,18 +225,6 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
     except Exception as e:
         logger.error(f"Hypothesis debate failed: {e}")
         state["meta_feedback"].append(f"Hypothesis debate error: {str(e)}")
-        # Try next topic if available, otherwise reset
-        if len(state["topics"]) > 1:
-            state["topics"] = state["topics"][1:]
-            log_agent_action("Orchestrator", "trying_next_topic_after_error", {"remaining_topics": len(state["topics"])})
-        else:
-            state["should_reset"] = True
-        return state
-        
-    except Exception as e:
-        logger.error(f"Hypothesis debate failed: {e}")
-        state["meta_feedback"].append(f"Hypothesis debate error: {str(e)}")
-        # Try next topic if available, otherwise reset
         if len(state["topics"]) > 1:
             state["topics"] = state["topics"][1:]
             log_agent_action("Orchestrator", "trying_next_topic_after_error", {"remaining_topics": len(state["topics"])})
@@ -213,8 +233,11 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
         return state
 
 def planning_node(state: ResearchState) -> ResearchState:
-    """Create research plan using PlannerAgent."""
+    """Create or revise research plan (bidirectional Engineer→Planner)."""
     log_agent_action("Orchestrator", "start_planning", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("planning")
     
     try:
         if not state["selected_topic"]:
@@ -222,9 +245,16 @@ def planning_node(state: ResearchState) -> ResearchState:
             return state
         
         planner = PlannerAgent()
-        plan = planner.create_plan(state["selected_topic"])
-        state["plan"] = plan
-        state["current_phase"] = "writing"
+        if state.get("plan") and state.get("plan_revision_requests"):
+            plan = state["plan"]
+            for req in state["plan_revision_requests"]:
+                plan = planner.revise_plan(plan, req, state["selected_topic"])
+            state["plan_revision_requests"] = []
+            state["plan"] = plan
+        else:
+            plan = planner.create_plan(state["selected_topic"])
+            state["plan"] = plan
+        state["current_phase"] = "writing_narrative"
         
         log_agent_action("Orchestrator", "plan_created", {"sections": len(plan.get("sections", []))})
         return state
@@ -235,9 +265,47 @@ def planning_node(state: ResearchState) -> ResearchState:
         state["meta_feedback"].append(f"Planning error: {str(e)}")
         return state
 
-def writing_node(state: ResearchState) -> ResearchState:
-    """Write paper sections using WriterAgent."""
-    log_agent_action("Orchestrator", "start_writing", {})
+NARRATIVE_SECTION_NAMES = {"abstract", "introduction", "related work", "methods", "method"}
+RESULTS_SECTION_NAMES = {"abstract", "results", "discussion", "conclusion", "experiments"}
+
+
+def _plan_section_names(plan: Dict[str, Any]) -> List[str]:
+    return [s.get("name", "Unknown") if isinstance(s, dict) else str(s) for s in plan.get("sections", [])]
+
+
+def _numeric_values(value: Any) -> List[float]:
+    """Collect numbers from raw experiment output, preserving only real numeric values."""
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, dict):
+        return [n for item in value.values() for n in _numeric_values(item)]
+    if isinstance(value, (list, tuple)):
+        return [n for item in value for n in _numeric_values(item)]
+    return []
+
+
+def verify_result_numbers(content: str, engineer_outputs: Dict[str, Any], rtol: float = 0.005) -> Dict[str, Any]:
+    """Ensure decimal/percentage claims in results prose originate in experiment output.
+
+    We intentionally inspect quantitative-looking claims only (decimal numbers and
+    percentages), avoiding harmless structural references such as "Section 2".
+    """
+    allowed = _numeric_values(engineer_outputs)
+    claims = [float(m.group(1)) / (100 if m.group(2) else 1) for m in re.finditer(r"(?<![\w.])(-?\d+(?:\.\d+)?)\s*(%)?", content)]
+    # Integer values are usually prose/section labels; check them only when written as percentages.
+    claims = [c for c in claims if not float(c).is_integer() or f"{int(c)}%" in content]
+    mismatches = [c for c in claims if not any(abs(c - raw) <= max(abs(raw) * rtol, 1e-6) for raw in allowed)]
+    return {"passed": bool(allowed) and not mismatches, "claims": claims, "allowed_values": allowed, "mismatches": mismatches}
+
+
+def write_narrative_sections(state: ResearchState) -> ResearchState:
+    """Draft non-result narrative before experiments; Methods contains no observed metrics."""
+    log_agent_action("Orchestrator", "start_writing_narrative", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("writing_narrative")
     
     try:
         if not state["plan"]:
@@ -245,23 +313,15 @@ def writing_node(state: ResearchState) -> ResearchState:
             return state
         
         writer = WriterAgent()
-        sections = state["plan"].get("sections", [])
-        
-        # Extract section names if sections are objects
-        section_names = []
-        for section in sections:
-            if isinstance(section, dict):
-                section_names.append(section.get("name", "Unknown"))
-            else:
-                section_names.append(section)
-        
-        for section_name in section_names:
+        for section_name in _plan_section_names(state["plan"]):
+            if section_name.lower() not in NARRATIVE_SECTION_NAMES:
+                continue
             if section_name not in state["draft_sections"]:
                 content = writer.draft_section(
                     section_name,
                     state["selected_topic"],
                     state["plan"],
-                    state["engineer_outputs"]
+                    {},  # narrative must not imply results before engineering
                 )
                 state["draft_sections"][section_name] = content
                 state["current_section"] = section_name
@@ -278,14 +338,59 @@ def writing_node(state: ResearchState) -> ResearchState:
         if state["error_count"] >= 3:
             state["should_reset"] = True
             return state
-        # Don't reset on writing errors, just continue to engineering
+        # Don't reset on narrative writing errors, just continue to engineering.
         state["current_phase"] = "engineering"
         state["error_count"] = 0  # Reset error count on success
         return state
 
+
+def write_results_sections(state: ResearchState) -> ResearchState:
+    """Write Results/Discussion and refresh Abstract only after engineering completes."""
+    log_agent_action("Orchestrator", "start_writing_results", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("writing_results")
+    if not state.get("plan"):
+        state["should_reset"] = True
+        return state
+    try:
+        writer = WriterAgent()
+        names = _plan_section_names(state["plan"])
+        # Ensure the required post-experiment sections exist even when an older plan omits one.
+        for required in ("Results", "Discussion", "Abstract"):
+            if not any(name.lower() == required.lower() for name in names):
+                names.append(required)
+        for section_name in names:
+            if section_name.lower() not in RESULTS_SECTION_NAMES:
+                continue
+            content = writer.draft_section(section_name, state["selected_topic"], state["plan"], state["engineer_outputs"])
+            state["draft_sections"][section_name] = content
+            state["current_section"] = section_name
+
+        checked = {name: verify_result_numbers(state["draft_sections"][name], state["engineer_outputs"])
+                   for name in names if name.lower() in RESULTS_SECTION_NAMES and name in state["draft_sections"]}
+        failures = {name: result for name, result in checked.items() if not result["passed"]}
+        state["results_verification"] = checked
+        if failures and state["results_redraft_count"] < 2:
+            state["results_redraft_count"] += 1
+            state["meta_feedback"].append(f"Results numeric grounding failed: {failures}")
+            state["current_phase"] = "writing_results"
+            log_agent_action("Orchestrator", "results_numeric_grounding_failed", {"sections": list(failures)})
+            return state
+        state["current_phase"] = "supervision"
+        return state
+    except Exception as e:
+        logger.error(f"Results writing failed: {e}")
+        state["meta_feedback"].append(f"Results writing error: {e}")
+        state["current_phase"] = "supervision"
+        return state
+
 def engineering_node(state: ResearchState) -> ResearchState:
-    """Run experiments using EngineerAgent."""
+    """Run branching experiment search + PIVOT/REFINE; may bounce to Planner."""
     log_agent_action("Orchestrator", "start_engineering", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("engineering")
     
     try:
         if not state["plan"]:
@@ -294,6 +399,35 @@ def engineering_node(state: ResearchState) -> ResearchState:
         
         engineer = EngineerAgent()
         experiments = state["plan"].get("experiments", [])
+        method_text = "\n".join(
+            state["draft_sections"].get(s, "")
+            for s in ("Methods", "Method", "Experiments")
+        )
+        
+        # Architecture 8.1: branch search when variants exist
+        branch_winner_name = None
+        if experiments and any(
+            isinstance(e, dict) and (e.get("variants") or e.get("alternatives"))
+            for e in experiments
+        ):
+            try:
+                if tracker:
+                    tracker.message("Engineering: branching cheap probes…")
+                branched = engineer.run_branching_search(
+                    [e for e in experiments if isinstance(e, dict)],
+                    method_description=method_text,
+                )
+                name = branched.get("experiment_name") or branched.get("approach") or "branch_winner"
+                branch_winner_name = name
+                state["engineer_outputs"][name] = branched
+                # Also alias under plan experiment name when possible
+                winner_label = (branched.get("branch_search") or {}).get("winner")
+                if winner_label and winner_label not in state["engineer_outputs"]:
+                    state["engineer_outputs"][winner_label] = branched
+            except Exception as e:
+                logger.error(f"Branching search failed: {e}")
+                if tracker:
+                    tracker.message(f"Branching search failed: {e}", level="error")
         
         for experiment in experiments:
             if isinstance(experiment, dict):
@@ -303,51 +437,84 @@ def engineering_node(state: ResearchState) -> ResearchState:
                 exp_name = str(experiment)
                 exp_config = {"name": exp_name}
             
-            if exp_name not in state["engineer_outputs"]:
-                try:
-                    output = engineer.run_experiment(exp_config)
-                    state["engineer_outputs"][exp_name] = output
-                    log_agent_action("Orchestrator", "experiment_run", {"experiment": exp_name})
-                except Exception as e:
-                    logger.error(f"Experiment {exp_name} failed: {e}")
-                    state["engineer_outputs"][exp_name] = {
-                        "success": False,
-                        "error": str(e),
-                        "experiment_name": exp_name
-                    }
+            # Skip if branching already produced this (or winner alias)
+            if exp_name in state["engineer_outputs"]:
+                continue
+            if branch_winner_name and exp_name == branch_winner_name:
+                continue
+            
+            try:
+                if tracker:
+                    tracker.message(f"Engineering: running {exp_name}")
+                alts = list(exp_config.get("variants") or exp_config.get("alternatives") or [])
+                output = engineer.run_experiment(
+                    exp_config,
+                    alternatives=alts,
+                    method_description=method_text,
+                )
+                state["engineer_outputs"][exp_name] = output
+                log_agent_action("Orchestrator", "experiment_run", {"experiment": exp_name})
+            except Exception as e:
+                logger.error(f"Experiment {exp_name} failed: {e}")
+                state["engineer_outputs"][exp_name] = {
+                    "success": False,
+                    "error": str(e),
+                    "experiment_name": exp_name,
+                }
         
-        state["current_phase"] = "supervision"
+        # Bidirectional: plan revision requests → re-enter planning
+        rev_reqs = engineer.consume_plan_revision_requests()
+        if rev_reqs:
+            state["plan_revision_requests"] = rev_reqs
+            state["current_phase"] = "planning"
+            # Keep prior outputs archived so Meta/UI can still summarize what failed
+            state["engineer_outputs"] = {
+                **{f"prior_{k}": v for k, v in state.get("engineer_outputs", {}).items()},
+            }
+            log_agent_action("Orchestrator", "plan_revision_requested", {"n": len(rev_reqs)})
+            return state
+        
+        state["current_phase"] = "writing_results"
         return state
         
     except Exception as e:
         logger.error(f"Engineering failed: {e}")
         state["meta_feedback"].append(f"Engineering error: {str(e)}")
         state["error_count"] += 1
-        # If too many consecutive errors, reset
         if state["error_count"] >= 3:
             state["should_reset"] = True
             return state
-        # Don't reset on engineering errors, just continue to supervision
-        state["current_phase"] = "supervision"
-        state["error_count"] = 0  # Reset error count on success
+        state["current_phase"] = "writing_results"
+        state["error_count"] = 0
         return state
 
 def supervision_node(state: ResearchState) -> ResearchState:
     """Evaluate quality using SupervisorAgent."""
     log_agent_action("Orchestrator", "start_supervision", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("supervision")
     
     try:
         supervisor = SupervisorAgent()
         
-        # Evaluate each section
+        # Evaluate each section (hard checks use engineer raw results)
         for section_name, content in state["draft_sections"].items():
             score, feedback = supervisor.evaluate_section(
                 section_name,
-                content
+                content,
+                engineer_outputs=state.get("engineer_outputs"),
             )
             state["supervisor_scores"][section_name] = score
             state["supervisor_feedback"][section_name] = feedback
+            if score < config.supervisor_threshold:
+                tracker = get_tracker()
+                if tracker:
+                    tracker.bump("sections_bounced")
         
+        state["reproducibility"] = reproducibility_dossier(state.get("plan"), state.get("engineer_outputs"))
+        if not state["reproducibility"]["passed"]:
+            state["meta_feedback"].append("Reproducibility dossier incomplete: " + json.dumps(state["reproducibility"]["checks"]))
         # Calculate overall score
         if state["supervisor_scores"]:
             overall_score = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
@@ -372,6 +539,9 @@ def supervision_node(state: ResearchState) -> ResearchState:
 def meta_evaluation_node(state: ResearchState) -> ResearchState:
     """Evaluate system performance using MetaAgent."""
     log_agent_action("Orchestrator", "start_meta_evaluation", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("meta_evaluation")
     
     try:
         meta_agent = MetaAgent()
@@ -387,7 +557,7 @@ def meta_evaluation_node(state: ResearchState) -> ResearchState:
         elif meta_agent.should_continue(state):
             state["should_continue"] = True
             state["iteration"] += 1
-            state["current_phase"] = "writing"  # Loop back to writing for revisions
+            state["current_phase"] = "writing_narrative"  # Loop back through both writing passes
             log_agent_action("Orchestrator", "meta_continue_triggered", {"iteration": state["iteration"]})
         else:
             state["should_continue"] = False
@@ -401,13 +571,16 @@ def meta_evaluation_node(state: ResearchState) -> ResearchState:
         # On meta evaluation error, increment iteration and continue
         state["iteration"] += 1
         state["should_continue"] = True
-        state["current_phase"] = "writing"  # Loop back to writing for revisions
+        state["current_phase"] = "writing_narrative"  # Loop back through both writing passes
         log_agent_action("Orchestrator", "meta_error_continue", {"iteration": state["iteration"]})
         return state
 
 def editing_node(state: ResearchState) -> ResearchState:
     """Generate final LaTeX output using EditorAgent."""
     log_agent_action("Orchestrator", "start_editing", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("editing")
     
     try:
         editor = EditorAgent()
@@ -416,7 +589,8 @@ def editing_node(state: ResearchState) -> ResearchState:
             state["selected_topic"],
             state["draft_sections"],
             state["plan"],
-            state["engineer_outputs"]
+            state["engineer_outputs"],
+            debate_results=state.get("debate_results"),
         )
         
         latex_output = editor.generate_latex(final_paper)
@@ -478,8 +652,9 @@ def create_research_graph() -> StateGraph:
     workflow.add_node("topic_discovery", topic_discovery_node)
     workflow.add_node("hypothesis_debate", hypothesis_debate_node)
     workflow.add_node("planning", planning_node)
-    workflow.add_node("writing", writing_node)
+    workflow.add_node("writing_narrative", write_narrative_sections)
     workflow.add_node("engineering", engineering_node)
+    workflow.add_node("writing_results", write_results_sections)
     workflow.add_node("supervision", supervision_node)
     workflow.add_node("meta_evaluation", meta_evaluation_node)
     workflow.add_node("editing", editing_node)
@@ -509,9 +684,23 @@ def create_research_graph() -> StateGraph:
         }
     )
     
-    workflow.add_edge("planning", "writing")
-    workflow.add_edge("writing", "engineering")
-    workflow.add_edge("engineering", "supervision")
+    workflow.add_edge("planning", "writing_narrative")
+    workflow.add_edge("writing_narrative", "engineering")
+    
+    # Engineer may bounce back to Planner for revision
+    workflow.add_conditional_edges(
+        "engineering",
+        lambda state: "planning" if state.get("current_phase") == "planning" else "writing_results",
+        {
+            "planning": "planning",
+            "writing_results": "writing_results",
+        },
+    )
+    workflow.add_conditional_edges(
+        "writing_results",
+        lambda state: "redraft" if state.get("current_phase") == "writing_results" else "supervision",
+        {"redraft": "writing_results", "supervision": "supervision"},
+    )
     
     workflow.add_conditional_edges(
         "supervision",
@@ -526,7 +715,7 @@ def create_research_graph() -> StateGraph:
         "meta_evaluation",
         should_continue,
         {
-            "continue": "writing",
+            "continue": "writing_narrative",
             "end": END
         }
     )
@@ -535,6 +724,21 @@ def create_research_graph() -> StateGraph:
     workflow.add_edge("reset", "topic_discovery")
     
     return workflow
+
+
+def create_checkpointer():
+    """Create the on-disk checkpoint store used by both CLI and web runs."""
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+    except ImportError as exc:
+        raise RuntimeError(
+            "Durable checkpoints require langgraph-checkpoint-sqlite; install requirements.txt."
+        ) from exc
+    checkpoint_path = Path(config.checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    # SqliteSaver owns the connection for the process lifetime.
+    import sqlite3
+    return SqliteSaver(sqlite3.connect(str(checkpoint_path), check_same_thread=False))
 
 def save_results(state: ResearchState, output_dir: str = None):
     """Save research results to files."""
@@ -600,23 +804,30 @@ def main():
         
         # Create the research graph
         workflow = create_research_graph()
-        app = workflow.compile(checkpointer=MemorySaver())
+        checkpointer = create_checkpointer()
+        app = workflow.compile(checkpointer=checkpointer)
         print("✅ Research workflow compiled")
         
-        # Initialize state
+        # Initialize state + run tracker (observability / UI events)
+        parser = argparse.ArgumentParser(description="Run or resume a ScholarGraph research workflow")
+        parser.add_argument("--resume", metavar="RUN_ID", help="resume a durable checkpoint by run id")
+        args = parser.parse_args()
+        tracker = start_run(args.resume)
         initial_state = initialize_state()
-        print("✅ Initial state created")
+        initial_state["run_id"] = args.resume or tracker.run_id
+        print(f"✅ Initial state created (run_id={tracker.run_id})")
         
         # Run the research workflow
         print("\n🚀 Starting research workflow...")
         print("=" * 50)
         
         config_dict = {
-            "configurable": {"thread_id": "research_session"},
+            "configurable": {"thread_id": initial_state["run_id"]},
             "recursion_limit": 1000  # Increase recursion limit to prevent infinite loop errors
         }
         
-        for event in app.stream(initial_state, config_dict):
+        # Supplying None resumes from the latest checkpoint; a new run supplies initial state.
+        for event in app.stream(None if args.resume else initial_state, config_dict):
             for node_name, node_output in event.items():
                 if node_name != "__end__":
                     state = node_output
@@ -654,6 +865,8 @@ def main():
         
         # Save results using the last known state
         save_results(state)
+        if tracker:
+            tracker.complete(success=bool(state.get("latex_output")))
         
         print("\n" + "=" * 50)
         print("🎉 Research workflow completed!")

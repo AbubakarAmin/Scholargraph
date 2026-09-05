@@ -1,453 +1,275 @@
 """
-EditorAgent - Assembles final LaTeX documents with proper formatting.
-Handles bibliography, figures, and publication-ready output.
+EditorAgent — submission-grade LaTeX, DOI bibliography, Limitations, companion repo.
+Provides create_final_paper / generate_latex expected by main.py.
 """
+
+from __future__ import annotations
 
 import json
 import os
-from typing import Dict, Any, List
-from datetime import datetime
+import re
 import subprocess
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import setup_gemini, call_gemini, log_agent_action
+from core.utils import call_llm, generate_embedding, log_agent_action
+from core.llm import get_llm_client
 from core.memory import memory
+from core.verification import extract_citation_ids, resolve_doi, resolve_arxiv
+
 
 class EditorAgent:
-    """Agent for assembling final research papers in LaTeX format."""
-    
     def __init__(self):
-        self.gemini_client = setup_gemini()
+        self.client = get_llm_client()
         self.output_dir = config.output_dir
+        self.companion_dir = config.companion_repo_dir
         os.makedirs(self.output_dir, exist_ok=True)
-    
-    def assemble_paper(self, topic: Dict[str, Any], sections: Dict[str, str], 
-                      plan: Dict[str, Any]) -> Dict[str, Any]:
-        """Assemble the final research paper."""
-        log_agent_action("EditorAgent", "start_assembly", {"topic": topic['title']})
-        
-        try:
-            # Generate LaTeX document
-            latex_content = self._generate_latex_document(topic, sections, plan)
-            
-            # Create bibliography
-            bibliography = self._generate_bibliography(topic, sections)
-            
-            # Add figures and tables
-            figures = self._add_figures_and_tables(sections)
-            
-            # Compile final document
-            final_document = self._compile_final_document(latex_content, bibliography, figures)
-            
-            # Generate output files
-            output_files = self._generate_output_files(final_document, topic)
-            
-            # Store in memory
-            self._store_paper(final_document, output_files, topic)
-            
-            log_agent_action("EditorAgent", "assembly_complete", {
-                "topic": topic['title'],
-                "output_files": list(output_files.keys())
-            })
-            
-            return {
-                'latex_file': output_files.get('latex_file'),
-                'pdf_file': output_files.get('pdf_file'),
-                'bib_file': output_files.get('bib_file'),
-                'zip_file': output_files.get('zip_file'),
-                'success': True,
-                'timestamp': str(datetime.now())
-            }
-            
-        except Exception as e:
-            log_agent_action("EditorAgent", "assembly_error", {"error": str(e)})
-            return {
-                'error': str(e),
-                'success': False,
-                'timestamp': str(datetime.now())
-            }
-    
-    def _generate_latex_document(self, topic: Dict[str, Any], sections: Dict[str, str], 
-                                plan: Dict[str, Any]) -> str:
-        """Generate the main LaTeX document."""
-        # Create document header
-        header = self._create_document_header(topic, plan)
-        
-        # Process sections
-        processed_sections = []
-        for section_name, content in sections.items():
-            processed_content = self._process_section_content(content, section_name)
-            processed_sections.append(processed_content)
-        
-        # Create document body
-        body = "\n\n".join(processed_sections)
-        
-        # Create document footer
-        footer = self._create_document_footer()
-        
-        return header + "\n\n" + body + "\n\n" + footer
-    
-    def _create_document_header(self, topic: Dict[str, Any], plan: Dict[str, Any]) -> str:
-        """Create the LaTeX document header."""
-        return f"""\\documentclass[11pt,a4paper]{{article}}
+        os.makedirs(self.companion_dir, exist_ok=True)
 
-% Packages
+    # --- API expected by main.py ---
+
+    def create_final_paper(
+        self,
+        topic: Dict[str, Any],
+        sections: Dict[str, str],
+        plan: Dict[str, Any],
+        engineer_outputs: Optional[Dict[str, Any]] = None,
+        debate_results: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        sections = dict(sections)
+        # Honest Limitations from unresolved Challenger objections
+        if "Limitations" not in sections or len(sections.get("Limitations", "")) < 80:
+            sections["Limitations"] = self._limitations_from_debate(debate_results, plan)
+
+        bib_entries, bib_map = self._bibliography_from_dois(sections)
+        companion = self._write_companion_repo(topic, plan, engineer_outputs or {})
+
+        return {
+            "topic": topic,
+            "sections": sections,
+            "plan": plan,
+            "engineer_outputs": engineer_outputs or {},
+            "bibliography": bib_entries,
+            "bib_map": bib_map,
+            "companion_repo": companion,
+            "debate_results": debate_results or [],
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def generate_latex(self, final_paper: Dict[str, Any]) -> str:
+        topic = final_paper["topic"]
+        sections = final_paper["sections"]
+        plan = final_paper.get("plan") or {}
+        bib = final_paper.get("bibliography") or ""
+        latex = self._generate_latex_document(topic, sections, plan)
+        # Attach resolved bib as comment + file write
+        bib_path = os.path.join(self.output_dir, "references.bib")
+        with open(bib_path, "w", encoding="utf-8") as f:
+            f.write(bib or "% no resolved citations\n")
+        latex_path = os.path.join(
+            self.output_dir, f"paper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex"
+        )
+        with open(latex_path, "w", encoding="utf-8") as f:
+            f.write(latex)
+        try:
+            memory.add_embedding(
+                generate_embedding(topic.get("title", "")),
+                {"type": "final_paper", "topic": topic.get("title"), "latex": latex_path},
+            )
+        except Exception:
+            pass
+        log_agent_action("EditorAgent", "latex_generated", {"path": latex_path})
+        return latex
+
+    def assemble_paper(
+        self,
+        topic: Dict[str, Any],
+        sections: Dict[str, str],
+        plan: Dict[str, Any],
+        engineer_outputs: Optional[Dict[str, Any]] = None,
+        debate_results: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        final = self.create_final_paper(
+            topic, sections, plan, engineer_outputs, debate_results
+        )
+        latex = self.generate_latex(final)
+        return {
+            "success": True,
+            "final_paper": final,
+            "latex": latex,
+            "latex_file": os.path.join(self.output_dir, "paper_output.tex"),
+            "bib_file": os.path.join(self.output_dir, "references.bib"),
+            "companion_repo": final.get("companion_repo"),
+            "timestamp": str(datetime.now()),
+        }
+
+    def _limitations_from_debate(
+        self,
+        debate_results: Optional[List[Any]],
+        plan: Dict[str, Any],
+    ) -> str:
+        objections = []
+        for d in debate_results or []:
+            unresolved = getattr(d, "unresolved_objections", None)
+            if unresolved is None and isinstance(d, dict):
+                unresolved = d.get("unresolved_objections") or []
+            objections.extend(unresolved or [])
+        if not objections:
+            # Fall back to plan flags
+            objections = (plan or {}).get("unfalsifiable_flags") or [
+                "Results are based on synthetic or limited public data.",
+                "Compute budget constrained sandbox experiments; scale-up unverified.",
+            ]
+        bullets = "\n".join(f"- {o}" for o in objections[:12])
+        return (
+            "# Limitations\n\n"
+            "The following limitations are carried forward from adversarial debate "
+            "and planning checks (unresolved objections and unverified assumptions):\n\n"
+            f"{bullets}\n"
+        )
+
+    def _bibliography_from_dois(self, sections: Dict[str, str]) -> tuple:
+        text = "\n".join(sections.values())
+        ids = extract_citation_ids(text)
+        entries = []
+        bib_map = {}
+        idx = 1
+        for doi in ids["dois"]:
+            info = resolve_doi(doi)
+            if not info.get("resolved"):
+                continue
+            key = f"doi{idx:03d}"
+            title = (info.get("title") or "Untitled").replace("{", "").replace("}", "")
+            year = info.get("year") or "n.d."
+            journal = (info.get("container") or "Journal").replace("{", "").replace("}", "")
+            entries.append(
+                f"@article{{{key},\n"
+                f"  title={{{title}}},\n"
+                f"  year={{{year}}},\n"
+                f"  journal={{{journal}}},\n"
+                f"  doi={{{doi}}}\n}}"
+            )
+            bib_map[doi] = key
+            idx += 1
+        for aid in ids["arxiv_ids"]:
+            info = resolve_arxiv(aid)
+            if not info.get("resolved"):
+                continue
+            key = f"arxiv{idx:03d}"
+            title = (info.get("title") or aid).replace("{", "").replace("}", "")
+            entries.append(
+                f"@article{{{key},\n"
+                f"  title={{{title}}},\n"
+                f"  year={{20{aid[:2]}}},\n"
+                f"  journal={{arXiv}},\n"
+                f"  eprint={{{aid}}}\n}}"
+            )
+            bib_map[aid] = key
+            idx += 1
+        return "\n\n".join(entries), bib_map
+
+    def _write_companion_repo(
+        self,
+        topic: Dict[str, Any],
+        plan: Dict[str, Any],
+        engineer_outputs: Dict[str, Any],
+    ) -> Dict[str, str]:
+        root = Path(self.companion_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "experiments").mkdir(exist_ok=True)
+
+        req = "numpy\npandas\nscikit-learn\nmatplotlib\nscipy\n"
+        (root / "requirements.txt").write_text(req, encoding="utf-8")
+
+        readme = f"""# Companion code — {topic.get('title', 'Research')}
+
+Auto-generated by ScholarGraph Editor.
+
+## Setup
+```bash
+pip install -r requirements.txt
+python run_experiments.py
+```
+
+## Experiments
+See `experiments/` for code snapshots from the Engineer agent.
+Raw multi-seed results live alongside the paper outputs.
+"""
+        (root / "README.md").write_text(readme, encoding="utf-8")
+
+        runner_lines = [
+            '"""Entry point for companion experiments."""',
+            "import json",
+            "from pathlib import Path",
+            "",
+            "def main():",
+            "    print('Companion experiments')",
+            "    for p in Path('experiments').glob('*.py'):",
+            "        print(' -', p.name)",
+            "",
+            "if __name__ == '__main__':",
+            "    main()",
+        ]
+        (root / "run_experiments.py").write_text("\n".join(runner_lines) + "\n", encoding="utf-8")
+
+        paths = {"readme": str(root / "README.md"), "requirements": str(root / "requirements.txt")}
+        for name, out in engineer_outputs.items():
+            code = out.get("code") if isinstance(out, dict) else None
+            if code:
+                safe = re.sub(r"[^\w\-]+", "_", name)[:60]
+                path = root / "experiments" / f"{safe}.py"
+                path.write_text(code, encoding="utf-8")
+                paths[safe] = str(path)
+        return paths
+
+    def _generate_latex_document(self, topic, sections, plan) -> str:
+        abstract = self._extract_abstract(sections) if sections.get("Abstract") else topic.get("description", "")
+        header = self._create_document_header(topic, plan, abstract)
+        body_parts = []
+        order = [
+            "Introduction", "Related Work", "Methods", "Experiments",
+            "Results", "Discussion", "Limitations", "Conclusion",
+        ]
+        seen = set()
+        for name in order:
+            if name in sections and name != "Abstract":
+                body_parts.append(f"\\section{{{name}}}\n\n{self._process_section_content(sections[name], name)}\n")
+                seen.add(name)
+        for name, content in sections.items():
+            if name not in seen and name != "Abstract":
+                body_parts.append(f"\\section{{{name}}}\n\n{self._process_section_content(content, name)}\n")
+        footer = self._create_document_footer()
+        return header + "\n\n" + "\n\n".join(body_parts) + "\n\n" + footer
+
+    def _create_document_header(self, topic, plan, abstract: str = "") -> str:
+        abs_block = abstract.replace("&", "\\&") if abstract else "Abstract pending."
+        return f"""\\documentclass[11pt,a4paper]{{article}}
 \\usepackage[utf8]{{inputenc}}
 \\usepackage[T1]{{fontenc}}
-\\usepackage{{amsmath}}
-\\usepackage{{amsfonts}}
-\\usepackage{{amssymb}}
-\\usepackage{{graphicx}}
-\\usepackage{{hyperref}}
-\\usepackage{{geometry}}
-\\usepackage{{natbib}}
-\\usepackage{{algorithm}}
-\\usepackage{{algorithmic}}
-\\usepackage{{booktabs}}
-\\usepackage{{multirow}}
-\\usepackage{{array}}
-
-% Page setup
+\\usepackage{{amsmath,amssymb,amsfonts}}
+\\usepackage{{graphicx,hyperref,geometry,natbib,booktabs}}
 \\geometry{{margin=1in}}
-
-% Hyperref setup
-\\hypersetup{{
-    colorlinks=true,
-    linkcolor=blue,
-    filecolor=magenta,      
-    urlcolor=cyan,
-    citecolor=blue
-}}
-
-% Title and author
-\\title{{{topic['title']}}}
-\\author{{AI Research System}}
+\\title{{{topic.get('title', 'Research Paper')}}}
+\\author{{ScholarGraph Research System}}
 \\date{{\\today}}
-
 \\begin{{document}}
-
 \\maketitle
-
 \\begin{{abstract}}
-{self._extract_abstract(sections) if 'Abstract' in sections else 'Abstract to be added.'}
+{abs_block}
 \\end{{abstract}}
-
-\\tableofcontents
-\\newpage
 """
-    
+
     def _create_document_footer(self) -> str:
-        """Create the LaTeX document footer."""
-        return """
-\\bibliographystyle{plain}
-\\bibliography{references}
+        return "\\bibliographystyle{plain}\n\\bibliography{references}\n\\end{document}\n"
 
-\\end{document}
-"""
-    
     def _process_section_content(self, content: str, section_name: str) -> str:
-        """Process section content for LaTeX formatting."""
-        # Remove markdown headers
-        content = content.replace('# ', '\\section{').replace('#', '}')
-        content = content.replace('## ', '\\subsection{').replace('##', '}')
-        content = content.replace('### ', '\\subsubsection{').replace('###', '}')
-        
-        # Convert code blocks
-        content = self._convert_code_blocks(content)
-        
-        # Convert inline code
-        content = self._convert_inline_code(content)
-        
-        # Convert lists
-        content = self._convert_lists(content)
-        
-        # Convert emphasis
-        content = content.replace('**', '\\textbf{').replace('**', '}')
-        content = content.replace('*', '\\textit{').replace('*', '}')
-        
-        return content
-    
-    def _convert_code_blocks(self, content: str) -> str:
-        """Convert markdown code blocks to LaTeX."""
-        import re
-        
-        # Find code blocks
-        pattern = r'```(\w+)?\n(.*?)\n```'
-        
-        def replace_code_block(match):
-            lang = match.group(1) or 'text'
-            code = match.group(2)
-            
-            # Escape LaTeX special characters
-            code = code.replace('\\', '\\textbackslash{}')
-            code = code.replace('{', '\\{')
-            code = code.replace('}', '\\}')
-            code = code.replace('^', '\\textasciicircum{}')
-            code = code.replace('_', '\\_')
-            code = code.replace('%', '\\%')
-            code = code.replace('$', '\\$')
-            code = code.replace('#', '\\#')
-            code = code.replace('&', '\\&')
-            
-            return f'\\begin{{verbatim}}\n{code}\n\\end{{verbatim}}'
-        
-        return re.sub(pattern, replace_code_block, content, flags=re.DOTALL)
-    
-    def _convert_inline_code(self, content: str) -> str:
-        """Convert inline code to LaTeX."""
-        import re
-        
-        # Find inline code
-        pattern = r'`([^`]+)`'
-        
-        def replace_inline_code(match):
-            code = match.group(1)
-            # Escape LaTeX special characters
-            code = code.replace('\\', '\\textbackslash{}')
-            code = code.replace('{', '\\{')
-            code = code.replace('}', '\\}')
-            code = code.replace('_', '\\_')
-            return f'\\texttt{{{code}}}'
-        
-        return re.sub(pattern, replace_inline_code, content)
-    
-    def _convert_lists(self, content: str) -> str:
-        """Convert markdown lists to LaTeX."""
-        lines = content.split('\n')
-        in_list = False
-        result = []
-        
-        for line in lines:
-            if line.strip().startswith('- '):
-                if not in_list:
-                    result.append('\\begin{itemize}')
-                    in_list = True
-                item = line.strip()[2:]  # Remove '- '
-                result.append(f'\\item {item}')
-            elif line.strip().startswith('1. '):
-                if not in_list:
-                    result.append('\\begin{enumerate}')
-                    in_list = True
-                item = line.strip()[3:]  # Remove '1. '
-                result.append(f'\\item {item}')
-            else:
-                if in_list:
-                    result.append('\\end{itemize}' if '- ' in content else '\\end{enumerate}')
-                    in_list = False
-                result.append(line)
-        
-        if in_list:
-            result.append('\\end{itemize}' if '- ' in content else '\\end{enumerate}')
-        
-        return '\n'.join(result)
-    
-    def _extract_abstract(self, sections: Dict[str, str]) -> str:
-        """Extract abstract content from sections."""
-        if 'Abstract' in sections:
-            abstract = sections['Abstract']
-            # Remove markdown formatting
-            abstract = abstract.replace('# Abstract', '').strip()
-            return abstract
-        return "Abstract to be added."
-    
-    def _generate_bibliography(self, topic: Dict[str, Any], sections: Dict[str, str]) -> str:
-        """Generate bibliography entries."""
-        # Extract citations from all sections
-        all_citations = []
-        for section_name, content in sections.items():
-            citations = self._extract_citations_from_text(content)
-            all_citations.extend(citations)
-        
-        # Remove duplicates
-        unique_citations = list(set(all_citations))
-        
-        # Generate BibTeX entries
-        bibtex_entries = []
-        for i, citation in enumerate(unique_citations):
-            bibtex_entry = self._generate_bibtex_entry(citation, i + 1)
-            bibtex_entries.append(bibtex_entry)
-        
-        return "\n\n".join(bibtex_entries)
-    
-    def _extract_citations_from_text(self, text: str) -> List[str]:
-        """Extract citation patterns from text."""
-        import re
-        
-        # Common citation patterns
-        patterns = [
-            r'\[([^\]]+)\]',  # [Author et al., 2023]
-            r'\(([^)]+)\)',   # (Author et al., 2023)
-            r'Author et al\.\s+\d{4}',  # Author et al. 2023
-        ]
-        
-        citations = []
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            citations.extend(matches)
-        
-        return list(set(citations))
-    
-    def _generate_bibtex_entry(self, citation: str, index: int) -> str:
-        """Generate a BibTeX entry for a citation."""
-        # Generate a key based on the citation
-        key = f"ref{index:03d}"
-        
-        # Try to extract author and year from citation
-        import re
-        year_match = re.search(r'\d{4}', citation)
-        year = year_match.group() if year_match else "2023"
-        
-        author = citation.replace(year, '').strip()
-        if author.endswith(','):
-            author = author[:-1]
-        
-        return f"""@article{{{key},
-  title={{{citation}}},
-  author={{{author}}},
-  year={{{year}}},
-  journal={{arXiv preprint}},
-  doi={{10.1000/000000}}
-}}"""
-    
-    def _add_figures_and_tables(self, sections: Dict[str, str]) -> List[str]:
-        """Add figures and tables to the document."""
-        figures = []
-        
-        # Look for figure references in sections
-        for section_name, content in sections.items():
-            if 'figure' in content.lower() or 'plot' in content.lower():
-                # Generate a figure placeholder
-                figure_path = f"figures/{section_name.lower().replace(' ', '_')}.png"
-                figures.append(figure_path)
-        
-        return figures
-    
-    def _compile_final_document(self, latex_content: str, bibliography: str, 
-                               figures: List[str]) -> str:
-        """Compile the final document with all components."""
-        # Add bibliography to the document
-        if bibliography:
-            # Replace bibliography placeholder
-            latex_content = latex_content.replace('\\bibliography{references}', 
-                                               f'\\bibliography{{references}}\n\n% Bibliography entries:\n{bibliography}')
-        
-        # Add figure includes
-        for figure in figures:
-            if os.path.exists(figure):
-                latex_content = latex_content.replace('\\end{document}', 
-                                                   f'\\includegraphics[width=0.8\\textwidth]{{{figure}}}\n\\end{{document}}')
-        
-        return latex_content
-    
-    def _generate_output_files(self, final_document: str, topic: Dict[str, Any]) -> Dict[str, str]:
-        """Generate all output files."""
-        output_files = {}
-        
-        # Generate LaTeX file
-        latex_filename = f"paper_{datetime.now().strftime('%Y%m%d_%H%M%S')}.tex"
-        latex_path = os.path.join(self.output_dir, latex_filename)
-        
-        with open(latex_path, 'w', encoding='utf-8') as f:
-            f.write(final_document)
-        
-        output_files['latex_file'] = latex_path
-        
-        # Generate bibliography file
-        bib_filename = "references.bib"
-        bib_path = os.path.join(self.output_dir, bib_filename)
-        
-        # Extract bibliography from document
-        bib_start = final_document.find('% Bibliography entries:')
-        if bib_start != -1:
-            bib_content = final_document[bib_start:].replace('% Bibliography entries:', '').strip()
-            with open(bib_path, 'w', encoding='utf-8') as f:
-                f.write(bib_content)
-            output_files['bib_file'] = bib_path
-        
-        # Try to compile PDF
-        try:
-            pdf_filename = latex_filename.replace('.tex', '.pdf')
-            pdf_path = os.path.join(self.output_dir, pdf_filename)
-            
-            # Run pdflatex
-            result = subprocess.run([
-                'pdflatex', '-interaction=nonstopmode', '-output-directory', self.output_dir, latex_path
-            ], capture_output=True, text=True)
-            
-            if result.returncode == 0 and os.path.exists(pdf_path):
-                output_files['pdf_file'] = pdf_path
-            else:
-                log_agent_action("EditorAgent", "pdf_compilation_failed", {
-                    "error": result.stderr,
-                    "latex_file": latex_path
-                })
-                
-        except Exception as e:
-            log_agent_action("EditorAgent", "pdf_compilation_error", {"error": str(e)})
-        
-        # Create ZIP file with all outputs
-        try:
-            import zipfile
-            zip_filename = f"paper_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-            zip_path = os.path.join(self.output_dir, zip_filename)
-            
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
-                for file_type, file_path in output_files.items():
-                    if os.path.exists(file_path):
-                        zipf.write(file_path, os.path.basename(file_path))
-            
-            output_files['zip_file'] = zip_path
-            
-        except Exception as e:
-            log_agent_action("EditorAgent", "zip_creation_error", {"error": str(e)})
-        
-        return output_files
-    
-    def _store_paper(self, final_document: str, output_files: Dict[str, str], topic: Dict[str, Any]):
-        """Store the paper in memory."""
-        try:
-            # Store in memory
-            memory.add_embedding(
-                generate_embedding(final_document, self.gemini_client),
-                {
-                    'type': 'final_paper',
-                    'topic': topic['title'],
-                    'output_files': output_files,
-                    'document_length': len(final_document),
-                    'timestamp': str(datetime.now())
-                }
-            )
-            
-        except Exception as e:
-            log_agent_action("EditorAgent", "storage_error", {"error": str(e)})
+        content = re.sub(r"^#+\s*.*$", "", content, flags=re.MULTILINE)
+        content = content.replace("&", "\\&").replace("%", "\\%")
+        return content.strip()
 
-# Example usage
-if __name__ == "__main__":
-    editor = EditorAgent()
-    
-    example_topic = {
-        'title': 'Novel Attention Mechanisms for Transformer Models',
-        'description': 'Developing new attention mechanisms that improve efficiency and interpretability'
-    }
-    
-    example_sections = {
-        'Abstract': '# Abstract\nThis paper presents novel attention mechanisms for transformer models.',
-        'Introduction': '# Introduction\nTransformer models have revolutionized natural language processing.',
-        'Methods': '# Methods\nWe propose a new attention mechanism that improves efficiency.',
-        'Results': '# Results\nOur experiments show significant improvements over baseline methods.'
-    }
-    
-    example_plan = {
-        'title': 'Research on Novel Attention Mechanisms',
-        'sections': [
-            {'name': 'Abstract', 'content_requirements': 'Brief summary'},
-            {'name': 'Introduction', 'content_requirements': 'Motivation and problem statement'},
-            {'name': 'Methods', 'content_requirements': 'Methodology description'},
-            {'name': 'Results', 'content_requirements': 'Experimental results'}
-        ]
-    }
-    
-    result = editor.assemble_paper(example_topic, example_sections, example_plan)
-    print(f"Paper assembly completed: {result['success']}")
-    if 'latex_file' in result:
-        print(f"LaTeX file: {result['latex_file']}") 
+    def _extract_abstract(self, sections: Dict[str, str]) -> str:
+        if "Abstract" in sections:
+            return re.sub(r"^#+\s*Abstract\s*", "", sections["Abstract"]).strip()
+        return "Abstract to be added."

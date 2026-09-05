@@ -1,31 +1,60 @@
-# Google Gemini API (Required)
-# Get from: https://makersuite.google.com/app/apikey
-GOOGLE_API_KEY=your_gemini_api_key_here
+# ScholarGraph → Research-Grade Upgrade
+# Copy to .env and fill in the keys you use.
 
-# OpenAlex Configuration (no API key required, just email for rate limiting)
-OPENALEX_EMAIL=darkdevil034477@gmail.com
+# --- LLM Provider: gemini | openai | openai_compatible ---
+LLM_PROVIDER=gemini
 
-# OpenAI API (Optional - for additional LLM capabilities)
-# Get from: https://platform.openai.com/api-keys
-OPENAI_API_KEY=your_openai_api_key_here
+# Gemini (when LLM_PROVIDER=gemini)
+# https://aistudio.google.com/apikey
+GOOGLE_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_EMBEDDING_MODEL=text-embedding-004
 
-# Scite.ai API (Optional - for claim verification)
-# Get from: https://scite.ai/api
-SCITE_API_KEY=your_scite_api_key_here
+# OpenAI or any OpenAI-compatible endpoint
+# (OpenAI, OpenRouter, Groq, Together, Azure-compatible, local vLLM/Ollama)
+# https://platform.openai.com/api-keys
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 
-# System Configuration
-RESEARCH_DOMAIN=computer_science  # or physics, biology, etc.
+# Cost-aware routing (optional overrides)
+# LLM_MODEL_CHEAP=gemini-2.5-flash-lite
+# LLM_MODEL_STRONG=gemini-2.5-pro
+# LLM_MODEL_JUDGE=gemini-2.5-pro
+# ENSEMBLE_JUDGE_MODELS=gemini-2.5-flash,gemini-2.5-pro
+
+# OpenAlex (required for topic search rate-limit identity)
+OPENALEX_EMAIL=you@example.com
+
+# Optional APIs
+SEMANTIC_SCHOLAR_API_KEY=
+SCITE_API_KEY=
+
+# System
+RESEARCH_DOMAIN=computer_science
 MAX_ITERATIONS=10
 SUPERVISOR_THRESHOLD=8.5
+DEBATE_PASS_THRESHOLD=7.5
+DEBATE_MIN_ROUNDS=2
+DEBATE_MAX_ROUNDS=4
+NOVELTY_SIMILARITY_REJECT=0.88
+EXPERIMENT_SEEDS=3
+EXPERIMENT_BRANCH_COUNT=3
 DEBUG_MODE=true
 LOG_LEVEL=INFO
+LLM_REQUEST_INTERVAL=1.0
 
-# Memory Configuration
+# Paths
 VECTOR_DB_PATH=./memory/vector_db
-MEMORY_SIZE=10000
-
-# Output Configuration
+CROSS_RUN_MEMORY_PATH=./memory/cross_run.jsonl
+RUN_LOG_PATH=./output/run_scratchpad.jsonl
+RUN_EVENTS_PATH=./output/run_events.jsonl
 OUTPUT_DIR=./output
-DRAFT_VERSIONS_DIR=./output/draft_versions
-DEBATE_LOG_PATH=./output/debate_log.txt
-FEEDBACK_LOG_PATH=./output/feedback_log.json 
+RAW_RESULTS_DIR=./output/raw_results
+COMPANION_REPO_DIR=./output/companion_repo
+KEYS_STORE_PATH=./memory/keys.json
+
+# Web UI
+WEB_HOST=127.0.0.1
+WEB_PORT=8765

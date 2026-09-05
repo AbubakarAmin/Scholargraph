@@ -157,5 +157,14 @@ class ResearchMemory:
         scores = [entry["score"] for entry in recent_feedback]
         return sum(scores) / len(scores)
 
+    def clear_all(self):
+        """Clear all in-memory and on-disk memory data."""
+        self.index = faiss.IndexFlatL2(self.dimension)
+        self.metadata = []
+        self.debate_log = []
+        self.feedback_log = []
+        self.save()
+
 # Global memory instance
-memory = ResearchMemory() 
+memory = ResearchMemory()
+ 

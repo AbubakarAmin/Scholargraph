@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from core.config import config
-from core.utils import setup_gemini, call_gemini, log_agent_action, extract_citations
+from core.utils import setup_gemini, call_gemini, log_agent_action, extract_citations, generate_embedding
 from core.memory import memory
 
 class WriterAgent:
@@ -38,6 +38,8 @@ class WriterAgent:
             content = self._draft_experiments(topic, plan, engineer_outputs)
         elif section_name.lower() == 'results':
             content = self._draft_results(topic, plan, engineer_outputs)
+        elif section_name.lower() == 'discussion':
+            content = self._draft_discussion(topic, plan, engineer_outputs)
         elif section_name.lower() == 'conclusion':
             content = self._draft_conclusion(topic, plan, engineer_outputs)
         else:
@@ -264,6 +266,26 @@ class WriterAgent:
         except Exception as e:
             log_agent_action("WriterAgent", "conclusion_error", {"error": str(e)})
             return self._create_fallback_conclusion(topic, plan)
+
+    def _draft_discussion(self, topic: Dict[str, Any], plan: Dict[str, Any],
+                          engineer_outputs: Dict[str, Any]) -> str:
+        """Interpret results after engineering without introducing new measurements."""
+        prompt = f"""
+Write the Discussion section for this paper.
+Topic: {topic['title']}
+Experimental source of truth:
+{self._format_engineer_outputs(engineer_outputs)}
+
+Interpret implications, limitations, and failures. Any quantitative statement must
+be copied from the experimental source of truth above; do not estimate, fabricate,
+or introduce a new number. If a measurement is absent, describe it qualitatively.
+"""
+        try:
+            content = call_gemini(prompt, self.gemini_client, temperature=0.5)
+            return self._format_section_content(content, "Discussion")
+        except Exception as e:
+            log_agent_action("WriterAgent", "discussion_error", {"error": str(e)})
+            return "# Discussion\n\nThe observed experimental results are interpreted using the recorded outputs; no additional measurements are claimed."
     
     def _draft_generic_section(self, section_name: str, topic: Dict[str, Any], 
                               plan: Dict[str, Any], engineer_outputs: Dict[str, Any]) -> str:

@@ -1,374 +1,305 @@
 """
-MetaAgent - Self-reflection and oversight for the research system.
-Monitors performance, detects stuck loops, and makes strategic decisions.
+MetaAgent — observability, operator chat, light mid-run control, give-up guards.
 """
+
+from __future__ import annotations
 
 import json
-from typing import Dict, Any, List
-from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import setup_gemini, call_gemini, log_agent_action
+from core.utils import call_llm, log_agent_action, parse_json_from_llm
+from core.llm import get_llm_client
 from core.memory import memory
+from core.run_log import CrossRunMemory, get_tracker, build_run_summary, read_events, emit_event
+
 
 class MetaAgent:
-    """Agent for system-wide oversight and strategic decision making."""
-    
     def __init__(self):
-        self.gemini_client = setup_gemini()
-    
+        self.client = get_llm_client()
+
     def evaluate_system_performance(self, state) -> str:
-        """Evaluate overall system performance and provide feedback."""
         log_agent_action("MetaAgent", "start_evaluation", {})
-        
         try:
-            # Gather performance metrics
             metrics = self._gather_performance_metrics(state)
-            
-            # Analyze trends
             trends = self._analyze_trends(state)
-            
-            # Generate feedback
-            feedback = self._generate_performance_feedback(metrics, trends)
-            
-            log_agent_action("MetaAgent", "evaluation_complete", {
-                "metrics": metrics,
-                "trends": trends
-            })
-            
+            dashboard = self.get_run_dashboard(state)
+            feedback = self._generate_performance_feedback(metrics, trends, dashboard)
+            tracker = get_tracker()
+            if tracker:
+                tracker.scratch("MetaAgent", "evaluation", {"metrics": metrics, "dashboard": dashboard})
             return feedback
-            
         except Exception as e:
-            log_agent_action("MetaAgent", "evaluation_error", {"error": str(e)})
-            return f"Meta evaluation error: {str(e)}"
-    
+            return f"Meta evaluation error: {e}"
+
+    def chat(
+        self,
+        message: str,
+        state: Optional[Dict[str, Any]] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Operator ↔ Meta conversation. Answers 'what are we doing?', failures, next steps.
+        May return control directives the UI/orchestrator can apply.
+        """
+        state = state or {}
+        summary = build_run_summary(state, error=state.get("terminal_error"))
+        tracker = get_tracker()
+        events = read_events(limit=20, run_id=summary.get("run_id"))
+        hist = history or []
+        hist_txt = "\n".join(f"{h.get('role','user')}: {h.get('content','')}" for h in hist[-8:])
+        prompt = f"""You are the Meta Agent of ScholarGraph, a multi-agent research harness.
+Answer the human operator clearly and concretely about the CURRENT run.
+If they ask what we are doing, explain the active phase and agent in plain language.
+If the run failed or stalled, summarize what was tried, how, and where we stopped.
+You MAY propose control actions, but only from this allowed set:
+- none
+- request_summary
+- skip_to_writing (use only if experiments already have some results)
+- request_plan_revision
+- stop_run
+
+Return JSON:
+{{
+  "reply": "markdown-friendly answer for the operator",
+  "control": "none|request_summary|skip_to_writing|request_plan_revision|stop_run",
+  "control_reason": "why, or empty"
+}}
+
+CURRENT SUMMARY:
+{json.dumps(summary, default=str)[:6000]}
+
+RECENT EVENTS:
+{json.dumps(events[-12:], default=str)[:3000]}
+
+CHAT HISTORY:
+{hist_txt}
+
+OPERATOR MESSAGE:
+{message}
+"""
+        raw = call_llm(prompt, temperature=0.3, tier="judge", max_tokens=1200)
+        parsed = parse_json_from_llm(raw) or {}
+        reply = parsed.get("reply") or raw or summary.get("narrative") or "No status available yet."
+        control = (parsed.get("control") or "none").strip().lower()
+        if control not in {
+            "none",
+            "request_summary",
+            "skip_to_writing",
+            "request_plan_revision",
+            "stop_run",
+        }:
+            control = "none"
+        result = {
+            "reply": reply,
+            "control": control,
+            "control_reason": parsed.get("control_reason") or "",
+            "summary": summary,
+        }
+        if tracker:
+            tracker.scratch("MetaAgent", "chat", {"message": message, "reply": reply, "control": control})
+            emit_event(
+                "meta_chat",
+                {"message": message[:500], "control": control},
+                run_id=tracker.run_id,
+                agent="MetaAgent",
+            )
+        log_agent_action("MetaAgent", "chat", {"control": control})
+        return result
+
+    def apply_control(self, control: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Apply a light Meta control directive to state (mutates and returns)."""
+        state = state or {}
+        control = (control or "none").lower()
+        if control == "request_summary":
+            state.setdefault("meta_feedback", []).append(build_run_summary(state).get("narrative"))
+        elif control == "skip_to_writing":
+            if state.get("engineer_outputs"):
+                state["current_phase"] = "writing_results"
+                state.setdefault("meta_feedback", []).append("Meta control: skip to writing_results")
+        elif control == "request_plan_revision":
+            state["current_phase"] = "planning"
+            state.setdefault("plan_revision_requests", []).append({
+                "reason": "operator_meta_control",
+                "detail": "Operator/Meta requested plan revision",
+            })
+        elif control == "stop_run":
+            state["should_continue"] = False
+            state["current_phase"] = "complete"
+            state["terminal_error"] = state.get("terminal_error") or "Stopped by Meta/operator"
+        return state
+
+    def get_run_dashboard(self, state) -> Dict[str, Any]:
+        tracker = get_tracker()
+        stats = tracker.stats if tracker else {}
+        return {
+            "iteration": state.get("iteration", 0),
+            "phase": state.get("current_phase"),
+            "rejected_topics": stats.get("rejected_topics", 0),
+            "debate_rounds": stats.get("debate_rounds", 0),
+            "sections_bounced": stats.get("sections_bounced", 0),
+            "pivots": stats.get("pivots", 0),
+            "refines": stats.get("refines", 0),
+            "plan_revisions": stats.get("plan_revisions", 0),
+            "hard_check_fails": stats.get("hard_check_fails", 0),
+            "avg_supervisor": (
+                sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
+                if state.get("supervisor_scores")
+                else None
+            ),
+            "lessons_available": len(CrossRunMemory().load(limit=100)),
+        }
+
     def should_reset(self, state) -> bool:
-        """Determine if the system should reset and start over."""
-        # Check for stuck loops
         if self._detect_stuck_loop(state):
             return True
-        
-        # Check for low-quality research
         if self._detect_low_quality_research(state):
             return True
-        
-        # Check for excessive iterations
         if state["iteration"] >= config.max_iterations:
             return True
-        
-        # Check for no progress
         if self._detect_no_progress(state):
             return True
-        
         return False
-    
+
     def should_continue(self, state) -> bool:
-        """Determine if the system should continue with revisions."""
-        # Check if we have a good foundation
-        if not state["selected_topic"]:
+        if not state["selected_topic"] or not state["plan"] or not state["draft_sections"]:
             return False
-        
-        # Check if we have a plan
-        if not state["plan"]:
-            return False
-        
-        # Check if we have some content
-        if not state["draft_sections"]:
-            return False
-        
-        # Check if scores are improving
-        if self._scores_improving(state):
+        if self._scores_improving(state) or self._close_to_threshold(state):
             return True
-        
-        # Check if we're close to threshold
-        if self._close_to_threshold(state):
-            return True
-        
         return False
-    
+
+    def validate_failure_claim(self, agent: str, claim: str, artifact: Any) -> bool:
+        """
+        Give-up early guard (8.5): bare 'not feasible' without artifact is suspicious.
+        """
+        if not artifact:
+            log_agent_action("MetaAgent", "suspicious_give_up", {"agent": agent, "claim": claim})
+            return False
+        if isinstance(artifact, dict) and artifact.get("suspicious_bare_claim"):
+            return False
+        # Require concrete evidence keys
+        if isinstance(artifact, dict):
+            if artifact.get("error") or artifact.get("traceback") or artifact.get("decision_log"):
+                return True
+        if isinstance(artifact, str) and len(artifact) > 40:
+            return True
+        return False
+
     def _gather_performance_metrics(self, state) -> Dict[str, Any]:
-        """Gather comprehensive performance metrics."""
         metrics = {
-            'iteration': state["iteration"],
-            'topics_discovered': len(state["topics"]),
-            'debates_completed': len(state["debate_results"]),
-            'sections_written': len(state["draft_sections"]),
-            'experiments_run': len(state["engineer_outputs"]),
-            'average_score': 0.0,
-            'best_score': 0.0,
-            'progress_made': False
+            "iteration": state["iteration"],
+            "topics_discovered": len(state["topics"]),
+            "debates_completed": len(state["debate_results"]),
+            "sections_written": len(state["draft_sections"]),
+            "experiments_run": len(state["engineer_outputs"]),
+            "average_score": 0.0,
+            "best_score": 0.0,
+            "has_topic": state["selected_topic"] is not None,
+            "has_plan": state["plan"] is not None,
+            "has_content": len(state["draft_sections"]) > 0,
+            "has_experiments": len(state["engineer_outputs"]) > 0,
         }
-        
-        # Calculate average supervisor score
         if state["supervisor_scores"]:
             scores = list(state["supervisor_scores"].values())
-            metrics['average_score'] = sum(scores) / len(scores)
-            metrics['best_score'] = max(scores)
-        
-        # Check if we have a selected topic
-        metrics['has_topic'] = state["selected_topic"] is not None
-        
-        # Check if we have a plan
-        metrics['has_plan'] = state["plan"] is not None
-        
-        # Check if we have content
-        metrics['has_content'] = len(state["draft_sections"]) > 0
-        
-        # Check if we have experiments
-        metrics['has_experiments'] = len(state["engineer_outputs"]) > 0
-        
+            metrics["average_score"] = sum(scores) / len(scores)
+            metrics["best_score"] = max(scores)
         return metrics
-    
+
     def _analyze_trends(self, state) -> Dict[str, Any]:
-        """Analyze trends in system performance."""
         trends = {
-            'score_trend': 'stable',
-            'content_growth': 'stable',
-            'quality_improvement': 'stable',
-            'stuck_pattern': False
+            "score_trend": "stable",
+            "stuck_pattern": False,
+            "content_growth": "stable",
         }
-        
-        # Get recent feedback
         recent_feedback = memory.get_recent_feedback(limit=10)
-        
-        if len(recent_feedback) >= 2:
-            # Analyze score trends
-            scores = [entry['score'] for entry in recent_feedback]
-            if len(scores) >= 3:
-                recent_avg = sum(scores[-3:]) / 3
-                older_avg = sum(scores[:-3]) / (len(scores) - 3) if len(scores) > 3 else scores[0]
-                
-                if recent_avg > older_avg + 0.5:
-                    trends['score_trend'] = 'improving'
-                elif recent_avg < older_avg - 0.5:
-                    trends['score_trend'] = 'declining'
-                else:
-                    trends['score_trend'] = 'stable'
-            
-            # Check for stuck patterns (same scores repeatedly)
-            if len(scores) >= 3:
-                recent_scores = scores[-3:]
-                if len(set(recent_scores)) <= 1:  # All same score
-                    trends['stuck_pattern'] = True
-        
-        # Analyze content growth
-        if state["draft_sections"]:
-            total_content_length = sum(len(content) for content in state["draft_sections"].values())
-            if total_content_length > 5000:  # Arbitrary threshold
-                trends['content_growth'] = 'good'
-            elif total_content_length > 1000:
-                trends['content_growth'] = 'moderate'
-            else:
-                trends['content_growth'] = 'poor'
-        
-        return trends
-    
-    def _generate_performance_feedback(self, metrics: Dict[str, Any], trends: Dict[str, Any]) -> str:
-        """Generate comprehensive performance feedback."""
-        prompt = f"""
-        Analyze the following research system performance metrics and provide strategic feedback:
-        
-        Performance Metrics:
-        {json.dumps(metrics, indent=2)}
-        
-        Trends:
-        {json.dumps(trends, indent=2)}
-        
-        Provide feedback on:
-        1. Overall system health
-        2. Quality of research direction
-        3. Progress assessment
-        4. Recommendations for improvement
-        5. Strategic next steps
-        
-        Format as JSON:
-        {{
-            "system_health": "good/medium/poor",
-            "research_quality": "high/medium/low",
-            "progress_assessment": "excellent/good/fair/poor",
-            "recommendations": ["list", "of", "recommendations"],
-            "next_steps": "continue/reset/refine"
-        }}
-        """
-        
-        try:
-            response = call_gemini(prompt, self.gemini_client, temperature=0.4)
-            
-            if '{' in response and '}' in response:
-                start = response.find('{')
-                end = response.rfind('}') + 1
-                json_str = response[start:end]
-                
-                feedback_data = json.loads(json_str)
-                
-                # Format feedback as readable text
-                feedback = f"""
-System Performance Analysis:
-- System Health: {feedback_data.get('system_health', 'unknown')}
-- Research Quality: {feedback_data.get('research_quality', 'unknown')}
-- Progress Assessment: {feedback_data.get('progress_assessment', 'unknown')}
-
-Recommendations:
-{chr(10).join([f"- {rec}" for rec in feedback_data.get('recommendations', [])])}
-
-Next Steps: {feedback_data.get('next_steps', 'continue')}
-"""
-                
-                return feedback.strip()
-            else:
-                return "Could not parse performance feedback."
-                
-        except Exception as e:
-            return f"Performance feedback error: {str(e)}"
-    
-    def _detect_stuck_loop(self, state) -> bool:
-        """Detect if the system is stuck in a low-quality loop."""
-        # Check recent feedback for stuck patterns
-        recent_feedback = memory.get_recent_feedback(limit=5)
-        
-        if len(recent_feedback) >= 5:  # Require more feedback before detecting stuck loop
-            scores = [entry['score'] for entry in recent_feedback]
-            
-            # Check if scores are consistently very low (below 3.0)
-            if all(score < 3.0 for score in scores):
-                return True
-            
-            # Check if scores are not improving over multiple iterations
-            if len(scores) >= 5:
-                recent_avg = sum(scores[-3:]) / 3
-                older_avg = sum(scores[:-3]) / (len(scores) - 3) if len(scores) > 3 else scores[0]
-                
-                # Only reset if scores are significantly declining
-                if recent_avg < older_avg - 1.0:  # Significant decline
-                    return True
-        
-        return False
-    
-    def _detect_low_quality_research(self, state) -> bool:
-        """Detect if the research direction is fundamentally flawed."""
-        # Check if we have a topic
-        if not state["selected_topic"]:
-            return True
-        
-        # Check if topic has reasonable feasibility
-        if state["selected_topic"].get('feasibility', 5) < 3:
-            return True
-        
-        # Check if we have any successful experiments
-        successful_experiments = sum(1 for output in state["engineer_outputs"].values() 
-                                   if output.get('success', False))
-        
-        if len(state["engineer_outputs"]) > 0 and successful_experiments == 0:
-            return True
-        
-        return False
-    
-    def _detect_no_progress(self, state) -> bool:
-        """Detect if the system is making no meaningful progress."""
-        # Check if we have any content
-        if not state["draft_sections"]:
-            return True
-        
-        # Check if content is too short (but be more lenient)
-        total_content_length = sum(len(content) for content in state["draft_sections"].values())
-        if total_content_length < 200:  # More lenient threshold
-            return True
-        
-        # Check if scores are consistently very low
-        if state["supervisor_scores"]:
-            avg_score = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
-            if avg_score < 2.0:  # Very low scores threshold
-                return True
-        
-        return False
-    
-    def _scores_improving(self, state) -> bool:
-        """Check if supervisor scores are improving."""
-        if not state["supervisor_scores"]:
-            return False
-        
-        # Get recent feedback
-        recent_feedback = memory.get_recent_feedback(limit=5)
-        
-        if len(recent_feedback) >= 2:
-            scores = [entry['score'] for entry in recent_feedback]
-            if len(scores) >= 3:
-                recent_avg = sum(scores[-3:]) / 3
-                older_avg = sum(scores[:-3]) / (len(scores) - 3) if len(scores) > 3 else scores[0]
-                
-                return recent_avg > older_avg
-        
-        return False
-    
-    def _close_to_threshold(self, state) -> bool:
-        """Check if we're close to the quality threshold."""
-        if not state["supervisor_scores"]:
-            return False
-        
-        avg_score = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
-        threshold = config.supervisor_threshold
-        
-        # Consider "close" if within 1.0 of threshold
-        return avg_score >= (threshold - 1.0)
-    
-    def get_system_recommendations(self, state) -> List[str]:
-        """Get specific recommendations for system improvement."""
-        recommendations = []
-        
-        # Check for common issues
-        if not state["selected_topic"]:
-            recommendations.append("No research topic selected - need to discover topics")
-        
-        if not state["plan"]:
-            recommendations.append("No research plan created - need to create detailed plan")
-        
-        if not state["draft_sections"]:
-            recommendations.append("No content written - need to draft paper sections")
-        
-        if state["supervisor_scores"]:
-            avg_score = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
-            if avg_score < config.supervisor_threshold:
-                recommendations.append(f"Quality below threshold ({avg_score:.1f}/{config.supervisor_threshold}) - need revisions")
-        
-        if state["iteration"] >= config.max_iterations // 2:
-            recommendations.append("Approaching iteration limit - consider reset if no improvement")
-        
-        # Check for stuck patterns
-        recent_feedback = memory.get_recent_feedback(limit=3)
         if len(recent_feedback) >= 3:
-            scores = [entry['score'] for entry in recent_feedback]
-            if len(set(scores)) <= 1:  # All same score
-                recommendations.append("Scores not improving - consider changing approach")
-        
-        return recommendations
+            scores = [e["score"] for e in recent_feedback]
+            recent_avg = sum(scores[-3:]) / 3
+            older = scores[:-3]
+            older_avg = sum(older) / len(older) if older else scores[0]
+            if recent_avg > older_avg + 0.5:
+                trends["score_trend"] = "improving"
+            elif recent_avg < older_avg - 0.5:
+                trends["score_trend"] = "declining"
+            if len(set(scores[-3:])) <= 1:
+                trends["stuck_pattern"] = True
+        return trends
 
-# Example usage
-if __name__ == "__main__":
-    meta_agent = MetaAgent()
-    
-    # Mock state for testing
-    class MockState:
-        def __init__(self):
-            self.iteration = 2
-            self.topics = [{'title': 'Test Topic'}]
-            self.selected_topic = {'title': 'Test Topic', 'feasibility': 7}
-            self.plan = {'sections': []}
-            self.draft_sections = {'Introduction': 'Some content'}
-            self.engineer_outputs = {'exp1': {'success': True}}
-            self.supervisor_scores = {'Introduction': 7.5}
-            self.meta_feedback = []
-    
-    mock_state = MockState()
-    
-    feedback = meta_agent.evaluate_system_performance(mock_state)
-    print("Performance Feedback:")
-    print(feedback)
-    
-    should_reset = meta_agent.should_reset(mock_state)
-    should_continue = meta_agent.should_continue(mock_state)
-    
-    print(f"\nShould reset: {should_reset}")
-    print(f"Should continue: {should_continue}")
-    
-    recommendations = meta_agent.get_system_recommendations(mock_state)
-    print(f"\nRecommendations: {recommendations}") 
+    def _generate_performance_feedback(self, metrics, trends, dashboard) -> str:
+        prompt = f"""
+Analyze research system performance. Prefer concrete next actions.
+Metrics: {json.dumps(metrics)}
+Trends: {json.dumps(trends)}
+Dashboard: {json.dumps(dashboard)}
+JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps": "continue|reset|refine"}}
+"""
+        parsed = parse_json_from_llm(call_llm(prompt, temperature=0.3, tier="cheap")) or {}
+        recs = parsed.get("recommendations") or []
+        return (
+            f"Health: {parsed.get('system_health', 'unknown')}\n"
+            f"Next: {parsed.get('next_steps', 'continue')}\n"
+            + "\n".join(f"- {r}" for r in recs)
+            + f"\nDashboard: pivots={dashboard.get('pivots')} hard_fails={dashboard.get('hard_check_fails')}"
+        )
+
+    def _detect_stuck_loop(self, state) -> bool:
+        recent = memory.get_recent_feedback(limit=5)
+        if len(recent) >= 5:
+            scores = [e["score"] for e in recent]
+            if all(s < 3.0 for s in scores):
+                return True
+        return False
+
+    def _detect_low_quality_research(self, state) -> bool:
+        if not state["selected_topic"]:
+            return True
+        if state["selected_topic"].get("feasibility", 5) < 3:
+            return True
+        if state["engineer_outputs"] and not any(
+            o.get("success") for o in state["engineer_outputs"].values() if isinstance(o, dict)
+        ):
+            # Check give-up artifacts
+            for o in state["engineer_outputs"].values():
+                if isinstance(o, dict) and not self.validate_failure_claim(
+                    "Engineer", o.get("error", "failed"), o.get("failure_artifact") or o
+                ):
+                    return True
+            return True
+        return False
+
+    def _detect_no_progress(self, state) -> bool:
+        if not state["draft_sections"]:
+            return True
+        total = sum(len(c) for c in state["draft_sections"].values())
+        if total < 200:
+            return True
+        if state["supervisor_scores"]:
+            avg = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
+            if avg < 2.0:
+                return True
+        return False
+
+    def _scores_improving(self, state) -> bool:
+        recent = memory.get_recent_feedback(limit=5)
+        if len(recent) >= 3:
+            scores = [e["score"] for e in recent]
+            return sum(scores[-3:]) / 3 > sum(scores[:-3]) / max(len(scores) - 3, 1)
+        return False
+
+    def _close_to_threshold(self, state) -> bool:
+        if not state["supervisor_scores"]:
+            return False
+        avg = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
+        return avg >= (config.supervisor_threshold - 1.0)
+
+    def get_system_recommendations(self, state) -> List[str]:
+        recs = []
+        if not state["selected_topic"]:
+            recs.append("Discover topics")
+        if not state["plan"]:
+            recs.append("Create plan with falsifiable predictions")
+        if state.get("supervisor_scores"):
+            avg = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
+            if avg < config.supervisor_threshold:
+                recs.append(f"Quality {avg:.1f} < {config.supervisor_threshold}")
+        return recs

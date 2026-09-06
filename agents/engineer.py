@@ -12,24 +12,35 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import call_llm, generate_embedding, log_agent_action, parse_json_from_llm
+from core.utils import log_agent_action, parse_json_from_llm
+from core.llm import call_llm, generate_embedding
 from core.llm import get_llm_client
+from core.context import RunContext, get_active_context
 from core.memory import memory
 from core.sandbox import execute_sandboxed, run_multi_seed, validate_code
 from core.run_log import get_tracker, CrossRunMemory, emit_event
 from core.research_db import research_db
+from core.contracts import CodeClaimReport, ExperimentOutput, ExperimentSpec, RevisionRequest
 
 
 class EngineerAgent:
     """Runs experiments with hard sandboxing and recovery loops."""
 
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
         self.client = get_llm_client()
-        self.output_dir = config.output_dir
-        self.raw_dir = config.raw_results_dir
+        runtime_config = self.context.config if self.context else config
+        self.ledger = self.context.research_db if self.context else research_db
+        self.vector_memory = self.context.memory if self.context else memory
+        self.output_dir = runtime_config.output_dir
+        self.raw_dir = runtime_config.raw_results_dir
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.raw_dir, exist_ok=True)
         self._plan_revision_requests: List[Dict[str, Any]] = []
+
+    @property
+    def runtime_config(self):
+        return self.context.config if self.context else config
 
     def _progress(self, event_type: str, data: Dict[str, Any]) -> None:
         """Emit live tactical progress for Arena / Meta chat."""
@@ -40,7 +51,7 @@ class EngineerAgent:
             tracker.scratch("EngineerAgent", event_type, data)
             tracker.message(f"{event_type}: {data.get('experiment') or data.get('name') or data.get('decision') or ''}")
 
-    def request_plan_revision(self, reason: str, experiment: Dict[str, Any], detail: str = "") -> Dict[str, Any]:
+    def request_plan_revision(self, reason: str, experiment: ExperimentSpec, detail: str = "") -> RevisionRequest:
         """First-class path back to Planner when the plan is wrong."""
         req = {
             "reason": reason,
@@ -57,17 +68,17 @@ class EngineerAgent:
         log_agent_action("EngineerAgent", "request_plan_revision", req)
         return req
 
-    def consume_plan_revision_requests(self) -> List[Dict[str, Any]]:
+    def consume_plan_revision_requests(self) -> List[RevisionRequest]:
         reqs = list(self._plan_revision_requests)
         self._plan_revision_requests.clear()
         return reqs
 
     def run_experiment(
         self,
-        experiment: Dict[str, Any],
-        alternatives: Optional[List[Dict[str, Any]]] = None,
+        experiment: ExperimentSpec,
+        alternatives: Optional[List[ExperimentSpec]] = None,
         method_description: str = "",
-    ) -> Dict[str, Any]:
+    ) -> ExperimentOutput:
         """
         Run with PIVOT/REFINE loop.
         alternatives: other designs from Planner for PIVOT.
@@ -81,7 +92,7 @@ class EngineerAgent:
         self._progress("experiment_start", {
             "experiment": experiment.get("name"),
             "max_attempts": max_attempts,
-            "seeds": config.experiment_seeds,
+            "seeds": self.runtime_config.experiment_seeds,
         })
 
         for attempt in range(1, max_attempts + 1):
@@ -119,9 +130,9 @@ class EngineerAgent:
                 "experiment": approach.get("name"),
                 "attempt": attempt,
                 "action": "multi_seed",
-                "seeds": config.experiment_seeds,
+                "seeds": self.runtime_config.experiment_seeds,
             })
-            multi = run_multi_seed(code, n_seeds=config.experiment_seeds)
+            multi = run_multi_seed(code, n_seeds=self.runtime_config.experiment_seeds)
             consistency = self.check_code_claim_consistency(method_description, code) if method_description else {
                 "consistent": True,
                 "score": 10.0,
@@ -153,8 +164,8 @@ class EngineerAgent:
                 self._store_experiment_results(output, approach)
                 tracker = get_tracker()
                 if tracker:
-                    research_db.record_event("experiment_artifact", {"experiment": approach["name"], "raw_results_path": raw_path, "seeds": config.experiment_seeds, "metrics": output["aggregate_metrics"]}, tracker.run_id, "EngineerAgent")
-                    research_db.record_artifact(tracker.run_id, "raw_experiment_results", raw_path, {"experiment": approach["name"], "metrics": output["aggregate_metrics"]})
+                    self.ledger.record_event("experiment_artifact", {"experiment": approach["name"], "raw_results_path": raw_path, "seeds": self.runtime_config.experiment_seeds, "metrics": output["aggregate_metrics"]}, tracker.run_id, "EngineerAgent")
+                    self.ledger.record_artifact(tracker.run_id, "raw_experiment_results", raw_path, {"experiment": approach["name"], "metrics": output["aggregate_metrics"]})
                 self._progress("experiment_complete", {
                     "experiment": approach["name"],
                     "success": True,
@@ -199,9 +210,9 @@ class EngineerAgent:
 
     def run_branching_search(
         self,
-        contribution_experiments: List[Dict[str, Any]],
+        contribution_experiments: List[ExperimentSpec],
         method_description: str = "",
-    ) -> Dict[str, Any]:
+    ) -> ExperimentOutput:
         """
         Architecture 8.1: cheap parallel short runs, promote winner to full multi-seed.
         Each item may have 'variants' list; otherwise treat as single design.
@@ -209,7 +220,7 @@ class EngineerAgent:
         candidates = []
         for exp in contribution_experiments:
             variants = exp.get("variants") or exp.get("alternatives") or [exp]
-            for v in variants[: config.experiment_branch_count]:
+            for v in variants[: self.runtime_config.experiment_branch_count]:
                 candidates.append(v)
 
         cheap_scores = []
@@ -247,7 +258,7 @@ class EngineerAgent:
         }
         return full
 
-    def check_code_claim_consistency(self, method_text: str, code: str) -> Dict[str, Any]:
+    def check_code_claim_consistency(self, method_text: str, code: str) -> CodeClaimReport:
         """Independent heuristic: claimed algorithms vs imports/classes in code."""
         notes = []
         score = 10.0
@@ -407,7 +418,7 @@ Return ONLY Python. Still print JSON metrics.
             out["raw_results_path"] = path
             tracker = get_tracker()
             if tracker:
-                research_db.record_artifact(tracker.run_id, "failed_experiment", path, {"experiment": name, "error": str(error)})
+                self.ledger.record_artifact(tracker.run_id, "failed_experiment", path, {"experiment": name, "error": str(error)})
         except Exception:
             pass
         return out
@@ -458,7 +469,7 @@ print(json.dumps({{"metrics": metrics, "raw": {{"y_test": y_test.tolist(), "pred
             results_file = os.path.join(self.output_dir, f"{experiment['name']}_results.json")
             with open(results_file, "w", encoding="utf-8") as f:
                 json.dump(output, f, indent=2, default=str)
-            memory.add_embedding(
+            self.vector_memory.add_embedding(
                 generate_embedding(json.dumps({"name": experiment["name"], "metrics": output.get("aggregate_metrics")})),
                 {
                     "type": "experiment_results",

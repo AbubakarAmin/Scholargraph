@@ -247,6 +247,26 @@ def test_debate_result_has_rounds_field():
     assert "rounds" in fields or "objections" in fields or "elo_delta" in fields
 
 
+def test_research_pipeline_streams_node_outputs():
+    from core.pipeline import ResearchPipeline
+
+    class FakeApp:
+        def stream(self, source, config):
+            assert source == {"current_phase": "start"}
+            assert config["configurable"]["thread_id"] == "run-1"
+            yield {"node_a": {"current_phase": "done"}}
+
+    class FakeGraph:
+        def compile(self, checkpointer):
+            assert checkpointer == "checkpoint"
+            return FakeApp()
+
+    pipeline = ResearchPipeline(lambda: FakeGraph(), lambda: "checkpoint")
+    assert list(pipeline.stream({"current_phase": "start"}, "run-1")) == [
+        ("node_a", {"current_phase": "done"})
+    ]
+
+
 def test_results_writer_only_keeps_engineer_numbers(monkeypatch):
     """The post-engineering pass must reject fabricated quantitative claims."""
     import main

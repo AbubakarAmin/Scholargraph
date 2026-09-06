@@ -14,8 +14,11 @@ import numpy as np
 import requests
 
 from core.config import config
-from core.utils import call_llm, generate_embedding, log_agent_action, parse_json_from_llm, calculate_similarity
+from core.utils import log_agent_action, parse_json_from_llm, calculate_similarity
+from core.llm import call_llm, generate_embedding
 from core.llm import get_llm_client
+from core.context import RunContext, get_active_context
+from core.contracts import FeasibilityReport, Topic
 from core.memory import memory
 from core.run_log import CrossRunMemory, get_tracker
 from agents.hypothesis_debate import EloStore, hypothesis_kind
@@ -26,14 +29,17 @@ class ResearchSourceUnavailable(RuntimeError):
 
 
 class TopicHunterAgent:
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
+        self.runtime_config = self.context.config if self.context else config
+        self.vector_memory = self.context.memory if self.context else memory
         self.client = get_llm_client()
         self.openalex_headers = {
-            "User-Agent": f"ScholarGraph/2.0 (mailto:{config.openalex_email})"
+            "User-Agent": f"ScholarGraph/2.0 (mailto:{self.runtime_config.openalex_email})"
         }
         self.s2_headers = {"User-Agent": "ScholarGraph/2.0"}
-        if config.semantic_scholar_api_key:
-            self.s2_headers["x-api-key"] = config.semantic_scholar_api_key
+        if self.runtime_config.semantic_scholar_api_key:
+            self.s2_headers["x-api-key"] = self.runtime_config.semantic_scholar_api_key
         self.base_urls = {
             "openalex": "https://api.openalex.org",
             "crossref": "https://api.crossref.org",
@@ -57,7 +63,7 @@ class TopicHunterAgent:
                 # OpenAlex exposes abstracts as an inverted index; requesting a
                 # non-existent `abstract` field is a 400 in current API versions.
                 "select": "id,title,abstract_inverted_index,publication_year,cited_by_count,concepts,type,doi",
-                "mailto": config.openalex_email,
+                "mailto": self.runtime_config.openalex_email,
             }
             r = requests.get(url, headers=self.openalex_headers, params=params, timeout=30)
             r.raise_for_status()
@@ -165,13 +171,13 @@ class TopicHunterAgent:
                     nearest = abs_text[:200]
             return {
                 "max_similarity": best_sim,
-                "reject": best_sim >= config.novelty_similarity_reject,
+                "reject": best_sim >= self.runtime_config.novelty_similarity_reject,
                 "nearest": nearest,
             }
         except Exception as e:
             return {"max_similarity": 0.0, "reject": False, "error": str(e)}
 
-    def feasibility_filter(self, topic: Dict[str, Any]) -> Dict[str, Any]:
+    def feasibility_filter(self, topic: Topic) -> FeasibilityReport:
         """Grounded in what Engineer sandbox can actually run."""
         reasons = []
         ok = True
@@ -199,7 +205,7 @@ class TopicHunterAgent:
             reasons.append("Proprietary dataset unavailable")
         return {"ok": ok, "reasons": reasons}
 
-    def _reject(self, topic: Dict[str, Any], reason: str, meta: Optional[Dict] = None):
+    def _reject(self, topic: Topic, reason: str, meta: Optional[Dict[str, Any]] = None):
         entry = {
             "title": topic.get("title"),
             "reason": reason,
@@ -276,7 +282,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 gap["gap_score"] = max(g.get("gap_score", 0) for g in graph_signals)
             kept.append(gap)
             try:
-                memory.add_embedding(
+                self.vector_memory.add_embedding(
                     generate_embedding(gap["title"] + " " + gap.get("description", "")),
                     {"type": "research_gap", "title": gap["title"], "domain": domain},
                 )
@@ -284,8 +290,8 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 pass
         return kept
 
-    def discover_topics(self, domain: str = None, n_parallel: int = 3) -> List[Dict[str, Any]]:
-        domain = domain or config.research_domain
+    def discover_topics(self, domain: str = None, n_parallel: int = 3) -> List[Topic]:
+        domain = domain or self.runtime_config.research_domain
         log_agent_action("TopicHunter", "start_discovery", {"domain": domain, "parallel": n_parallel})
         seeds = [
             "underexplored methods",
@@ -325,7 +331,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
         })
         return ranked
 
-    def rank_topics_by_potential(self, topics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def rank_topics_by_potential(self, topics: List[Topic]) -> List[Topic]:
         if not topics:
             return []
         if len(topics) == 1:

@@ -10,28 +10,38 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.config import config
-from core.utils import call_llm, log_agent_action, validate_math_expression, verify_math_derivation, parse_json_from_llm
+from core.utils import log_agent_action, validate_math_expression, verify_math_derivation, parse_json_from_llm
+from core.llm import call_llm
 from core.llm import get_llm_client
+from core.context import RunContext, get_active_context
 from core.memory import memory
 from core.verification import hard_verify_section, verify_citations
 from core.run_log import get_tracker
 from core.research_db import research_db
+from core.contracts import ExperimentOutput, VerificationReport
 
 
 class SupervisorAgent:
     """Quality gate: hard checks dominate; LLM review is last filter only."""
 
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
         self.client = get_llm_client()
+        self.ledger = self.context.research_db if self.context else research_db
+        self.feedback_memory = self.context.memory if self.context else memory
         self.math_checker = MathChecker()
         self.code_checker = CodeChecker()
         self.reviewer_bot = ReviewerBot()
+
+    @property
+    def runtime_config(self):
+        return self.context.config if self.context else config
 
     def evaluate_section(
         self,
         section_name: str,
         content: str,
-        engineer_outputs: Optional[Dict[str, Any]] = None,
+        engineer_outputs: Optional[Dict[str, ExperimentOutput]] = None,
     ) -> Tuple[float, str]:
         log_agent_action("SupervisorAgent", "start_evaluation", {"section": section_name})
 
@@ -57,7 +67,7 @@ class SupervisorAgent:
             feedbacks.append(f"reviewer_bot (post-hard): {soft_fb}")
             overall = min(hard_bundle_score, soft_score, 4.0)
             overall_feedback = "HARD CHECK FAILED — regenerate citations/stats.\n" + "\n".join(feedbacks)
-            memory.add_feedback_entry("SupervisorAgent", section_name, overall, overall_feedback, 1)
+            self.feedback_memory.add_feedback_entry("SupervisorAgent", section_name, overall, overall_feedback, 1)
             return overall, overall_feedback
 
         # --- SOFT LLM REVIEW LAST ---
@@ -77,7 +87,7 @@ class SupervisorAgent:
         )
         overall_feedback = "\n".join(feedbacks)
 
-        memory.add_feedback_entry("SupervisorAgent", section_name, overall, overall_feedback, 1)
+        self.feedback_memory.add_feedback_entry("SupervisorAgent", section_name, overall, overall_feedback, 1)
         log_agent_action("SupervisorAgent", "evaluation_complete", {
             "section": section_name,
             "overall_score": overall,
@@ -85,7 +95,7 @@ class SupervisorAgent:
         })
         return overall, overall_feedback
 
-    def _record_claim_evidence(self, section_name: str, content: str, hard: Dict[str, Any], engineer_outputs: Optional[Dict[str, Any]]):
+    def _record_claim_evidence(self, section_name: str, content: str, hard: VerificationReport, engineer_outputs: Optional[Dict[str, ExperimentOutput]]):
         """Persist an auditable claim ledger instead of hiding evidence in reviewer prose."""
         tracker = get_tracker()
         if not tracker:
@@ -93,15 +103,15 @@ class SupervisorAgent:
         citation = hard.get("citation", {})
         for item in citation.get("resolved", []):
             identifier = item.get("doi") or item.get("arxiv_id") or "source"
-            research_db.record_claim(tracker.run_id, section_name, identifier, "citation", "verified", item)
+            self.ledger.record_claim(tracker.run_id, section_name, identifier, "citation", "verified", item)
         for item in citation.get("failed", []):
             identifier = item.get("doi") or item.get("arxiv_id") or "source"
-            research_db.record_claim(tracker.run_id, section_name, identifier, "citation", "failed", item)
+            self.ledger.record_claim(tracker.run_id, section_name, identifier, "citation", "failed", item)
         # Quantitative sentences are evidence claims; keep their deterministic check beside them.
         stat_status = "verified" if hard.get("passed") else "needs_revision"
         for sentence in re.split(r"(?<=[.!?])\s+", content):
             if re.search(r"\d+(?:\.\d+)?\s*%|\b(?:mean|std|p\s*[<=>]|accuracy|f1)\b", sentence, re.I):
-                research_db.record_claim(tracker.run_id, section_name, sentence[:500], "quantitative", stat_status, {"statistics": hard.get("statistics", [])})
+                self.ledger.record_claim(tracker.run_id, section_name, sentence[:500], "quantitative", stat_status, {"statistics": hard.get("statistics", [])})
 
     def _soft_hallucination_check(self, content: str, section_name: str, hard: Dict) -> Tuple[float, str]:
         prompt = f"""

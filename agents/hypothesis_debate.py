@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import call_llm, log_agent_action, parse_json_from_llm
+from core.utils import log_agent_action, parse_json_from_llm
+from core.llm import call_llm
 from core.llm import get_llm_client
+from core.context import RunContext, get_active_context
 from core.memory import memory
 from core.run_log import get_tracker
 
@@ -44,8 +46,9 @@ class DebateResult:
 
 
 class EloStore:
-    def __init__(self, path: Optional[str] = None):
-        self.path = Path(path or config.elo_ratings_path)
+    def __init__(self, path: Optional[str] = None, context: Optional[RunContext] = None):
+        runtime_config = (context or get_active_context()).config if (context or get_active_context()) else config
+        self.path = Path(path or runtime_config.elo_ratings_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.ratings: Dict[str, float] = {}
         if self.path.exists():
@@ -81,7 +84,8 @@ def hypothesis_kind(title: str) -> str:
 
 
 class ProposerAgent:
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
         self.client = get_llm_client()
 
     def build_argument(self, topic: Dict[str, Any]) -> str:
@@ -123,12 +127,13 @@ For each objection: OBJECTION: ... RESPONSE: ... CONCESSION (if any): ...
 
 
 class ChallengerAgent:
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
         self.client = get_llm_client()
 
     def build_rebuttal(self, topic: Dict[str, Any], proposer_argument: str) -> str:
         """Checklist-grounded critique — must address each reviewer criterion."""
-        rating = float(topic.get("elo_rating", EloStore().get(hypothesis_kind(topic.get("title", "")))))
+        rating = float(topic.get("elo_rating", EloStore(context=self.context).get(hypothesis_kind(topic.get("title", "")))))
         kind = topic.get("hypothesis_kind") or hypothesis_kind(topic.get("title", ""))
         history_note = (
             f"This is a {kind} hypothesis with a low historical Elo ({rating:.0f}). "
@@ -180,7 +185,9 @@ Return JSON: {{"unresolved": [{{"criterion": "...", "objection": "...", "severit
 
 
 class ModeratorAgent:
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
+        self.runtime_config = self.context.config if self.context else config
         self.client = get_llm_client()
 
     def evaluate_debate(
@@ -199,9 +206,9 @@ Moderate this multi-round research debate.
 Topic: {topic.get('title')}
 Transcript: {transcript}
 Unresolved objections: {json.dumps(unresolved)[:2000]}
-Pass threshold: {config.debate_pass_threshold}
+Pass threshold: {self.runtime_config.debate_pass_threshold}
 
-Score overall scientific merit 1-10. PASS only if score >= {config.debate_pass_threshold}
+Score overall scientific merit 1-10. PASS only if score >= {self.runtime_config.debate_pass_threshold}
 and unresolved high-severity (>=4) objections are empty.
 
 JSON: {{"score": 7.5, "passed": true, "reasoning": "...", "decision": "PASS|FAIL"}}
@@ -223,7 +230,7 @@ JSON: {{"score": 7.5, "passed": true, "reasoning": "...", "decision": "PASS|FAIL
         disagreement = max(scores) - min(scores) if len(scores) > 1 else 0.0
         # Agreement required: if disagreement high, do not pass even if mean is high
         agreed = disagreement <= 1.5
-        passed = agreed and mean >= config.debate_pass_threshold and not any(
+        passed = agreed and mean >= self.runtime_config.debate_pass_threshold and not any(
             (u.get("severity") or 0) >= 4 for u in unresolved
         )
         return {
@@ -237,24 +244,27 @@ JSON: {{"score": 7.5, "passed": true, "reasoning": "...", "decision": "PASS|FAIL
         }
 
     def _judge_models(self) -> List[str]:
-        models = config.get_ensemble_models()
+        models = self.runtime_config.get_ensemble_models()
         if models:
             return models[:3]
         # Single configured judge/strong model repeated is weak; use cheap+strong if set
         out = []
         for tier in ("judge", "strong", "cheap"):
-            m = config.resolve_model(tier)
+            m = self.runtime_config.resolve_model(tier)
             if m and m not in out:
                 out.append(m)
-        return out[:3] or [config.resolve_model("default")]
+        return out[:3] or [self.runtime_config.resolve_model("default")]
 
 
 class HypothesisDebateSystem:
-    def __init__(self):
-        self.proposer = ProposerAgent()
-        self.challenger = ChallengerAgent()
-        self.moderator = ModeratorAgent()
-        self.elo = EloStore()
+    def __init__(self, context: Optional[RunContext] = None):
+        context = context or get_active_context()
+        self.context = context
+        self.runtime_config = context.config if context else config
+        self.proposer = ProposerAgent(context)
+        self.challenger = ChallengerAgent(context)
+        self.moderator = ModeratorAgent(context)
+        self.elo = EloStore(context=context)
 
     def conduct_debate(self, topic: Dict[str, Any]) -> DebateResult:
         log_agent_action("HypothesisDebate", "start", {"topic": topic.get("title")})
@@ -271,8 +281,8 @@ class HypothesisDebateSystem:
             "objections": objections,
         })
 
-        min_r = config.debate_min_rounds
-        max_r = config.debate_max_rounds
+        min_r = self.runtime_config.debate_min_rounds
+        max_r = self.runtime_config.debate_max_rounds
         unresolved = objections
 
         for r in range(2, max_r + 1):
@@ -328,7 +338,7 @@ class HypothesisDebateSystem:
             ensemble_scores=final.get("ensemble_scores") or [],
             elo_delta=delta,
         )
-        memory.add_debate_entry(
+        (self.context.memory if self.context else memory).add_debate_entry(
             result.topic,
             result.proposer_argument[:2000],
             result.challenger_argument[:2000],

@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
 from core.config import config
-from core.utils import setup_gemini, call_gemini, _rate_limit
+from core.llm import call_gemini, generate_embedding, setup_gemini
 
 def test_gemini_integration():
     """Test the Gemini API integration."""
@@ -30,16 +30,7 @@ def test_gemini_integration():
         # Apply rate limiting
         _rate_limit()
         
-        response = client.models.generate_content(
-            model="models/gemini-2.0-flash-exp",
-            contents=test_prompt,
-            config={
-                "temperature": 0.7,
-                "max_output_tokens": 100,
-            }
-        )
-        
-        result = response.candidates[0].content.parts[0].text
+        result = client.chat(test_prompt, temperature=0.7, max_tokens=100)
         print(f"   ✅ Response received: {result[:50]}...")
         
         # Test 3: Test the call_gemini utility function
@@ -49,7 +40,6 @@ def test_gemini_integration():
         
         # Test 4: Test embedding generation
         print("4. Testing embedding generation...")
-        from core.utils import generate_embedding
         embedding = generate_embedding("test text", client)
         print(f"   ✅ Embedding generated: shape {embedding.shape}")
         

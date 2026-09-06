@@ -11,6 +11,8 @@
 
 ScholarGraph is an autonomous multi-agent research pipeline. Given a research domain, it discovers gaps, adversarially debates hypotheses, designs falsifiable experiments, executes sandboxed code with multi-seed statistics, verifies citations and reported numbers against raw data, and assembles a LaTeX paper plus a companion code repo.
 
+For module-by-module architecture notes and the staged refactor plan, see [docs/README.md](docs/README.md).
+
 **Design thesis:** quality comes from the harness, not from hoping a single LLM call is brilliant. Soft “vibe scores” are secondary; hard, checkable verification (resolved DOIs, recomputed stats, sandbox lockdown, PIVOT/REFINE) is primary — aligned with failure modes documented in systems like AI Scientist v1/v2, Agent Laboratory, AgentRxiv, and AutoResearchClaw.
 
 ---

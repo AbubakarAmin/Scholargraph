@@ -10,8 +10,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import call_llm, generate_embedding, log_agent_action, parse_json_from_llm
+from core.utils import log_agent_action, parse_json_from_llm
+from core.llm import call_llm, generate_embedding
 from core.llm import get_llm_client
+from core.context import RunContext, get_active_context
+from core.contracts import Contribution, Dependency, ExperimentSpec, Plan, RevisionRequest, Timeline, Topic
 from core.memory import memory
 from core.run_log import get_tracker, CrossRunMemory
 
@@ -19,10 +22,19 @@ from core.run_log import get_tracker, CrossRunMemory
 class PlannerAgent:
     """Creates falsifiable research plans with baselines and experiment branches."""
 
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
         self.client = get_llm_client()
 
-    def create_plan(self, topic: Dict[str, Any]) -> Dict[str, Any]:
+    @property
+    def runtime_config(self):
+        return self.context.config if self.context else config
+
+    @property
+    def vector_memory(self):
+        return self.context.memory if self.context else memory
+
+    def create_plan(self, topic: Topic) -> Plan:
         log_agent_action("PlannerAgent", "start_planning", {"topic": topic.get("title")})
         lessons = CrossRunMemory().lessons_for_prompt()
 
@@ -52,10 +64,10 @@ class PlannerAgent:
 
     def revise_plan(
         self,
-        plan: Dict[str, Any],
-        revision_request: Dict[str, Any],
-        topic: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        plan: Plan,
+        revision_request: RevisionRequest,
+        topic: Optional[Topic] = None,
+    ) -> Plan:
         """Bidirectional edge: Engineer requested a plan revision."""
         log_agent_action("PlannerAgent", "revise_plan", revision_request)
         tracker = get_tracker()
@@ -97,7 +109,7 @@ Return full updated plan fragment as JSON with keys: methodology, contributions,
         )
         return plan
 
-    def _flag_unfalsifiable(self, plan: Dict[str, Any]) -> List[str]:
+    def _flag_unfalsifiable(self, plan: Plan) -> List[str]:
         flags = []
         contribs = plan.get("contributions") or []
         if not contribs and plan.get("expected_contributions"):
@@ -114,7 +126,7 @@ Return full updated plan fragment as JSON with keys: methodology, contributions,
                 flags.append(f"Missing statistical_test: {c.get('claim', c)}")
         return flags
 
-    def _flag_missing_baselines(self, plan: Dict[str, Any]) -> List[str]:
+    def _flag_missing_baselines(self, plan: Plan) -> List[str]:
         flags = []
         for exp in plan.get("experiments") or []:
             baselines = exp.get("baselines") or []
@@ -126,7 +138,7 @@ Return full updated plan fragment as JSON with keys: methodology, contributions,
                 pass
         return flags
 
-    def _ensure_falsifiable_contributions(self, plan: Dict[str, Any], topic: Dict[str, Any]) -> List[Dict]:
+    def _ensure_falsifiable_contributions(self, plan: Plan, topic: Topic) -> List[Contribution]:
         existing = plan.get("contributions")
         if existing and isinstance(existing, list) and existing and isinstance(existing[0], dict):
             return existing
@@ -153,7 +165,7 @@ Return JSON array:
             for c in claims
         ]
 
-    def _generate_plan_structure(self, topic: Dict[str, Any], lessons: str) -> Dict[str, Any]:
+    def _generate_plan_structure(self, topic: Topic, lessons: str) -> Plan:
         prompt = f"""
 Create a detailed research plan.
 
@@ -182,13 +194,13 @@ Include standard sections: Abstract, Introduction, Related Work, Methods, Experi
             if isinstance(parsed, dict) and "sections" in parsed:
                 parsed["created_at"] = datetime.now().isoformat()
                 parsed["topic"] = topic.get("title")
-                parsed["domain"] = config.research_domain
+                parsed["domain"] = self.runtime_config.research_domain
                 return parsed
         except Exception as e:
             log_agent_action("PlannerAgent", "plan_generation_error", {"error": str(e)})
         return self._create_fallback_plan(topic)
 
-    def _generate_experiments(self, topic: Dict[str, Any], plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _generate_experiments(self, topic: Topic, plan: Plan) -> List[ExperimentSpec]:
         contribs = plan.get("contributions") or []
         prompt = f"""
 Design experiments for:
@@ -218,7 +230,7 @@ Return JSON array of experiments.
             log_agent_action("PlannerAgent", "experiment_generation_error", {"error": str(e)})
         return self._create_fallback_experiments(topic)
 
-    def _attach_variants(self, experiments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _attach_variants(self, experiments: List[ExperimentSpec]) -> List[ExperimentSpec]:
         for exp in experiments:
             if not exp.get("variants"):
                 exp["variants"] = [
@@ -247,7 +259,7 @@ Return JSON {{"contributions": [...], "experiments": [...]}}
             plan["experiments"] = self._attach_variants(plan.get("experiments") or [])
         return plan
 
-    def _generate_dependencies(self, plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _generate_dependencies(self, plan: Plan) -> List[Dependency]:
         deps = []
         for section in plan.get("sections") or []:
             if section.get("name") in ("Methods", "Experiments", "Results"):
@@ -259,7 +271,7 @@ Return JSON {{"contributions": [...], "experiments": [...]}}
                 })
         return deps
 
-    def _generate_timeline(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+    def _generate_timeline(self, plan: Plan) -> Timeline:
         return {
             "phases": [
                 {"name": "Planning", "duration": "1 week", "tasks": ["Literature", "Falsifiable claims"]},
@@ -270,19 +282,19 @@ Return JSON {{"contributions": [...], "experiments": [...]}}
             "total_duration": "4-6 weeks",
         }
 
-    def _store_plan(self, plan: Dict[str, Any], topic: Dict[str, Any]):
+    def _store_plan(self, plan: Plan, topic: Topic):
         try:
-            plan_path = f"{config.output_dir}/plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            plan_path = f"{self.runtime_config.output_dir}/plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             with open(plan_path, "w", encoding="utf-8") as f:
                 json.dump(plan, f, indent=2, default=str)
-            memory.add_embedding(
+            self.vector_memory.add_embedding(
                 generate_embedding(json.dumps({"title": plan.get("title"), "topic": topic.get("title")})),
                 {"type": "research_plan", "topic": topic.get("title"), "plan_file": plan_path},
             )
         except Exception as e:
             log_agent_action("PlannerAgent", "plan_storage_error", {"error": str(e)})
 
-    def _create_fallback_plan(self, topic: Dict[str, Any]) -> Dict[str, Any]:
+    def _create_fallback_plan(self, topic: Topic) -> Plan:
         return {
             "title": f"Research on {topic.get('title')}",
             "sections": [
@@ -299,10 +311,10 @@ Return JSON {{"contributions": [...], "experiments": [...]}}
             "dataset_availability": "synthetic",
             "created_at": datetime.now().isoformat(),
             "topic": topic.get("title"),
-            "domain": config.research_domain,
+            "domain": self.runtime_config.research_domain,
         }
 
-    def _create_fallback_experiments(self, topic: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _create_fallback_experiments(self, topic: Topic) -> List[ExperimentSpec]:
         return [
             {
                 "name": "Baseline Comparison",

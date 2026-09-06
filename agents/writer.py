@@ -8,17 +8,29 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from core.config import config
-from core.utils import setup_gemini, call_gemini, log_agent_action, extract_citations, generate_embedding
+from core.utils import log_agent_action, extract_citations
+from core.llm import call_llm, generate_embedding, get_llm_client
+from core.context import RunContext, get_active_context
+from core.contracts import ExperimentOutput, Plan, PlanSection, Topic
 from core.memory import memory
 
 class WriterAgent:
     """Agent for drafting research paper sections."""
     
-    def __init__(self):
-        self.gemini_client = setup_gemini()
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
+        self.client = get_llm_client()
+
+    @property
+    def runtime_config(self):
+        return self.context.config if self.context else config
+
+    @property
+    def vector_memory(self):
+        return self.context.memory if self.context else memory
     
-    def draft_section(self, section_name: str, topic: Dict[str, Any], 
-                     plan: Dict[str, Any], engineer_outputs: Dict[str, Any]) -> str:
+    def draft_section(self, section_name: str, topic: Topic,
+                     plan: Plan, engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Draft a specific section of the research paper."""
         log_agent_action("WriterAgent", "start_drafting", {"section": section_name})
         
@@ -55,15 +67,15 @@ class WriterAgent:
         
         return content
     
-    def _get_section_plan(self, section_name: str, plan: Dict[str, Any]) -> Dict[str, Any]:
+    def _get_section_plan(self, section_name: str, plan: Plan) -> PlanSection:
         """Get the plan for a specific section."""
         for section in plan.get('sections', []):
             if section['name'].lower() == section_name.lower():
                 return section
         return {}
     
-    def _draft_abstract(self, topic: Dict[str, Any], plan: Dict[str, Any], 
-                       engineer_outputs: Dict[str, Any]) -> str:
+    def _draft_abstract(self, topic: Topic, plan: Plan,
+                       engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Draft the abstract section."""
         prompt = f"""
         Write a concise abstract for the following research paper:
@@ -87,13 +99,13 @@ class WriterAgent:
         """
         
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.6)
+            content = call_llm(prompt, temperature=0.6, tier="strong")
             return self._format_section_content(content, "Abstract")
         except Exception as e:
             log_agent_action("WriterAgent", "abstract_error", {"error": str(e)})
             return self._create_fallback_abstract(topic, plan)
     
-    def _draft_introduction(self, topic: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    def _draft_introduction(self, topic: Topic, plan: Plan) -> str:
         """Draft the introduction section."""
         prompt = f"""
         Write an introduction section for the following research paper:
@@ -117,13 +129,13 @@ class WriterAgent:
         """
         
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.7)
+            content = call_llm(prompt, temperature=0.7, tier="strong")
             return self._format_section_content(content, "Introduction")
         except Exception as e:
             log_agent_action("WriterAgent", "introduction_error", {"error": str(e)})
             return self._create_fallback_introduction(topic, plan)
     
-    def _draft_related_work(self, topic: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    def _draft_related_work(self, topic: Topic, plan: Plan) -> str:
         """Draft the related work section."""
         prompt = f"""
         Write a related work section for the following research topic:
@@ -144,14 +156,14 @@ class WriterAgent:
         """
         
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.6)
+            content = call_llm(prompt, temperature=0.6, tier="strong")
             return self._format_section_content(content, "Related Work")
         except Exception as e:
             log_agent_action("WriterAgent", "related_work_error", {"error": str(e)})
             return self._create_fallback_related_work(topic, plan)
     
-    def _draft_methods(self, topic: Dict[str, Any], plan: Dict[str, Any], 
-                      engineer_outputs: Dict[str, Any]) -> str:
+    def _draft_methods(self, topic: Topic, plan: Plan,
+                      engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Draft the methods section."""
         prompt = f"""
         Write a methods section for the following research:
@@ -174,14 +186,14 @@ class WriterAgent:
         """
         
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.5)
+            content = call_llm(prompt, temperature=0.5, tier="strong")
             return self._format_section_content(content, "Methods")
         except Exception as e:
             log_agent_action("WriterAgent", "methods_error", {"error": str(e)})
             return self._create_fallback_methods(topic, plan)
     
-    def _draft_experiments(self, topic: Dict[str, Any], plan: Dict[str, Any], 
-                          engineer_outputs: Dict[str, Any]) -> str:
+    def _draft_experiments(self, topic: Topic, plan: Plan,
+                          engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Draft the experiments section."""
         prompt = f"""
         Write an experiments section for the following research:
@@ -203,14 +215,14 @@ class WriterAgent:
         """
         
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.6)
+            content = call_llm(prompt, temperature=0.6, tier="strong")
             return self._format_section_content(content, "Experiments")
         except Exception as e:
             log_agent_action("WriterAgent", "experiments_error", {"error": str(e)})
             return self._create_fallback_experiments(topic, plan)
     
-    def _draft_results(self, topic: Dict[str, Any], plan: Dict[str, Any], 
-                      engineer_outputs: Dict[str, Any]) -> str:
+    def _draft_results(self, topic: Topic, plan: Plan,
+                      engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Draft the results section."""
         prompt = f"""
         Write a results section for the following research:
@@ -232,14 +244,14 @@ class WriterAgent:
         """
         
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.6)
+            content = call_llm(prompt, temperature=0.6, tier="strong")
             return self._format_section_content(content, "Results")
         except Exception as e:
             log_agent_action("WriterAgent", "results_error", {"error": str(e)})
             return self._create_fallback_results(topic, plan)
     
-    def _draft_conclusion(self, topic: Dict[str, Any], plan: Dict[str, Any], 
-                         engineer_outputs: Dict[str, Any]) -> str:
+    def _draft_conclusion(self, topic: Topic, plan: Plan,
+                         engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Draft the conclusion section."""
         prompt = f"""
         Write a conclusion section for the following research:
@@ -261,14 +273,14 @@ class WriterAgent:
         """
         
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.7)
+            content = call_llm(prompt, temperature=0.7, tier="strong")
             return self._format_section_content(content, "Conclusion")
         except Exception as e:
             log_agent_action("WriterAgent", "conclusion_error", {"error": str(e)})
             return self._create_fallback_conclusion(topic, plan)
 
-    def _draft_discussion(self, topic: Dict[str, Any], plan: Dict[str, Any],
-                          engineer_outputs: Dict[str, Any]) -> str:
+    def _draft_discussion(self, topic: Topic, plan: Plan,
+                          engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Interpret results after engineering without introducing new measurements."""
         prompt = f"""
 Write the Discussion section for this paper.
@@ -281,14 +293,14 @@ be copied from the experimental source of truth above; do not estimate, fabricat
 or introduce a new number. If a measurement is absent, describe it qualitatively.
 """
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.5)
+            content = call_llm(prompt, temperature=0.5, tier="strong")
             return self._format_section_content(content, "Discussion")
         except Exception as e:
             log_agent_action("WriterAgent", "discussion_error", {"error": str(e)})
             return "# Discussion\n\nThe observed experimental results are interpreted using the recorded outputs; no additional measurements are claimed."
     
-    def _draft_generic_section(self, section_name: str, topic: Dict[str, Any], 
-                              plan: Dict[str, Any], engineer_outputs: Dict[str, Any]) -> str:
+    def _draft_generic_section(self, section_name: str, topic: Topic,
+                              plan: Plan, engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Draft a generic section."""
         prompt = f"""
         Write a {section_name} section for the following research:
@@ -301,13 +313,13 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
         """
         
         try:
-            content = call_gemini(prompt, self.gemini_client, temperature=0.6)
+            content = call_llm(prompt, temperature=0.6, tier="strong")
             return self._format_section_content(content, section_name)
         except Exception as e:
             log_agent_action("WriterAgent", "generic_section_error", {"error": str(e)})
             return f"Error drafting {section_name} section: {str(e)}"
     
-    def _format_engineer_outputs(self, engineer_outputs: Dict[str, Any]) -> str:
+    def _format_engineer_outputs(self, engineer_outputs: Dict[str, ExperimentOutput]) -> str:
         """Format engineer outputs for inclusion in text."""
         if not engineer_outputs:
             return "No experimental results available yet."
@@ -334,15 +346,15 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
         
         return content
     
-    def _store_section(self, section_name: str, content: str, topic: Dict[str, Any]):
+    def _store_section(self, section_name: str, content: str, topic: Topic):
         """Store section content in memory."""
         try:
             # Extract citations
             citations = extract_citations(content)
             
             # Store in memory
-            memory.add_embedding(
-                generate_embedding(content, self.gemini_client),
+            self.vector_memory.add_embedding(
+                generate_embedding(content),
                 {
                     'type': 'paper_section',
                     'section': section_name,
@@ -371,7 +383,7 @@ Experimental results demonstrate the effectiveness of our approach compared to e
         return f"""
 # Introduction
 
-{topic['title']} represents an important challenge in {config.research_domain}. 
+{topic['title']} represents an important challenge in {self.runtime_config.research_domain}. 
 Current approaches have limitations in {topic.get('rationale', 'scalability and efficiency')}. 
 This work addresses these challenges by {topic.get('impact', 'introducing novel methods')}.
 
@@ -387,7 +399,7 @@ and Section 5 concludes with future work.
         return f"""
 # Related Work
 
-Previous work in {config.research_domain} has addressed various aspects of {topic['title']}. 
+Previous work in {self.runtime_config.research_domain} has addressed various aspects of {topic['title']}. 
 However, existing approaches have limitations in {topic.get('rationale', 'scalability and efficiency')}. 
 Our work builds upon these foundations while addressing key gaps in the literature.
 
@@ -434,7 +446,7 @@ and provides guidance for future research directions.
         return f"""
 # Conclusion
 
-This paper presented research on {topic['title']}, addressing key challenges in {config.research_domain}. 
+This paper presented research on {topic['title']}, addressing key challenges in {self.runtime_config.research_domain}. 
 Our main contributions include {', '.join(plan.get('expected_contributions', ['novel methodology', 'comprehensive evaluation']))}.
 
 Future work will explore extensions to other domains and applications, building upon 

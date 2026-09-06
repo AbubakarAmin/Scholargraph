@@ -8,17 +8,24 @@ import json
 from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import call_llm, log_agent_action, parse_json_from_llm
+from core.utils import log_agent_action, parse_json_from_llm
+from core.llm import call_llm
 from core.llm import get_llm_client
+from core.context import RunContext, get_active_context
 from core.memory import memory
 from core.run_log import CrossRunMemory, get_tracker, build_run_summary, read_events, emit_event
+from core.contracts import MetaChatResult, MetaDashboard
+from core.state import ResearchState
 
 
 class MetaAgent:
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
+        self.runtime_config = self.context.config if self.context else config
+        self.feedback_memory = self.context.memory if self.context else memory
         self.client = get_llm_client()
 
-    def evaluate_system_performance(self, state) -> str:
+    def evaluate_system_performance(self, state: ResearchState) -> str:
         log_agent_action("MetaAgent", "start_evaluation", {})
         try:
             metrics = self._gather_performance_metrics(state)
@@ -35,9 +42,9 @@ class MetaAgent:
     def chat(
         self,
         message: str,
-        state: Optional[Dict[str, Any]] = None,
+        state: Optional[ResearchState] = None,
         history: Optional[List[Dict[str, str]]] = None,
-    ) -> Dict[str, Any]:
+    ) -> MetaChatResult:
         """
         Operator ↔ Meta conversation. Answers 'what are we doing?', failures, next steps.
         May return control directives the UI/orchestrator can apply.
@@ -107,7 +114,7 @@ OPERATOR MESSAGE:
         log_agent_action("MetaAgent", "chat", {"control": control})
         return result
 
-    def apply_control(self, control: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def apply_control(self, control: str, state: Optional[ResearchState] = None) -> ResearchState:
         """Apply a light Meta control directive to state (mutates and returns)."""
         state = state or {}
         control = (control or "none").lower()
@@ -129,7 +136,7 @@ OPERATOR MESSAGE:
             state["terminal_error"] = state.get("terminal_error") or "Stopped by Meta/operator"
         return state
 
-    def get_run_dashboard(self, state) -> Dict[str, Any]:
+    def get_run_dashboard(self, state: ResearchState) -> MetaDashboard:
         tracker = get_tracker()
         stats = tracker.stats if tracker else {}
         return {
@@ -150,18 +157,18 @@ OPERATOR MESSAGE:
             "lessons_available": len(CrossRunMemory().load(limit=100)),
         }
 
-    def should_reset(self, state) -> bool:
+    def should_reset(self, state: ResearchState) -> bool:
         if self._detect_stuck_loop(state):
             return True
         if self._detect_low_quality_research(state):
             return True
-        if state["iteration"] >= config.max_iterations:
+        if state["iteration"] >= self.runtime_config.max_iterations:
             return True
         if self._detect_no_progress(state):
             return True
         return False
 
-    def should_continue(self, state) -> bool:
+    def should_continue(self, state: ResearchState) -> bool:
         if not state["selected_topic"] or not state["plan"] or not state["draft_sections"]:
             return False
         if self._scores_improving(state) or self._close_to_threshold(state):
@@ -211,7 +218,7 @@ OPERATOR MESSAGE:
             "stuck_pattern": False,
             "content_growth": "stable",
         }
-        recent_feedback = memory.get_recent_feedback(limit=10)
+        recent_feedback = self.feedback_memory.get_recent_feedback(limit=10)
         if len(recent_feedback) >= 3:
             scores = [e["score"] for e in recent_feedback]
             recent_avg = sum(scores[-3:]) / 3
@@ -243,7 +250,7 @@ JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps"
         )
 
     def _detect_stuck_loop(self, state) -> bool:
-        recent = memory.get_recent_feedback(limit=5)
+        recent = self.feedback_memory.get_recent_feedback(limit=5)
         if len(recent) >= 5:
             scores = [e["score"] for e in recent]
             if all(s < 3.0 for s in scores):
@@ -280,7 +287,7 @@ JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps"
         return False
 
     def _scores_improving(self, state) -> bool:
-        recent = memory.get_recent_feedback(limit=5)
+        recent = self.feedback_memory.get_recent_feedback(limit=5)
         if len(recent) >= 3:
             scores = [e["score"] for e in recent]
             return sum(scores[-3:]) / 3 > sum(scores[:-3]) / max(len(scores) - 3, 1)
@@ -290,9 +297,9 @@ JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps"
         if not state["supervisor_scores"]:
             return False
         avg = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
-        return avg >= (config.supervisor_threshold - 1.0)
+        return avg >= (self.runtime_config.supervisor_threshold - 1.0)
 
-    def get_system_recommendations(self, state) -> List[str]:
+    def get_system_recommendations(self, state: ResearchState) -> List[str]:
         recs = []
         if not state["selected_topic"]:
             recs.append("Discover topics")
@@ -300,6 +307,6 @@ JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps"
             recs.append("Create plan with falsifiable predictions")
         if state.get("supervisor_scores"):
             avg = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
-            if avg < config.supervisor_threshold:
-                recs.append(f"Quality {avg:.1f} < {config.supervisor_threshold}")
+            if avg < self.runtime_config.supervisor_threshold:
+                recs.append(f"Quality {avg:.1f} < {self.runtime_config.supervisor_threshold}")
         return recs

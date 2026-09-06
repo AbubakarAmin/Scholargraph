@@ -317,31 +317,32 @@ def _run_pipeline(domain: Optional[str] = None):
         if domain:
             apply_runtime_keys({"RESEARCH_DOMAIN": domain})
         validate_config()
-        from main import create_research_graph, create_checkpointer, initialize_state, save_results
+        from main import create_checkpointer, create_research_graph, initialize_state, save_results
+        from core.context import create_run_context
+        from core.pipeline import ResearchPipeline
 
         tracker = start_run()
-        workflow = create_research_graph()
-        app_graph = workflow.compile(checkpointer=create_checkpointer())
+        pipeline = ResearchPipeline(
+            create_research_graph,
+            create_checkpointer,
+            context=create_run_context(tracker),
+        )
         state = initialize_state()
         state["run_id"] = tracker.run_id
         _latest_state = state
-        cfg = {
-            "configurable": {"thread_id": tracker.run_id},
-            "recursion_limit": 1000,
-        }
-        last = state
-        for event in app_graph.stream(state, cfg):
-            for node_name, node_output in event.items():
-                if node_name != "__end__":
-                    last = node_output
-                    _latest_state = node_output
-                    tracker.message(f"{node_name} → {node_output.get('current_phase')}")
-        save_results(last)
+        def on_node(node_name, node_output):
+            nonlocal state
+            global _latest_state
+            state = node_output
+            _latest_state = node_output
+            tracker.message(f"{node_name} -> {node_output.get('current_phase')}")
+
+        result = pipeline.run(state, tracker.run_id, on_node=on_node, finalize=save_results)
+        last = result.state
         terminal_error = last.get("terminal_error")
         _run_error = terminal_error
         if terminal_error:
             tracker.message(terminal_error, level="error")
-        tracker.complete(success=bool(last.get("latex_output")) and not terminal_error)
     except Exception as e:
         _run_error = str(e)
         tracker = get_tracker()

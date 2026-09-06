@@ -1,6 +1,6 @@
 """
-Shared utilities — re-exports LLM helpers and common ops.
-Prefer core.llm.call_llm for new code; call_gemini kept for compatibility.
+Shared utilities and common operations.
+Use core.llm for LLM provider access and compatibility aliases.
 """
 
 import json
@@ -13,14 +13,7 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 
 from .config import config
-from .llm import (
-    setup_gemini,
-    call_gemini,
-    call_llm,
-    generate_embedding,
-    get_llm_client,
-    reset_llm_client,
-)
+from .llm import generate_embedding
 
 logging.basicConfig(
     level=getattr(logging, config.log_level),

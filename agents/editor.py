@@ -14,17 +14,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import call_llm, generate_embedding, log_agent_action
+from core.utils import log_agent_action
+from core.llm import call_llm, generate_embedding
 from core.llm import get_llm_client
+from core.context import RunContext, get_active_context
+from core.contracts import ExperimentOutput, Paper, Plan, Topic
 from core.memory import memory
 from core.verification import extract_citation_ids, resolve_doi, resolve_arxiv
 
 
 class EditorAgent:
-    def __init__(self):
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
         self.client = get_llm_client()
-        self.output_dir = config.output_dir
-        self.companion_dir = config.companion_repo_dir
+        runtime_config = self.context.config if self.context else config
+        self.vector_memory = self.context.memory if self.context else memory
+        self.output_dir = runtime_config.output_dir
+        self.companion_dir = runtime_config.companion_repo_dir
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.companion_dir, exist_ok=True)
 
@@ -32,12 +38,12 @@ class EditorAgent:
 
     def create_final_paper(
         self,
-        topic: Dict[str, Any],
+        topic: Topic,
         sections: Dict[str, str],
-        plan: Dict[str, Any],
-        engineer_outputs: Optional[Dict[str, Any]] = None,
+        plan: Plan,
+        engineer_outputs: Optional[Dict[str, ExperimentOutput]] = None,
         debate_results: Optional[List[Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Paper:
         sections = dict(sections)
         # Honest Limitations from unresolved Challenger objections
         if "Limitations" not in sections or len(sections.get("Limitations", "")) < 80:
@@ -58,7 +64,7 @@ class EditorAgent:
             "timestamp": datetime.now().isoformat(),
         }
 
-    def generate_latex(self, final_paper: Dict[str, Any]) -> str:
+    def generate_latex(self, final_paper: Paper) -> str:
         topic = final_paper["topic"]
         sections = final_paper["sections"]
         plan = final_paper.get("plan") or {}
@@ -74,7 +80,7 @@ class EditorAgent:
         with open(latex_path, "w", encoding="utf-8") as f:
             f.write(latex)
         try:
-            memory.add_embedding(
+            self.vector_memory.add_embedding(
                 generate_embedding(topic.get("title", "")),
                 {"type": "final_paper", "topic": topic.get("title"), "latex": latex_path},
             )
@@ -85,12 +91,12 @@ class EditorAgent:
 
     def assemble_paper(
         self,
-        topic: Dict[str, Any],
+        topic: Topic,
         sections: Dict[str, str],
-        plan: Dict[str, Any],
-        engineer_outputs: Optional[Dict[str, Any]] = None,
+        plan: Plan,
+        engineer_outputs: Optional[Dict[str, ExperimentOutput]] = None,
         debate_results: Optional[List[Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Paper:
         final = self.create_final_paper(
             topic, sections, plan, engineer_outputs, debate_results
         )
@@ -108,7 +114,7 @@ class EditorAgent:
     def _limitations_from_debate(
         self,
         debate_results: Optional[List[Any]],
-        plan: Dict[str, Any],
+        plan: Plan,
     ) -> str:
         objections = []
         for d in debate_results or []:
@@ -172,9 +178,9 @@ class EditorAgent:
 
     def _write_companion_repo(
         self,
-        topic: Dict[str, Any],
-        plan: Dict[str, Any],
-        engineer_outputs: Dict[str, Any],
+        topic: Topic,
+        plan: Plan,
+        engineer_outputs: Dict[str, ExperimentOutput],
     ) -> Dict[str, str]:
         root = Path(self.companion_dir)
         root.mkdir(parents=True, exist_ok=True)

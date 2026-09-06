@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any, Dict, List
 
 from core.config import config
@@ -13,12 +14,16 @@ from core.utils import log_agent_action
 from core.verification import reproducibility_dossier
 
 from agents.editor import EditorAgent
+from agents.data import DataAgent
+from agents.analysis import AnalysisAgent
 from agents.engineer import EngineerAgent
+from agents.execution import ExecutionAgent
 from agents.hypothesis_debate import HypothesisDebateSystem
 from agents.meta_agent import MetaAgent
 from agents.planner import PlannerAgent
 from agents.supervisor import SupervisorAgent
 from agents.topic_hunter import ResearchSourceUnavailable, TopicHunterAgent
+from agents.verification import VerificationAgent
 from agents.writer import WriterAgent
 
 logger = logging.getLogger(__name__)
@@ -136,6 +141,47 @@ def planning_node(state: ResearchState) -> ResearchState:
         return state
 
 
+def data_validation_node(state: ResearchState) -> ResearchState:
+    """Validate an explicitly requested dataset before experiments begin."""
+    log_agent_action("Orchestrator", "start_data_validation", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("data_validation")
+    try:
+        plan = state.get("plan") or {}
+        dataset_path = plan.get("dataset_path") or plan.get("dataset_file")
+        if not dataset_path:
+            state["data_validation"] = {
+                "passed": True,
+                "score": 10.0,
+                "note": "No external dataset requested; experiment may use declared synthetic data",
+                "checks": {"dataset_requested": False},
+            }
+            state["current_phase"] = "writing_narrative"
+            return state
+
+        spec = plan.get("dataset_spec") or {
+            "name": Path(dataset_path).stem,
+            "access_policy": "user-provided",
+        }
+        artifact = _create_agent(DataAgent).validate_dataset(dataset_path, spec)
+        key = artifact.get("spec", {}).get("name") or Path(dataset_path).name
+        state["data_artifacts"][key] = artifact
+        state["data_validation"] = artifact.get("validation", {})
+        if not state["data_validation"].get("passed"):
+            state["terminal_error"] = "Dataset validation failed"
+            state["meta_feedback"].append(json.dumps(state["data_validation"]))
+            state["current_phase"] = "complete"
+            state["should_continue"] = False
+            return state
+        state["current_phase"] = "writing_narrative"
+        return state
+    except Exception as exc:
+        logger.error(f"Data validation failed: {exc}")
+        state["terminal_error"] = f"Data validation failed: {exc}"
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
 NARRATIVE_SECTION_NAMES = {"abstract", "introduction", "related work", "methods", "method"}
 RESULTS_SECTION_NAMES = {"abstract", "results", "discussion", "conclusion", "experiments"}
 
@@ -291,6 +337,78 @@ def engineering_node(state: ResearchState) -> ResearchState:
         return state
 
 
+def independent_validation_node(state: ResearchState) -> ResearchState:
+    """Replay engineer code, analyze outputs, and record independent findings."""
+    log_agent_action("Orchestrator", "start_independent_validation", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("independent_validation")
+    try:
+        code_artifacts = {
+            name: {
+                "experiment_name": name,
+                "source_code": output.get("code", ""),
+                "language": "python",
+            }
+            for name, output in state.get("engineer_outputs", {}).items()
+            if output.get("success") and output.get("code")
+        }
+        if not code_artifacts:
+            state["meta_feedback"].append("Independent validation skipped: no executable code artifacts")
+            state["current_phase"] = "writing_results"
+            return state
+
+        execution_agent = _create_agent(ExecutionAgent)
+        for name, code_artifact in code_artifacts.items():
+            experiment = next(
+                (item for item in (state.get("plan") or {}).get("experiments", [])
+                 if isinstance(item, dict) and item.get("name") == name),
+                {},
+            )
+            seeds = [42 + index * 1009 for index in range(config.experiment_seeds)]
+            state["execution_artifacts"][name] = execution_agent.execute(
+                code_artifact,
+                {
+                    "experiment_name": name,
+                    "seeds": seeds,
+                    "resource_limits": {"timeout_seconds": config.sandbox_timeout_sec},
+                },
+            )
+
+        analysis_plan = (state.get("plan") or {}).get("analysis_plan") or {
+            "primary_metric": ((state.get("plan") or {}).get("experiments") or [{}])[0].get(
+                "evaluation_metrics", ["accuracy"]
+            )[0],
+            "statistical_test": "Welch t-test",
+            "confidence_level": 0.95,
+        }
+        report = _create_agent(AnalysisAgent).analyze(state["execution_artifacts"], analysis_plan)
+        state["analysis_reports"]["independent"] = report
+        reports_by_experiment = {
+            name: {"metrics": report.get("metrics", {}).get(name, {})}
+            for name in state["execution_artifacts"]
+        }
+        state["verification_findings"] = _create_agent(VerificationAgent).verify(
+            state["execution_artifacts"],
+            reports_by_experiment,
+        )
+        if any(finding.get("blocking") for finding in state["verification_findings"]):
+            state["meta_feedback"].append("Independent validation produced blocking findings")
+        state["current_phase"] = "writing_results"
+        return state
+    except Exception as exc:
+        logger.error(f"Independent validation failed: {exc}")
+        state["verification_findings"].append({
+            "finding_id": "independent_validation:error",
+            "severity": "error",
+            "check": "independent_validation",
+            "message": str(exc),
+            "blocking": True,
+            "status": "failed",
+        })
+        state["meta_feedback"].append(f"Independent validation error: {exc}")
+        state["current_phase"] = "writing_results"
+        return state
 def supervision_node(state: ResearchState) -> ResearchState:
     log_agent_action("Orchestrator", "start_supervision", {})
     tracker = get_tracker()
@@ -307,7 +425,15 @@ def supervision_node(state: ResearchState) -> ResearchState:
         state["reproducibility"] = reproducibility_dossier(state.get("plan"), state.get("engineer_outputs"))
         if not state["reproducibility"]["passed"]:
             state["meta_feedback"].append("Reproducibility dossier incomplete: " + json.dumps(state["reproducibility"]["checks"]))
-        if state["supervisor_scores"]:
+        has_blocking_findings = any(
+            finding.get("blocking") for finding in state.get("verification_findings", [])
+        )
+        if has_blocking_findings:
+            state["current_phase"] = "meta_evaluation"
+            log_agent_action("Orchestrator", "release_blocked_by_verification", {
+                "findings": len(state.get("verification_findings", [])),
+            })
+        elif state["supervisor_scores"]:
             overall_score = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
             state["current_phase"] = "editing" if overall_score >= config.supervisor_threshold else "meta_evaluation"
             log_agent_action("Orchestrator", "quality_threshold_met" if overall_score >= config.supervisor_threshold else "quality_below_threshold", {"score": overall_score})

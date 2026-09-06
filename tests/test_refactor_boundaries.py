@@ -12,6 +12,7 @@ from core.pipeline import ResearchPipeline
 from core.state import initialize_state
 from core.workflow import create_research_graph
 from core.workflow_nodes import should_continue, should_reset
+from core.workflow_nodes import independent_validation_node
 
 
 class FakeTracker:
@@ -136,8 +137,8 @@ def test_pipeline_marks_tracker_failed_when_execution_raises():
 
 def test_workflow_graph_compiles_with_injected_nodes():
     node_names = {
-        "topic_discovery", "hypothesis_debate", "planning", "writing_narrative",
-        "engineering", "writing_results", "supervision", "meta_evaluation",
+        "topic_discovery", "hypothesis_debate", "planning", "data_validation", "writing_narrative",
+        "engineering", "independent_validation", "writing_results", "supervision", "meta_evaluation",
         "editing", "reset", "should_reset", "should_continue",
     }
     nodes = {name: (lambda state: state) for name in node_names}
@@ -159,6 +160,27 @@ def test_route_selectors_honor_terminal_state():
     state["should_continue"] = True
     assert should_reset(state) == "reset"
     assert should_continue(state) == "continue"
+
+
+def test_independent_validation_node_records_clean_artifacts(tmp_path, monkeypatch):
+    state = initialize_state()
+    state.update({
+        "plan": {"experiments": [{"name": "toy", "evaluation_metrics": ["accuracy"]}]},
+        "engineer_outputs": {
+            "toy": {
+                "success": True,
+                "code": 'import json\nprint(json.dumps({"metrics": {"accuracy": 0.8}}))',
+            }
+        },
+    })
+    monkeypatch.setattr("core.config.config.raw_results_dir", str(tmp_path))
+    monkeypatch.setattr("core.config.config.experiment_seeds", 3)
+
+    result = independent_validation_node(state)
+
+    assert result["execution_artifacts"]["toy"]["status"] == "completed"
+    assert result["analysis_reports"]["independent"]["metrics"]
+    assert result["verification_findings"] == []
 
 
 def test_primary_agent_boundaries_use_shared_contracts():

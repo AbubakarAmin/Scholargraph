@@ -23,8 +23,10 @@ from core.workflow import create_research_graph as build_research_graph
 from core import workflow_nodes
 from core.workflow_nodes import (
     editing_node,
+    data_validation_node,
     engineering_node,
     hypothesis_debate_node,
+    independent_validation_node,
     meta_evaluation_node,
     planning_node,
     reset_node,
@@ -69,8 +71,10 @@ def create_research_graph() -> StateGraph:
             "topic_discovery": topic_discovery_node,
             "hypothesis_debate": hypothesis_debate_node,
             "planning": planning_node,
+            "data_validation": data_validation_node,
             "writing_narrative": write_narrative_sections,
             "engineering": engineering_node,
+            "independent_validation": independent_validation_node,
             "writing_results": write_results_sections,
             "supervision": supervision_node,
             "meta_evaluation": meta_evaluation_node,

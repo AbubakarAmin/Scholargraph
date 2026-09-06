@@ -70,6 +70,21 @@ class ResearchDatabase:
     def finish_run(self, run_id: str, status: str, phase: str, summary: Dict[str, Any]):
         with self.lock, self._connect() as con:
             con.execute("UPDATE research_runs SET ended_at=?, status=?, phase=?, summary_json=? WHERE run_id=?", (self._now(), status, phase, json.dumps(summary, default=str), run_id))
+    def update_run_summary(self, run_id: str, updates: Dict[str, Any]):
+        """Merge additional JSON-safe details into a completed run summary."""
+        with self.lock, self._connect() as con:
+            row = con.execute("SELECT summary_json FROM research_runs WHERE run_id=?", (run_id,)).fetchone()
+            if not row:
+                return
+            try:
+                summary = json.loads(row["summary_json"] or "{}")
+            except json.JSONDecodeError:
+                summary = {}
+            summary.update(updates)
+            con.execute(
+                "UPDATE research_runs SET summary_json=? WHERE run_id=?",
+                (json.dumps(summary, default=str), run_id),
+            )
 
     def record_scratch(self, run_id: str, agent: str, kind: str, content: Any, metadata: Dict[str, Any]):
         with self.lock, self._connect() as con:
@@ -95,6 +110,24 @@ class ResearchDatabase:
         with self._connect() as con:
             rows = con.execute("SELECT * FROM evidence_claims WHERE run_id=? ORDER BY id DESC LIMIT ?", (run_id, limit)).fetchall()
         return [{"section": r["section_name"], "claim": r["claim_text"], "type": r["claim_type"], "status": r["status"], "evidence": json.loads(r["evidence_json"])} for r in reversed(rows)]
+
+    def artifacts(self, run_id: Optional[str], limit: int = 200) -> List[Dict[str, Any]]:
+        if not run_id:
+            return []
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM research_artifacts WHERE run_id=? ORDER BY id DESC LIMIT ?",
+                (run_id, limit),
+            ).fetchall()
+        return [
+            {
+                "artifact_type": row["artifact_type"],
+                "location": row["location"],
+                "metadata": json.loads(row["metadata_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in reversed(rows)
+        ]
 
 
     def list_runs(self, limit: int = 50) -> List[Dict[str, Any]]:

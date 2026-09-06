@@ -136,6 +136,27 @@ def apply_runtime_keys(keys: dict) -> None:
         "EXPERIMENT_SEEDS": "experiment_seeds",
         "EXPERIMENT_BRANCH_COUNT": "experiment_branch_count",
         "MAX_ITERATIONS": "max_iterations",
+        "DEBUG_MODE": "debug_mode",
+        "LOG_LEVEL": "log_level",
+        "VECTOR_DB_PATH": "vector_db_path",
+        "MEMORY_SIZE": "memory_size",
+        "CROSS_RUN_MEMORY_PATH": "cross_run_memory_path",
+        "RUN_LOG_PATH": "run_log_path",
+        "RUN_EVENTS_PATH": "run_events_path",
+        "ELO_RATINGS_PATH": "elo_ratings_path",
+        "CHECKPOINT_PATH": "checkpoint_path",
+        "RESEARCH_DB_PATH": "research_db_path",
+        "OUTPUT_DIR": "output_dir",
+        "DRAFT_VERSIONS_DIR": "draft_versions_dir",
+        "DEBATE_LOG_PATH": "debate_log_path",
+        "FEEDBACK_LOG_PATH": "feedback_log_path",
+        "RAW_RESULTS_DIR": "raw_results_dir",
+        "COMPANION_REPO_DIR": "companion_repo_dir",
+        "SANDBOX_TIMEOUT_SEC": "sandbox_timeout_sec",
+        "SANDBOX_MAX_OUTPUT_BYTES": "sandbox_max_output_bytes",
+        "WEB_HOST": "web_host",
+        "WEB_PORT": "web_port",
+        "KEYS_STORE_PATH": "keys_store_path",
     }
     for env_key, attr in mapping.items():
         if env_key in keys and keys[env_key] not in (None, ""):
@@ -147,6 +168,8 @@ def apply_runtime_keys(keys: dict) -> None:
                     setattr(config, attr, float(value))
                 elif isinstance(current, int) and not isinstance(current, bool):
                     setattr(config, attr, int(value))
+                elif isinstance(current, bool):
+                    setattr(config, attr, str(value).lower() in {"1", "true", "yes", "on"})
                 else:
                     setattr(config, attr, value)
 
@@ -179,6 +202,27 @@ def sync_env_file(keys: dict, env_path: Optional[Path] = None) -> Path:
         "EXPERIMENT_SEEDS",
         "EXPERIMENT_BRANCH_COUNT",
         "MAX_ITERATIONS",
+        "DEBUG_MODE",
+        "LOG_LEVEL",
+        "VECTOR_DB_PATH",
+        "MEMORY_SIZE",
+        "CROSS_RUN_MEMORY_PATH",
+        "RUN_LOG_PATH",
+        "RUN_EVENTS_PATH",
+        "ELO_RATINGS_PATH",
+        "CHECKPOINT_PATH",
+        "RESEARCH_DB_PATH",
+        "OUTPUT_DIR",
+        "DRAFT_VERSIONS_DIR",
+        "DEBATE_LOG_PATH",
+        "FEEDBACK_LOG_PATH",
+        "RAW_RESULTS_DIR",
+        "COMPANION_REPO_DIR",
+        "SANDBOX_TIMEOUT_SEC",
+        "SANDBOX_MAX_OUTPUT_BYTES",
+        "WEB_HOST",
+        "WEB_PORT",
+        "KEYS_STORE_PATH",
     }
     updates = {
         str(k): str(v)

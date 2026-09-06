@@ -9,7 +9,13 @@
   <img src="https://img.shields.io/badge/pytest-Eval%20Harness-0A9EDC?style=for-the-badge" alt="pytest" />
 </p>
 
-ScholarGraph is an autonomous multi-agent research pipeline. Given a research domain, it discovers gaps, adversarially debates hypotheses, designs falsifiable experiments, executes sandboxed code with multi-seed statistics, verifies citations and reported numbers against raw data, and assembles a LaTeX paper plus a companion code repo.
+ScholarGraph is a local, evidence-oriented multi-agent research system. Given a research domain, it discovers candidate gaps, debates hypotheses adversarially, creates falsifiable plans, validates explicitly supplied datasets, generates and executes experiments, independently replays and analyzes results, verifies citations and evidence, and assembles a LaTeX paper plus reproducibility artifacts.
+
+The current implementation is intentionally incremental. The legacy `EngineerAgent`
+path remains available for compatibility, while the newer execution, analysis, and
+verification artifacts are now inserted into the live workflow as an independent
+validation stage. This means the system is already more than a text generator, but
+it is not yet a publication guarantee or a secure multi-user research platform.
 
 For module-by-module architecture notes and the staged refactor plan, see [docs/README.md](docs/README.md).
 
@@ -27,16 +33,17 @@ For module-by-module architecture notes and the staged refactor plan, see [docs/
 6. [State schema](#state-schema)
 7. [Core modules (technical spec)](#core-modules-technical-spec)
 8. [Agents (technical spec)](#agents-technical-spec)
-9. [Verification & quality gates](#verification--quality-gates)
-10. [LLM provider layer](#llm-provider-layer)
-11. [Web UI — Control Deck](#web-ui--control-deck)
-12. [Configuration & environment](#configuration--environment)
-13. [Project layout](#project-layout)
-14. [Outputs & artifacts](#outputs--artifacts)
-15. [Testing / eval harness](#testing--eval-harness)
-16. [CLI & entry points](#cli--entry-points)
-17. [Operations, failure handling, and recovery](#operations-failure-handling-and-recovery)
-18. [Design decisions & limitations](#design-decisions--limitations)
+9. [Capability and tool-access model](#capability-and-tool-access-model)
+10. [Verification & quality gates](#verification--quality-gates)
+11. [LLM provider layer](#llm-provider-layer)
+12. [Web UI — Operations Console](#web-ui--operations-console)
+13. [Configuration & environment](#configuration--environment)
+14. [Project layout](#project-layout)
+15. [Outputs & artifacts](#outputs--artifacts)
+16. [Testing / eval harness](#testing--eval-harness)
+17. [CLI & entry points](#cli--entry-points)
+18. [Operations, failure handling, and recovery](#operations-failure-handling-and-recovery)
+19. [Design decisions & limitations](#design-decisions--limitations)
 
 ---
 
@@ -130,28 +137,39 @@ and [ACM artifact evaluation guidance](https://sigsim.acm.org/conf/pads/2024/blo
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         LangGraph Orchestrator                          │
 │                              (main.py)                                  │
-│  ResearchState + durable SQLite checkpointer + conditional edges        │
+│ ResearchState + durable checkpoint + typed artifacts + conditional edges│
 └───────────┬─────────────────────────────────────────────────────────────┘
             │
-   ┌────────▼────────┐     ┌──────────────┐     ┌─────────────────────────┐
-   │  Topic Hunter   │────▶│   Debate     │────▶│  Planner                │
-   │  citation graph │     │  multi-round │     │  falsifiable + baselines│
-   │  novelty / feas │     │  ensemble    │     │◀── revision requests ───┤
-   └─────────────────┘     └──────────────┘     └───────────┬─────────────┘
-                                                            │
-   ┌─────────────────┐     ┌──────────────┐     ┌───────────▼─────────────┐
-   │  Editor         │◀────│  Supervisor  │◀────│  Writer → Engineer      │
-   │  LaTeX + bib    │     │  HARD then   │     │  branch search          │
-   │  Limitations    │     │  soft LLM    │     │  sandbox / PIVOT/REFINE │
-   │  companion repo │     └──────────────┘     └─────────────────────────┘
-   └────────┬────────┘
-            │
-   ┌────────▼────────────────────────────────────────────────────────────┐
-   │  Shared infrastructure                                              │
-   │  core/llm.py · core/sandbox.py · core/verification.py               │
-   │  core/run_log.py + core/research_db.py (events, claims, artifacts)  │
-   │  core/memory.py (FAISS 768-d) · core/config.py                      │
-   └─────────────────────────────────────────────────────────────────────┘
+   ┌────────▼────────┐   ┌──────────────┐   ┌──────────────┐
+   │ Topic Hunter    │──▶│ Debate       │──▶│ Planner      │
+   │ source broker   │   │ proposer /   │   │ falsifiable  │
+   │ novelty / feas  │   │ challenger   │   │ baselines    │
+   └─────────────────┘   └──────────────┘   └──────┬───────┘
+                                                   │
+                              ┌────────────────────▼──────────────────┐
+                              │ Data validation                       │
+                              │ DataAgent: schema, target, hash       │
+                              └────────────────────┬──────────────────┘
+                                                   │
+   ┌─────────────────┐   ┌────────────────────────▼──────────────────┐
+   │ Writer          │◀──│ Engineer                                   │
+   │ narrative       │   │ implementation + legacy experiment path   │
+   └────────┬────────┘   └────────────────────────┬──────────────────┘
+            │                                     │
+            │              ┌──────────────────────▼──────────────────┐
+            │              │ Independent validation                  │
+            │              │ ExecutionAgent → AnalysisAgent           │
+            │              │                    → VerificationAgent    │
+            │              └──────────────────────┬──────────────────┘
+            │                                     │
+   ┌────────▼────────┐   ┌────────────────────────▼──────────────────┐
+   │ Results Writer  │──▶│ Supervisor: hard checks + release blockers │
+   └─────────────────┘   └────────────────────────┬──────────────────┘
+                                                   │
+                              ┌────────────────────▼──────────────────┐
+                              │ Meta → Editor                         │
+                              │ retry/reset or paper + artifacts      │
+                              └───────────────────────────────────────┘
 ```
 
 **Principles encoded in code:**
@@ -165,6 +183,9 @@ and [ACM artifact evaluation guidance](https://sigsim.acm.org/conf/pads/2024/blo
 | Don’t lose context across agents | Append-only scratchpad (`run_scratchpad.jsonl`) |
 | Improve across runs | `CrossRunMemory` JSONL lessons fed into Topic Hunter / Planner |
 | Cost-aware generation | `tier=cheap\|strong\|judge` model routing in `call_llm` |
+| Separate scientific responsibilities | Data, execution, analysis, and verification agents use distinct manifests |
+| Broker external knowledge | OpenAlex retrieval uses allowlists, retries, validation, hashes, and cache replay |
+| Block unsupported release | Independent verification findings are checked before editing |
 
 ---
 
@@ -176,13 +197,19 @@ Defined in `main.py` → `create_research_graph()`:
 |---|---|---|
 | `topic_discovery` | `should_reset` → reset / continue / end | `reset` \| `hypothesis_debate` \| `END` |
 | `hypothesis_debate` | same | `reset` \| `planning` \| `END` |
-| `planning` | always | `writing_narrative` |
+| `planning` | always | `data_validation` |
+| `data_validation` | no explicit dataset | `writing_narrative` |
+| `data_validation` | valid explicit dataset | `writing_narrative` |
+| `data_validation` | invalid explicit dataset | `END` with terminal validation error |
 | `writing_narrative` | safe non-results sections only | `engineering` |
 | `engineering` | `current_phase == "planning"` | `planning` (revision bounce) |
-| `engineering` | else | `writing_results` |
+| `engineering` | else | `independent_validation` |
+| `independent_validation` | no executable code artifact | `writing_results` with compatibility note |
+| `independent_validation` | code artifacts available | `writing_results` after replay, analysis, verification |
 | `writing_results` | ungrounded quantitative claim, ≤2 retries | `writing_results` |
 | `writing_results` | grounded results/discussion/abstract | `supervision` |
-| `supervision` | avg ≥ `SUPERVISOR_THRESHOLD` | `editing` |
+| `supervision` | avg ≥ threshold and no blocking finding | `editing` |
+| `supervision` | blocking independent finding | `meta_evaluation` |
 | `supervision` | else | `meta_evaluation` |
 | `meta_evaluation` | `should_continue` | `writing_narrative` \| `END` |
 | `editing` | always | `END` |
@@ -195,13 +222,16 @@ graph TD
     HD -->|all topics fail| R
     HD -->|debate PASS| PL[planning]
     R --> TD
-    PL --> WN[writing_narrative]
+    PL --> DV[data_validation]
+    DV --> WN[writing_narrative]
     WN --> EN[engineering]
     EN -->|plan_revision_requests| PL
-    EN -->|experiments complete| WR[writing_results]
+    EN -->|experiments complete| IV[independent_validation]
+    IV --> WR[writing_results]
     WR -->|untraced number; retry| WR
     WR -->|grounded results| SU[supervision]
-    SU -->|avg >= threshold| ED[editing]
+    SU -->|avg >= threshold + no blockers| ED[editing]
+    SU -->|verification blocker| ME[meta_evaluation]
     SU -->|below threshold| ME[meta_evaluation]
     ME -->|continue| WR
     ME -->|stop| END1[END]
@@ -259,7 +289,8 @@ processes or shared users.
 3. Agent scratchpad calls are inserted into `run_scratchpad`; JSONL mirrors are
    retained for easy local inspection.
 4. Supervisor writes verified/failed citation and quantitative claim rows.
-5. Engineer records raw experiment-result artifacts.
+5. Engineer records implementation/legacy experiment artifacts; the independent
+  validation stage records replay execution artifacts and statistical reports.
 6. `RunTracker.complete()` finalizes the run status and summary.
 
 ### Useful local inspection queries
@@ -296,6 +327,11 @@ FROM research_artifacts WHERE run_id = ?;
 | `debate_results` | `List[DebateResult]` | Multi-round debate artifacts |
 | `hypothesis_passed` | `bool` | Debate gate |
 | `plan` | `Optional[Dict]` | Sections, contributions, experiments, variants |
+| `data_artifacts` | `Dict[str, DatasetArtifact]` | Validated user-provided dataset metadata, schema, and hashes |
+| `data_validation` | `VerificationReport` | Dataset gate result; explicit invalid datasets stop the run |
+| `execution_artifacts` | `Dict[str, ExecutionArtifact]` | Seeded replay outputs, raw paths, environment, and hashes |
+| `analysis_reports` | `Dict[str, StatisticalReport]` | Independent metrics, confidence intervals, tests, and warnings |
+| `verification_findings` | `List[Dict]` | Blocking or advisory findings from independent verification |
 | `draft_sections` | `Dict[str, str]` | Section name → markdown/text |
 | `current_section` | `Optional[str]` | Last written section |
 | `engineer_outputs` | `Dict[str, Any]` | Per-experiment results + raw paths |
@@ -361,6 +397,52 @@ Not a full container; blocks documented Agent Laboratory failure modes:
 - **`execute_sandboxed(code, seed)`** — injects `random`/`numpy` seeds, captures stdout/stderr, parses last JSON line
 - **`run_multi_seed(code, n_seeds)`** — aggregates numeric metrics as `{mean, std, values, n}`
 
+The sandbox is an execution policy filter, not a security boundary. It runs in
+the host process and uses a soft thread timeout. Do not treat it as sufficient
+isolation for hostile code, untrusted users, arbitrary package installation, or
+multi-user deployment. The production hardening path is OS/container isolation
+with curated dependencies and immutable artifact mounts.
+
+### `core/contracts.py` — typed research handoffs
+
+The contract module contains `TypedDict` handoffs for `DatasetArtifact`,
+`CodeArtifact`, `ExecutionRequest`, `ExecutionArtifact`, `AnalysisPlan`,
+`StatisticalReport`, `Claim`, `EvidenceBundle`, `VerificationFinding`, and
+`AgentCapabilityManifest`. Artifact provenance can include run identity,
+producer, content hash, parent artifacts, environment, status, and limitations.
+These types are additive to the legacy `ExperimentOutput` contract so older
+callers can migrate without a flag day.
+
+### `core/capabilities.py` and `core/tool_broker.py` — scoped access
+
+`DEFAULT_MANIFESTS` declares what each role may use. For example, Engineer may
+generate code and read/write code artifacts, but cannot execute code, download
+datasets, or perform statistical analysis. Analysis may read execution artifacts
+and write statistical reports, but cannot generate code or download data.
+Verification may replay and inspect artifacts, but cannot generate code or
+change the experiment. `CapabilityBroker` authorizes registered tool calls,
+fails closed for unknown capabilities, and records an audit entry before
+dispatch.
+
+### `core/sources.py` — reliable scholarly retrieval
+
+`SourceClient` is the first brokered source adapter. It currently supports the
+allowlisted OpenAlex, Crossref, arXiv, and Semantic Scholar base domains, with
+OpenAlex integrated into Topic Hunter. It provides:
+
+- HTTPS and source-base allowlisting
+- bounded retries and request timeouts
+- response-size limits
+- optional payload validators
+- deterministic cache keys
+- disk cache replay when a source is offline
+- response/content hashes and retrieval timestamps
+- explicit `verified`, `cached`, and `unavailable` statuses
+
+The returned source artifact preserves raw normalized content and warnings. A
+source outage is infrastructure information; it must not be silently converted
+into a scientific rejection.
+
 ### `core/verification.py` — hard checks
 
 | Function | Spec |
@@ -413,6 +495,12 @@ Re-exports LLM helpers; JSON I/O; `parse_json_from_llm`; SymPy `validate_math_ex
 | Feasibility | Heuristic blocklist (GPU fine-tune, wet lab, proprietary data, low feasibility score) |
 | Parallelism | `ThreadPoolExecutor` with 3 seed angles; lightweight LLM judge ranks survivors |
 | Logging | Every rejection → `CrossRunMemory` + tracker bump |
+
+OpenAlex retrieval is routed through `core.sources.SourceClient`, which caches
+validated responses under `output/source_cache/` and records hashes/statuses.
+The current migration covers OpenAlex first; arXiv and Semantic Scholar still
+have legacy direct adapter paths and are candidates for the next source-client
+migration.
 
 If OpenAlex and arXiv are both unreachable or incompatible, Topic Hunter raises
 `ResearchSourceUnavailable`. The orchestrator records a terminal infrastructure
@@ -475,6 +563,56 @@ validated from the source/experiment ledger rather than from similarity memory.
 
 **Give-up guard:** bare “not feasible” without error/traceback/decision_log marked suspicious (`failure_artifact`).
 
+Engineer remains a compatibility-heavy role: it still contains the legacy
+generation, execution, branch, ablation, and recovery path. The live graph now
+adds an independent validation stage after Engineering, so Engineer output is
+not the only execution or analysis evidence. The long-term target is to narrow
+Engineer to implementation and move all execution/statistics responsibilities
+behind the newer worker contracts.
+
+### Data — `agents/data.py`
+
+`DataAgent` is a dataset stewardship worker. It accepts explicit CSV or JSON
+paths and returns a `DatasetArtifact` containing the absolute location, SHA-256
+hash, row count, columns, dtypes, target checks, and validation status. It flags
+missing targets, target/feature overlap, empty data, and all-missing data. It
+does not generate experiment code, execute experiments, or certify statistical
+claims.
+
+If a plan contains `dataset_path` or `dataset_file`, the graph runs this agent
+in `data_validation` before writing and engineering. Invalid requested data
+terminates the run with a visible validation error. Plans without an explicit
+dataset retain the existing declared-synthetic-data compatibility path.
+
+### Execution — `agents/execution.py`
+
+`ExecutionAgent` wraps the existing `core.sandbox.run_multi_seed` implementation
+instead of duplicating an executor. It validates code before execution, runs the
+requested seed set, captures Python/platform/sandbox metadata, writes raw result
+JSON, and produces an `ExecutionArtifact` with a content hash and status. It
+does not generate code or interpret scientific meaning.
+
+### Analysis — `agents/analysis.py`
+
+`AnalysisAgent` consumes execution artifacts only. It uses SciPy and NumPy to
+compute metric summaries, 95% confidence intervals, Welch comparisons, and
+Cohen’s d where two groups are available. It records warnings for insufficient
+seeds, missing raw values, missing primary metrics, failed executions, and
+missing comparison artifacts. It cannot mutate code or datasets.
+
+### Verification — `agents/verification.py`
+
+`VerificationAgent` independently checks execution artifacts and reports:
+
+- raw result path exists
+- raw result content hash matches the execution artifact
+- execution completed successfully
+- an independent analysis report exists
+- reported statistics agree with raw results via `core.verification`
+
+Findings are structured and can be blocking. The supervisor refuses the editing
+route when any blocking finding is present.
+
 ### Supervisor — `agents/supervisor.py`
 
 **Order (critical):**
@@ -516,14 +654,62 @@ Weighted blend when hard passed: hard 0.35 + math 0.15 + code 0.15 + reviewer 0.
 | Plan falsifiability | Planner | Missing prediction/test → repair or flag |
 | Plan baselines | Planner | Empty baselines → flag/repair |
 | Sandbox | Engineer | AST/runtime reject dangerous code |
-| Multi-seed | Engineer | ≥ `EXPERIMENT_SEEDS` (3); report mean±std |
+| Dataset validation | DataAgent | Explicit user dataset must exist, parse, contain rows, and include a valid target when declared |
+| Multi-seed | Engineer + ExecutionAgent | Requested seeds are replayed; report mean±std and retain raw values |
+| Independent analysis | AnalysisAgent | SciPy summaries, confidence intervals, Welch comparison, effect size, warnings |
+| Artifact integrity | VerificationAgent | Raw path exists and content hash matches |
+| Independent statistics | VerificationAgent | Analysis report agrees with raw execution results |
 | Citation resolve | Supervisor hard | Unresolved DOI/arXiv → hard fail |
 | Stats match raw | Supervisor hard | Reported vs recomputed within rtol |
 | Section quality | Supervisor overall | Mean ≥ `SUPERVISOR_THRESHOLD` (8.5) → editing |
 | Iteration budget | Meta / reset | `MAX_ITERATIONS` (10) |
 | Suspicious give-up | Meta | Failure without concrete artifact |
 
+### Release-readiness interpretation
+
+The console’s “Ready” state means the implemented release checks passed; it does
+not mean the research is novel, causal, generalizable, or publication-ready.
+The system still needs human domain review, source relevance review, appropriate
+data governance, and independent reproduction before external submission.
+
 ---
+
+## Capability and tool-access model
+
+ScholarGraph distinguishes **knowledge retrieval** from **experiment
+execution**. Discovery agents may use approved scholarly-source adapters;
+generated experiment code runs through the restricted sandbox and does not have
+network, shell, arbitrary filesystem, or package-install access.
+
+### Current role manifests
+
+| Role | Allowed | Explicitly forbidden |
+|---|---|---|
+| Engineer | Code generation, artifact read/write | Dataset download, code execution, statistical analysis, claim verification |
+| DataAgent | Literature/data retrieval, dataset catalog/download, artifact write | Code generation/execution, statistical analysis, claim verification |
+| ExecutionAgent | Artifact read, code execution, artifact write | Code generation, dataset download, statistical analysis, claim verification |
+| AnalysisAgent | Artifact read, statistical analysis, report write | Code generation/execution, dataset download, claim verification |
+| VerificationAgent | Artifact read, replay, claim verification, finding write | Code generation, dataset download, statistical analysis |
+
+These are policy manifests and broker checks, not yet a complete operating
+system security boundary. The current `CapabilityBroker` dispatches registered
+tools and audits authorization; direct legacy calls remain in older agents and
+are being migrated incrementally.
+
+### Information reliability rules
+
+Source access should be treated as an evidence pipeline:
+
+1. use an allowlisted adapter;
+2. apply timeout, retry, and response-size limits;
+3. validate the response shape;
+4. cache the raw response for replay;
+5. retain retrieval metadata and hashes;
+6. expose `verified`, `cached`, or `unavailable` state;
+7. never turn a failed lookup into an invented fact.
+
+The current implementation applies this path to OpenAlex first. A future source
+adapter should preserve the same contract before being used by an agent.
 
 ## LLM provider layer
 
@@ -567,13 +753,13 @@ ENSEMBLE_JUDGE_MODELS=model-a,model-b,model-c
 
 ---
 
-## Web UI — Control Deck
+## Web UI — Operations Console
 
 | Item | Spec |
 |---|---|
 | Entry | `python run_ui.py` → `web/app.py` (FastAPI + Uvicorn) |
 | Default bind | `WEB_HOST=127.0.0.1` `WEB_PORT=8765` |
-| Frontend | `web/static/index.html` — single-page control deck |
+| Frontend | `web/static/admin.html` — operational local admin console; `index.html` remains as a legacy fallback |
 | Key store | `POST /api/keys` → `memory/keys.json` + `apply_runtime_keys` + `reset_llm_client` |
 
 **Main API routes:**
@@ -584,7 +770,9 @@ ENSEMBLE_JUDGE_MODELS=model-a,model-b,model-c
 | GET | `/api/health` | Provider + key presence |
 | GET/POST | `/api/keys` | Load (masked) / save keys |
 | POST | `/api/keys/test` | Smoke LLM call |
-| GET | `/api/dashboard` | Live stats, phase, events tail, cross-run lessons |
+| GET | `/api/dashboard` | Live stats, phase, events, workspace artifacts, findings, capabilities |
+| GET | `/api/artifacts` | Durable artifact records for the selected run |
+| GET | `/api/capabilities` | Agent capability manifests and allowed/forbidden operations |
 | GET | `/api/events` | Event stream |
 | GET | `/api/scratchpad` | Raw agent scratchpad |
 | POST | `/api/run` | Start pipeline in background thread |
@@ -598,15 +786,20 @@ ENSEMBLE_JUDGE_MODELS=model-a,model-b,model-c
 - **Required vs optional labels:** credentials and OpenAlex email are marked
   required; routing overrides, extra scholarly APIs, and tuning thresholds are
   optional.
-- **Pipeline rail:** shows pending, active, and completed nodes; a node opens
-  the workspace most relevant to that phase.
-- **Workspace tabs:** Paper renders the working manuscript; Debate displays
-  rounds and ensemble scores; Experiments displays branches/metrics; Plan
-  exposes predictions/tests/baselines; Evidence trace displays the ledger’s
-  claim-to-evidence rows and reproducibility dossier.
+- **Operations-first home:** release readiness, current phase, experiment count,
+  blocking findings, gate checks, and latest activity are the first view.
+- **Evidence workspace:** dataset and execution artifact lineage, hashes,
+  locations, verification findings, and durable claim records.
+- **Jobs workspace:** replay seeds, aggregate metrics, raw result paths, and
+  execution status.
+- **Agent registry:** visible allowed and forbidden capabilities for each role.
+- **Manuscript workspace:** downstream paper rendering remains available, but
+  it is no longer the product’s only organizing surface.
+- **Run history:** durable SQLite run records.
+- **Settings:** provider, domain, OpenAlex email, and experiment seed controls.
 - **Error presentation:** a stopped run displays a visible, actionable error
   banner. A source outage is not presented as a scientific rejection.
-- **Live refresh:** the browser polls status/dashboard/scratchpad every 2.5 s.
+- **Live refresh:** the browser polls status/dashboard/scratchpad every 3 s.
   It does not expose pause/stop controls as working features because the graph
   has not yet implemented cooperative user interrupts.
 
@@ -664,6 +857,10 @@ Scholargraph/
 │   ├── planner.py
 │   ├── writer.py
 │   ├── engineer.py
+│   ├── data.py              # Dataset validation and provenance
+│   ├── execution.py         # Independent seeded replay worker
+│   ├── analysis.py          # Independent SciPy analysis worker
+│   ├── verification.py      # Artifact/hash/statistical verifier
 │   ├── supervisor.py
 │   ├── meta_agent.py
 │   └── editor.py
@@ -673,14 +870,30 @@ Scholargraph/
 │   ├── utils.py            # Shared helpers + legacy aliases
 │   ├── memory.py           # FAISS + debate/feedback logs
 │   ├── sandbox.py          # Restricted code execution
+│   ├── capabilities.py     # Role manifests and authorization
+│   ├── tool_broker.py      # Auditable registered-tool dispatch
+│   ├── sources.py          # Allowlisted cached scholarly retrieval
+│   ├── contracts.py        # Typed artifact/evidence handoffs
+│   ├── context.py          # Per-run dependencies and manifests
+│   ├── state.py            # ResearchState and validation artifacts
+│   ├── workflow.py         # LangGraph graph assembly
+│   ├── workflow_nodes.py   # Phase nodes and validation gate
 │   ├── verification.py     # Citation + statistical hard checks
 │   ├── run_log.py          # Events, scratchpad, cross-run memory
 │   └── research_db.py      # SQLite runs, provenance, evidence, artifacts
 ├── web/
 │   ├── app.py              # FastAPI Control Deck API
-│   └── static/index.html   # Dashboard UI
+│   └── static/admin.html   # Current operations console
+│       static/index.html   # Legacy UI fallback
 ├── tests/
 │   ├── test_eval_harness.py
+│   ├── test_capabilities.py
+│   ├── test_sources.py
+│   ├── test_data_agent.py
+│   ├── test_execution_agent.py
+│   ├── test_analysis_agent.py
+│   ├── test_verification_agent.py
+│   ├── test_refactor_boundaries.py
 │   └── smoke_offline.py
 ├── templates/              # LaTeX templates (legacy/support)
 ├── memory/                 # FAISS, keys.json, cross_run.jsonl, elo
@@ -698,6 +911,7 @@ Scholargraph/
 | `output/plan_*.json` / `plan.yaml` | Research plan snapshot |
 | `output/research_summary.json` | Run summary (topic, scores, experiments) |
 | `output/raw_results/*.json` | Multi-seed raw + aggregate metrics |
+| `output/source_cache/*.json` | Cached OpenAlex source artifacts for offline replay |
 | `output/*_results.json` | Per-experiment Engineer dumps |
 | `memory/research_ledger.sqlite` | Authoritative runs, events, scratchpad, claims, artifacts |
 | `memory/checkpoints.sqlite` | Durable LangGraph execution checkpoints |
@@ -734,6 +948,24 @@ Coverage includes (offline / mocked where needed):
 - Graceful scholarly-source outage termination (no misleading reset loop)
 - SQLite run/event/claim/scratchpad/artifact persistence
 - Reproducibility dossier requirements
+- Capability manifests fail closed for undeclared tools
+- Capability broker audits authorized calls and denies before dispatch
+- Source client allowlisting, validation, retries, cache replay, hashes, and outages
+- DatasetAgent hashing, schema checks, target checks, and unsupported formats
+- ExecutionAgent seeded replay, raw artifact creation, and forbidden-code rejection
+- AnalysisAgent confidence intervals, Welch tests, effect sizes, and seed warnings
+- VerificationAgent raw-path, hash, and statistical mismatch blockers
+- Live workflow integration for dataset validation and independent validation
+
+Run the complete current suite with:
+
+```powershell
+python -m pytest -q
+```
+
+The maintained suite currently covers the full offline boundary set. Live LLM
+and scholarly-source scripts may still contact external services and consume
+quota when run directly.
 
 These tests are the measurement surface for “did this upgrade help?” — add a test before wiring new gates into the graph.
 
@@ -761,11 +993,13 @@ These tests are the measurement surface for “did this upgrade help?” — add
 | Missing or invalid provider key | Validation fails before workflow work starts | Select the intended provider and enter its required key(s) |
 | OpenAlex + arXiv unavailable | One terminal source error; no reset loop | Restore network/source access, verify `OPENALEX_EMAIL`, then start a new run |
 | One scholarly source unavailable | Continue with the available source; record failure in trace | Inspect trace and retry if broad coverage matters |
+| Explicit dataset missing/invalid | Data validation terminates the run before writing/engineering | Correct the path, format, target, or feature specification |
 | Topic novelty/feasibility rejection | Candidate rejected and next candidate considered | Inspect reason; refine scope/domain if appropriate |
 | Debate failure | Next ranked candidate is tried | Read objections; it is a research result, not an app crash |
 | Unsafe/invalid experiment code | AST rejection then refine, pivot, or plan revision | Inspect failure artifact and revision request |
 | Untraced result number | Results writer redrafts before supervision | Inspect `results_verification` and the Engineer artifact |
 | Citation/statistics hard failure | Section score capped; LLM review cannot rescue it | Correct the identifier, source, result, or wording |
+| Independent verification blocker | Editing/release route is blocked and Meta can evaluate recovery | Inspect raw artifacts, hashes, statistical report, and finding |
 | Process crash | Latest workflow checkpoint remains durable | Resume: `python main.py --resume <run_id>` |
 
 ### Safe operating procedure
@@ -798,7 +1032,18 @@ consistent copy.
 **Decisions**
 
 - Prefer **verification compute** over prettier generation (Supervisor hard path first).
+- Prefer mature existing libraries over custom replacements: LangGraph for
+  orchestration, Pydantic contracts/settings, pandas/NumPy/SciPy for analysis,
+  SymPy for symbolic checks, FastAPI for the local API, and the existing
+  sandbox/multi-seed runner for execution.
 - Keep Proposer / Challenger / Moderator as distinct personas; collapse only pure transform steps.
+- Separate data stewardship, implementation, execution, analysis, and
+  verification responsibilities even when the legacy Engineer path remains for
+  compatibility.
+- Give agents typed, scoped capabilities rather than arbitrary internet,
+  filesystem, shell, or package-install access.
+- Cache and hash external source responses so discovery can be inspected and
+  replayed without silently trusting a live network response.
 - Engineer sandbox is **in-process lockdown**, not Docker/E2B — sufficient against exit/subprocess/host-install patterns; not a security boundary against determined escape.
 - OpenAI embeddings are **padded/truncated to 768** for FAISS compatibility with Gemini-era indexes.
 - Narrative writing is separated from result writing. Results, Discussion, and
@@ -808,6 +1053,16 @@ consistent copy.
 **Limitations**
 
 - Live runs cost API tokens and wall time; novelty/citation-graph calls need network.
+- OpenAlex is currently migrated to the reliable `SourceClient`; arXiv,
+  Semantic Scholar, and other source paths still need the same adapter migration.
+- The capability broker is an enforceable application policy, but older direct
+  provider calls remain during migration and the broker is not an OS sandbox.
+- The new execution/analysis/verification chain is integrated after the legacy
+  Engineer path; Engineer still owns legacy generation, execution, branching,
+  ablation, and recovery code that will be narrowed in a later migration.
+- The current admin console is local single-user and polling-based. It has no
+  authentication, role management, CSRF protection, or multi-process job queue;
+  keep it bound to localhost.
 - PDF compilation requires a local `pdflatex` if you want PDF (LaTeX source is always written).
 - Soft ReviewerBot remains an LLM judgment — intentionally last, never the only gate.
 - SQLite is designed for this local single-process desktop deployment. Shared,

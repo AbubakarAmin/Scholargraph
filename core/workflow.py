@@ -20,8 +20,10 @@ def create_research_graph(nodes: Mapping[str, Node]) -> StateGraph:
     workflow.add_node("topic_discovery", nodes["topic_discovery"])
     workflow.add_node("hypothesis_debate", nodes["hypothesis_debate"])
     workflow.add_node("planning", nodes["planning"])
+    workflow.add_node("data_validation", nodes["data_validation"])
     workflow.add_node("writing_narrative", nodes["writing_narrative"])
     workflow.add_node("engineering", nodes["engineering"])
+    workflow.add_node("independent_validation", nodes["independent_validation"])
     workflow.add_node("writing_results", nodes["writing_results"])
     workflow.add_node("supervision", nodes["supervision"])
     workflow.add_node("meta_evaluation", nodes["meta_evaluation"])
@@ -40,14 +42,20 @@ def create_research_graph(nodes: Mapping[str, Node]) -> StateGraph:
         nodes["should_reset"],
         {"reset": "reset", "continue": "planning", "end": END},
     )
-    workflow.add_edge("planning", "writing_narrative")
+    workflow.add_edge("planning", "data_validation")
+    workflow.add_conditional_edges(
+        "data_validation",
+        lambda state: "end" if state.get("current_phase") == "complete" else "continue",
+        {"continue": "writing_narrative", "end": END},
+    )
     workflow.add_edge("writing_narrative", "engineering")
 
     workflow.add_conditional_edges(
         "engineering",
-        lambda state: "planning" if state.get("current_phase") == "planning" else "writing_results",
-        {"planning": "planning", "writing_results": "writing_results"},
+        lambda state: "planning" if state.get("current_phase") == "planning" else "independent_validation",
+        {"planning": "planning", "independent_validation": "independent_validation"},
     )
+    workflow.add_edge("independent_validation", "writing_results")
     workflow.add_conditional_edges(
         "writing_results",
         lambda state: "redraft" if state.get("current_phase") == "writing_results" else "supervision",

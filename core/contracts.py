@@ -3,6 +3,153 @@
 from typing import Any, Dict, List, TypedDict
 
 
+class ArtifactProvenance(TypedDict, total=False):
+    """Traceability metadata shared by every research artifact."""
+
+    artifact_id: str
+    run_id: str
+    producer: str
+    artifact_type: str
+    content_hash: str
+    created_at: str
+    source: str
+    parent_artifacts: List[str]
+    environment: Dict[str, Any]
+    limitations: List[str]
+    status: str
+
+
+class ResearchQuestion(TypedDict, total=False):
+    question_id: str
+    question: str
+    hypothesis: str
+    falsifiable_prediction: str
+    null_hypothesis: str
+    primary_metric: str
+    status: str
+
+
+class DatasetSpec(TypedDict, total=False):
+    name: str
+    source: str
+    version: str
+    license: str
+    task: str
+    features: List[str]
+    target: str
+    split_policy: str
+    leakage_controls: List[str]
+    access_policy: str
+
+
+class SourceArtifact(TypedDict, total=False):
+    provenance: ArtifactProvenance
+    source: str
+    url: str
+    retrieved_at: str
+    status: str
+    response_hash: str
+    content: Dict[str, Any]
+    warnings: List[str]
+
+
+class DatasetArtifact(TypedDict, total=False):
+    provenance: ArtifactProvenance
+    spec: DatasetSpec
+    location: str
+    content_hash: str
+    schema: Dict[str, Any]
+    row_count: int
+    validation: "VerificationReport"
+
+
+class CodeArtifact(TypedDict, total=False):
+    provenance: ArtifactProvenance
+    experiment_name: str
+    source_code: str
+    language: str
+    dependencies: List[str]
+    entrypoint: str
+    validation: "VerificationReport"
+
+
+class ExecutionRequest(TypedDict, total=False):
+    experiment_name: str
+    code_artifact_id: str
+    dataset_artifact_ids: List[str]
+    seeds: List[int]
+    timeout_seconds: int
+    resource_limits: Dict[str, Any]
+
+
+class ExecutionArtifact(TypedDict, total=False):
+    provenance: ArtifactProvenance
+    request: ExecutionRequest
+    raw_results_path: str
+    environment: Dict[str, Any]
+    seed_results: Dict[str, Any]
+    status: str
+    error: str
+    content_hash: str
+
+
+class AnalysisPlan(TypedDict, total=False):
+    primary_metric: str
+    secondary_metrics: List[str]
+    statistical_test: str
+    effect_size: str
+    confidence_level: float
+    multiple_comparison_policy: str
+    stopping_rule: str
+
+
+class StatisticalReport(TypedDict, total=False):
+    provenance: ArtifactProvenance
+    analysis_plan: AnalysisPlan
+    metrics: Dict[str, Any]
+    comparisons: List[Dict[str, Any]]
+    warnings: List[str]
+    passed: bool
+
+
+class Claim(TypedDict, total=False):
+    claim_id: str
+    text: str
+    claim_type: str
+    evidence_artifact_ids: List[str]
+    status: str
+    limitations: List[str]
+
+
+class EvidenceBundle(TypedDict, total=False):
+    claim: Claim
+    dataset_artifacts: List[DatasetArtifact]
+    code_artifacts: List[CodeArtifact]
+    execution_artifacts: List[ExecutionArtifact]
+    statistical_reports: List[StatisticalReport]
+    verification_findings: List[Dict[str, Any]]
+
+
+class VerificationFinding(TypedDict, total=False):
+    finding_id: str
+    severity: str
+    check: str
+    message: str
+    artifact_ids: List[str]
+    blocking: bool
+    status: str
+
+
+class AgentCapabilityManifest(TypedDict, total=False):
+    agent: str
+    role: str
+    allowed_capabilities: List[str]
+    forbidden_capabilities: List[str]
+    input_artifact_types: List[str]
+    output_artifact_types: List[str]
+    can_mutate: List[str]
+
+
 class Topic(TypedDict, total=False):
     title: str
     description: str

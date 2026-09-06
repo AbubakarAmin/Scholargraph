@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import arxiv
@@ -21,6 +22,7 @@ from core.context import RunContext, get_active_context
 from core.contracts import FeasibilityReport, Topic
 from core.memory import memory
 from core.run_log import CrossRunMemory, get_tracker
+from core.sources import SourceClient
 from agents.hypothesis_debate import EloStore, hypothesis_kind
 
 
@@ -45,6 +47,9 @@ class TopicHunterAgent:
             "crossref": "https://api.crossref.org",
             "s2": "https://api.semanticscholar.org/graph/v1",
         }
+        self.source_client = SourceClient(
+            str(Path(self.runtime_config.output_dir) / "source_cache")
+        )
         self.rejection_log: List[Dict[str, Any]] = []
         self.source_health: Dict[str, Dict[str, Any]] = {}
 
@@ -65,9 +70,16 @@ class TopicHunterAgent:
                 "select": "id,title,abstract_inverted_index,publication_year,cited_by_count,concepts,type,doi",
                 "mailto": self.runtime_config.openalex_email,
             }
-            r = requests.get(url, headers=self.openalex_headers, params=params, timeout=30)
-            r.raise_for_status()
-            rows = r.json().get("results", [])
+            artifact = self.source_client.fetch_json(
+                "openalex",
+                f"{url}/",
+                headers=self.openalex_headers,
+                params=params,
+                validator=lambda payload: isinstance(payload, dict) and "results" in payload,
+            )
+            if artifact["status"] == "unavailable":
+                raise RuntimeError("; ".join(artifact.get("warnings", [])) or "source unavailable")
+            rows = artifact["content"].get("results", [])
             for row in rows:
                 inverted = row.pop("abstract_inverted_index", None) or {}
                 if inverted:

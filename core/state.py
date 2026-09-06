@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, List, Optional, TypedDict
 
-from .contracts import ExperimentOutput, Plan, Topic, VerificationReport
+from .contracts import DatasetArtifact, ExecutionArtifact, ExperimentOutput, Plan, StatisticalReport, Topic, VerificationReport
 
 
 class ResearchState(TypedDict):
@@ -18,6 +18,11 @@ class ResearchState(TypedDict):
     debate_results: List[Dict[str, Any]]
     hypothesis_passed: bool
     plan: Optional[Plan]
+    data_artifacts: Dict[str, DatasetArtifact]
+    data_validation: VerificationReport
+    execution_artifacts: Dict[str, ExecutionArtifact]
+    analysis_reports: Dict[str, StatisticalReport]
+    verification_findings: List[Dict[str, Any]]
     draft_sections: Dict[str, str]
     current_section: Optional[str]
     engineer_outputs: Dict[str, ExperimentOutput]
@@ -47,6 +52,11 @@ def initialize_state() -> ResearchState:
         debate_results=[],
         hypothesis_passed=False,
         plan=None,
+        data_artifacts={},
+        data_validation={},
+        execution_artifacts={},
+        analysis_reports={},
+        verification_findings=[],
         draft_sections={},
         current_section=None,
         engineer_outputs={},

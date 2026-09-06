@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextvars import ContextVar, Token
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from .config import Config, config as default_config
 from .memory import memory as default_memory
 from .research_db import research_db as default_research_db
 from .ports import ResearchLedgerPort, VectorMemoryPort
 from .run_log import RunTracker
+from .capabilities import DEFAULT_MANIFESTS
 
 
 @dataclass
@@ -22,6 +23,7 @@ class RunContext:
     research_db: ResearchLedgerPort
     tracker: Optional[RunTracker] = None
     run_id: Optional[str] = None
+    capability_manifests: Dict[str, Dict[str, Any]] | None = None
 
 
 _active_context: ContextVar[Optional[RunContext]] = ContextVar(
@@ -38,6 +40,7 @@ def create_run_context(tracker: Optional[RunTracker] = None) -> RunContext:
         research_db=default_research_db,
         tracker=tracker,
         run_id=tracker.run_id if tracker else None,
+        capability_manifests=dict(DEFAULT_MANIFESTS),
     )
 
 

@@ -32,6 +32,7 @@ from core.run_log import (
 )
 from core.memory import memory
 from core.research_db import research_db
+from core.capabilities import DEFAULT_MANIFESTS
 
 app = FastAPI(title="ScholarGraph Control Deck", version="2.0")
 app.add_middleware(
@@ -102,7 +103,7 @@ def _startup():
 
 @app.get("/")
 def index():
-    index_path = STATIC / "index.html"
+    index_path = STATIC / "admin.html"
     if index_path.exists():
         return FileResponse(index_path)
     return HTMLResponse("<h1>ScholarGraph</h1><p>static/index.html missing</p>")
@@ -121,7 +122,7 @@ def health():
 
 @app.get("/api/config")
 def get_config():
-    return {
+    values = {
         "llm_provider": config.llm_provider,
         "gemini_model": config.gemini_model,
         "openai_model": config.openai_model,
@@ -146,7 +147,29 @@ def get_config():
         "scite_enabled": bool(config.scite_api_key),
         "research_db_path": config.research_db_path,
         "checkpoint_path": config.checkpoint_path,
+        "gemini_embedding_model": config.gemini_embedding_model,
+        "openai_embedding_model": config.openai_embedding_model,
+        "debug_mode": config.debug_mode,
+        "log_level": config.log_level,
+        "vector_db_path": config.vector_db_path,
+        "memory_size": config.memory_size,
+        "cross_run_memory_path": config.cross_run_memory_path,
+        "run_log_path": config.run_log_path,
+        "run_events_path": config.run_events_path,
+        "elo_ratings_path": config.elo_ratings_path,
+        "output_dir": config.output_dir,
+        "draft_versions_dir": config.draft_versions_dir,
+        "debate_log_path": config.debate_log_path,
+        "feedback_log_path": config.feedback_log_path,
+        "raw_results_dir": config.raw_results_dir,
+        "companion_repo_dir": config.companion_repo_dir,
+        "sandbox_timeout_sec": config.sandbox_timeout_sec,
+        "sandbox_max_output_bytes": config.sandbox_max_output_bytes,
+        "web_host": config.web_host,
+        "web_port": config.web_port,
+        "keys_store_path": config.keys_store_path,
     }
+    return values
 
 
 @app.get("/api/keys")
@@ -204,8 +227,15 @@ def post_keys(payload: KeysPayload):
 def test_llm():
     try:
         validate_config()
-        text = call_llm("Reply with exactly: OK", temperature=0, tier="cheap", max_tokens=16)
-        return {"ok": True, "response": (text or "").strip()[:200]}
+        text = (call_llm("Reply with exactly: OK", temperature=0, tier="cheap", max_tokens=16) or "").strip()
+        if not text:
+            raise RuntimeError("Provider returned an empty response")
+        return {
+            "ok": True,
+            "response": text[:200],
+            "provider": config.llm_provider,
+            "model": config.resolve_model("cheap"),
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -232,6 +262,7 @@ def dashboard(run_id: Optional[str] = None):
                 "phase": found["phase"] or "completed",
                 "stats": summary.get("stats", {}),
                 "recent_messages": [],
+                "workspace": summary.get("workspace", {}),
             }
         else:
             dash = {
@@ -252,25 +283,45 @@ def dashboard(run_id: Optional[str] = None):
         "model": config.resolve_model("default"),
         "domain": config.research_domain,
     }
-    state = _latest_state or {}
+    state = _latest_state if tracker and (run_id is None or run_id == tracker.run_id) else {}
 
     debates = []
     for item in state.get("debate_results", []):
         debates.append(item.__dict__ if hasattr(item, "__dict__") else item)
-    dash["workspace"] = {
-        "debates": debates,
-        "plan": state.get("plan"),
-        "plan_revision_requests": state.get("plan_revision_requests", []),
-        "engineer_outputs": state.get("engineer_outputs", {}),
-        "paper": state.get("final_paper") or {"sections": state.get("draft_sections", {})},
-        "draft_sections": state.get("draft_sections", {}),
-        "supervisor_scores": state.get("supervisor_scores", {}),
-        "supervisor_feedback": state.get("supervisor_feedback", {}),
-        "results_verification": state.get("results_verification", {}),
-        "reproducibility": state.get("reproducibility", {}),
-    }
+    if state:
+        dash["workspace"] = {
+            "debates": debates,
+            "plan": state.get("plan"),
+            "plan_revision_requests": state.get("plan_revision_requests", []),
+            "engineer_outputs": state.get("engineer_outputs", {}),
+            "paper": state.get("final_paper") or {"sections": state.get("draft_sections", {})},
+            "draft_sections": state.get("draft_sections", {}),
+            "supervisor_scores": state.get("supervisor_scores", {}),
+            "supervisor_feedback": state.get("supervisor_feedback", {}),
+            "results_verification": state.get("results_verification", {}),
+            "reproducibility": state.get("reproducibility", {}),
+            "data_artifacts": state.get("data_artifacts", {}),
+            "data_validation": state.get("data_validation", {}),
+            "execution_artifacts": state.get("execution_artifacts", {}),
+            "analysis_reports": state.get("analysis_reports", {}),
+            "verification_findings": state.get("verification_findings", []),
+        }
     dash["evidence_trace"] = research_db.claims(dash.get("run_id"))
+    dash["capabilities"] = DEFAULT_MANIFESTS
     return dash
+
+
+@app.get("/api/capabilities")
+def capabilities():
+    """Return the role/tool contract used by the current runtime."""
+    return {"capabilities": DEFAULT_MANIFESTS}
+
+
+@app.get("/api/artifacts")
+def artifacts(run_id: Optional[str] = None):
+    """Return durable artifact records for the selected run."""
+    target_run_id = run_id or (get_tracker().run_id if get_tracker() else None)
+    return {"artifacts": research_db.artifacts(target_run_id)}
 
 
 @app.get("/api/events")
@@ -296,9 +347,21 @@ def get_runs(limit: int = 50):
 @app.post("/api/data/clear")
 def clear_all_data():
     global _latest_state, _run_error
+    if _run_thread and _run_thread.is_alive():
+        raise HTTPException(status_code=409, detail="Stop the active run before clearing local data")
     research_db.clear_all()
     memory.clear_all()
     CrossRunMemory().clear()
+    for path_value in (config.run_events_path, config.run_log_path):
+        path = Path(path_value)
+        if path.exists():
+            path.write_text("", encoding="utf-8")
+    checkpoint = Path(config.checkpoint_path)
+    for path in (checkpoint, Path(f"{checkpoint}-wal"), Path(f"{checkpoint}-shm")):
+        try:
+            path.unlink(missing_ok=True)
+        except PermissionError:
+            raise HTTPException(status_code=409, detail="Checkpoint storage is still in use")
     _latest_state = {}
     _run_error = None
     return {"ok": True, "message": "All runs, memories, and event logs cleared."}
@@ -308,6 +371,29 @@ def clear_all_data():
 def delete_single_run(run_id: str):
     research_db.delete_run(run_id)
     return {"ok": True, "message": f"Run {run_id} deleted."}
+
+def _workspace_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep enough completed state for the admin panel to survive a refresh."""
+    return {
+        "debates": [
+            item.__dict__ if hasattr(item, "__dict__") else item
+            for item in state.get("debate_results", [])
+        ],
+        "plan": state.get("plan"),
+        "plan_revision_requests": state.get("plan_revision_requests", []),
+        "engineer_outputs": state.get("engineer_outputs", {}),
+        "paper": state.get("final_paper") or {"sections": state.get("draft_sections", {})},
+        "draft_sections": state.get("draft_sections", {}),
+        "supervisor_scores": state.get("supervisor_scores", {}),
+        "supervisor_feedback": state.get("supervisor_feedback", {}),
+        "results_verification": state.get("results_verification", {}),
+        "reproducibility": state.get("reproducibility", {}),
+        "data_artifacts": state.get("data_artifacts", {}),
+        "data_validation": state.get("data_validation", {}),
+        "execution_artifacts": state.get("execution_artifacts", {}),
+        "analysis_reports": state.get("analysis_reports", {}),
+        "verification_findings": state.get("verification_findings", []),
+    }
 
 
 def _run_pipeline(domain: Optional[str] = None):
@@ -339,6 +425,7 @@ def _run_pipeline(domain: Optional[str] = None):
 
         result = pipeline.run(state, tracker.run_id, on_node=on_node, finalize=save_results)
         last = result.state
+        research_db.update_run_summary(tracker.run_id, {"workspace": _workspace_snapshot(last)})
         terminal_error = last.get("terminal_error")
         _run_error = terminal_error
         if terminal_error:

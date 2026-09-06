@@ -328,8 +328,9 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
         for exp_name, output in engineer_outputs.items():
             formatted.append(f"Experiment: {exp_name}")
             if isinstance(output, dict):
-                for key, value in output.items():
-                    formatted.append(f"  {key}: {value}")
+                for key in ("success", "outcome", "aggregate_metrics", "results", "raw_results_path", "error", "contract_hash"):
+                    if key in output:
+                        formatted.append(f"  {key}: {output[key]}")
             else:
                 formatted.append(f"  Result: {output}")
         
@@ -376,7 +377,7 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
 This paper presents research on {topic['title']}. We address the problem of {topic['description']} 
 and propose a novel approach that {topic.get('impact', 'provides significant improvements')}. 
 Our contributions include {', '.join(plan.get('expected_contributions', ['novel methodology', 'comprehensive evaluation']))}. 
-Experimental results demonstrate the effectiveness of our approach compared to existing methods.
+No verified experimental results are available for this draft. Do not make empirical claims.
 """
     
     def _create_fallback_introduction(self, topic: Dict[str, Any], plan: Dict[str, Any]) -> str:
@@ -426,17 +427,14 @@ We conduct extensive experiments to evaluate our approach on {topic['title']}.
 Our experimental setup includes multiple datasets and baseline comparisons to ensure 
 comprehensive evaluation of our contributions.
 
-Results demonstrate significant improvements over existing methods, validating the 
-effectiveness of our proposed approach.
+No verified results are available. This section must not claim improvements.
 """
     
     def _create_fallback_results(self, topic: Dict[str, Any], plan: Dict[str, Any]) -> str:
         return f"""
 # Results
 
-Our experimental results show that our approach to {topic['title']} achieves 
-significant improvements over baseline methods. The results validate our key 
-contributions and demonstrate the practical impact of our work.
+Verified experimental results are required before making claims about {topic['title']}.
 
 Analysis reveals important insights about the effectiveness of different components 
 and provides guidance for future research directions.

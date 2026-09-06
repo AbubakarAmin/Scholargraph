@@ -1,0 +1,5 @@
+{"ts": "2026-09-06T17:39:06.956100Z", "category": "rejection", "kind": "topic", "item": "Hybrid Symbolic\u2011Numeric Optimizers via Differentiable Programming for Combinatorial Problems", "reason": "infeasible_for_engineer", "meta": {"ok": false, "reasons": ["Not executable in sandbox: gpu cluster"]}}
+{"ts": "2026-09-06T18:02:18.363691Z", "category": "pivot", "experiment": "Ablation Study_variant_b", "reason": "underperformed / no metrics", "meta": {}}
+{"ts": "2026-09-06T18:03:24.848105Z", "category": "pivot", "experiment": "Baseline Comparison_variant_a", "reason": "All seeded runs failed", "meta": {}}
+{"ts": "2026-09-06T18:04:23.093465Z", "category": "pivot", "experiment": "Baseline Comparison_variant_b", "reason": "All seeded runs failed", "meta": {}}
+{"ts": "2026-09-06T18:21:32.550003Z", "category": "run_summary", "run_id": "1bc8599c", "started_at": "2026-09-06T17:18:06.794487Z", "ended_at": "2026-09-06T18:21:32.549983Z", "success": false, "stats": {"rejected_topics": 1, "debate_rounds": 12, "sections_bounced": 4, "pivots": 3, "refines": 9, "plan_revisions": 0, "hard_check_fails": 0, "llm_calls": 0, "cost_estimate_usd": 0.0}, "phase": "meta_evaluation"}

@@ -48,6 +48,11 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
         elif hasattr(state, "__dict__"):
             state = state.__dict__
 
+        if state.get("terminal_error") or state.get("evidence_gate", {}).get("terminal"):
+            dossier = save_failure_dossier(state, target_dir)
+            logger.warning("Run stopped before release; failure dossier saved to %s", dossier)
+            return
+
         if state.get("latex_output"):
             latex_file = os.path.join(target_dir, "paper_output.tex")
             with open(latex_file, "w", encoding="utf-8") as handle:
@@ -77,3 +82,42 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
     except Exception as exc:
         logger.error("Error saving results: %s", exc)
         print(f"Warning: Could not save results: {exc}")
+
+
+def save_failure_dossier(state: ResearchState, output_dir: str) -> str:
+    """Persist an operator-readable failure report without releasing a paper."""
+    from .run_log import build_run_summary, get_tracker
+    from .research_db import research_db
+
+    target_dir = Path(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    summary = build_run_summary(state, error=state.get("terminal_error"))
+    dossier = {
+        "status": "failed",
+        "run_id": state.get("run_id") or summary.get("run_id"),
+        "terminal_error": state.get("terminal_error"),
+        "evidence_gate": state.get("evidence_gate", {}),
+        "experiment_contracts": state.get("experiment_contracts", {}),
+        "technical_failures": state.get("technical_failures", {}),
+        "engineer_outputs": state.get("engineer_outputs", {}),
+        "execution_artifacts": state.get("execution_artifacts", {}),
+        "verification_findings": state.get("verification_findings", []),
+        "summary": summary,
+    }
+    dossier_path = target_dir / "failure_dossier.json"
+    dossier_path.write_text(json.dumps(dossier, indent=2, default=str), encoding="utf-8")
+    summary_path = target_dir / "research_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    tracker = get_tracker()
+    if tracker:
+        research_db.record_artifact(
+            tracker.run_id,
+            "failure_dossier",
+            str(dossier_path),
+            {"reason": state.get("terminal_error"), "gate": state.get("evidence_gate", {})},
+        )
+        research_db.update_run_summary(
+            tracker.run_id,
+            {"status": "failed", "terminal_error": state.get("terminal_error"), "failure_dossier": str(dossier_path)},
+        )
+    return str(dossier_path)

@@ -1,1 +1,34 @@
-[]
+[
+  {
+    "timestamp": "2026-09-06T23:16:57.314681",
+    "agent": "SupervisorAgent",
+    "section": "Abstract",
+    "score": 7.9399999999999995,
+    "feedback": "HARD_CITATION_STATS: Citations: No DOI/arXiv IDs found to verify\nStats[Ablation Study_variant_a]: No overlapping metrics to verify against raw data\nStats[Ablation Study_variant_b]: No overlapping metrics to verify against raw data\nStats[Baseline Comparison]: No overlapping metrics to verify against raw data\nStats[Ablation Study]: No overlapping metrics to verify against raw data\nmath_checker: No mathematical expressions found\ncode_checker: No code snippets found\nreviewer_bot: Peer review score: 7.2/10 | weaknesses: The phrase 'precise marginal alignment' is a bit vague. While technically accurate, it might not resonate with readers unfamiliar with Optimal Transport., The research questions are stated, but could be *slightly* more focused. What specific aspects of 'efficacy' and 'feasibility' are being investigated?\nhallucination_checker: {\"score\": 7, \"issues\": [\"The claim that standard statistical transformations often fail to capture complex distributional shifts is a broad generalization that would benefit from citation to relevant literature.\", \"The statement that the framework provides the empirical foundation necessary to evaluate the effectiveness of Wasserstein Barycenters is somewhat vague and could be qualified or supported with preliminary results.\", \"The assertion that the method offers a robust alternative to traditi",
+    "iteration": 1
+  },
+  {
+    "timestamp": "2026-09-06T23:17:30.369302",
+    "agent": "SupervisorAgent",
+    "section": "Introduction",
+    "score": 4.873076923076923,
+    "feedback": "HARD_CITATION_STATS: Citations: No DOI/arXiv IDs found to verify\nStats[Ablation Study_variant_a]: No overlapping metrics to verify against raw data\nStats[Ablation Study_variant_b]: No overlapping metrics to verify against raw data\nStats[Baseline Comparison]: No overlapping metrics to verify against raw data\nStats[Ablation Study]: No overlapping metrics to verify against raw data\nmath_checker: Math validation: 3/26 valid | invalid: \\hat{P}_t, \\mathcal{X}, P_t(Y | \\mathbf{X}) | derivations: \\mathcal{Y} == \\{1, \\dots, C\\}? False; \\mathcal{D}_t = \\{\\mathbf{x}_j^t\\}_{j == 1}^{N_t}? False; \\{y_j^t\\}_{j == 1}^{N_t}? False\ncode_checker: Code validation: 4/5 snippets valid | invalid: \n\nTo adapt predictive models without incurring pro...\nreviewer_bot: Peer review score: 5.0/10\nhallucination_checker: {}",
+    "iteration": 1
+  },
+  {
+    "timestamp": "2026-09-06T23:18:37.105020",
+    "agent": "SupervisorAgent",
+    "section": "Related Work",
+    "score": 6.14,
+    "feedback": "HARD_CITATION_STATS: Citations: Resolved 1/1 citation IDs\nStats[Ablation Study_variant_a]: No overlapping metrics to verify against raw data\nStats[Ablation Study_variant_b]: No overlapping metrics to verify against raw data\nStats[Baseline Comparison]: No overlapping metrics to verify against raw data\nStats[Ablation Study]: No overlapping metrics to verify against raw data\nmath_checker: Math validation: 0/1 valid | invalid: O(N^3)\ncode_checker: No code snippets found\nreviewer_bot: Peer review score: 7.2/10 | weaknesses: Limited scope \u2013 feels slightly dated, Underdeveloped discussion of challenges in tabular DA\nhallucination_checker: {}",
+    "iteration": 1
+  },
+  {
+    "timestamp": "2026-09-06T23:21:32.332240",
+    "agent": "SupervisorAgent",
+    "section": "Methods",
+    "score": 6.316470588235294,
+    "feedback": "HARD_CITATION_STATS: Citations: No DOI/arXiv IDs found to verify\nStats[Ablation Study_variant_a]: No overlapping metrics to verify against raw data\nStats[Ablation Study_variant_b]: No overlapping metrics to verify against raw data\nStats[Baseline Comparison]: No overlapping metrics to verify against raw data\nStats[Ablation Study]: No overlapping metrics to verify against raw data\nmath_checker: Math validation: 4/34 valid | invalid: -th column of , D_S = \\{(x_i, y_i)\\}_{i=1}^{N_S},  is the entropy regularization parameter.\n\nThe Sinkhorn-Knopp algorithm iteratively updates the transport matrix  | derivations: D_S = \\{(x_i, y_i)\\}_{i == 1}^{N_S}? False; D_T = \\{x_j\\}_{j == 1}^{N_T}? False; x_{norm} == \\frac{x - \\mu}{\\sigma}? False\ncode_checker: No code snippets found\nreviewer_bot: Peer review score: 7.2/10 | weaknesses: The section ends abruptly in 3.5, cutting off the explanation of why Logistic Regression was chosen., The description of the 'sampling from source' step in 3.4 is somewhat vague and lacks technical detail on how the transport probabilities are sampled.\nhallucination_checker: {}",
+    "iteration": 1
+  }
+]

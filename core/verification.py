@@ -316,6 +316,35 @@ def reproducibility_dossier(plan: Optional[Dict[str, Any]], engineer_outputs: Op
     return {"checks": checks, "passed": all(checks.values()), "score": round(10 * sum(checks.values()) / len(checks), 2)}
 
 
+PROHIBITED_MANUSCRIPT_TEXT = (
+    "tracemalloc",
+    "sandbox blocked",
+    "import blocked",
+    "syntaxerror",
+    "traceback",
+    "object has no attribute",
+    "experiment_failed",
+    "plan_revision_requested",
+)
+
+
+def validate_empirical_claims(content: str, engineer_outputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Reject leaked harness diagnostics from empirical manuscript sections."""
+    lowered = content.lower()
+    prohibited = [phrase for phrase in PROHIBITED_MANUSCRIPT_TEXT if phrase in lowered]
+    successful = [
+        name for name, output in (engineer_outputs or {}).items()
+        if isinstance(output, dict) and output.get("success")
+        or isinstance(output, dict) and output.get("aggregate_metrics")
+    ]
+    return {
+        "passed": not prohibited and bool(successful),
+        "prohibited_text": prohibited,
+        "successful_experiments": successful,
+        "note": "Empirical text is grounded in completed experiment outputs" if successful and not prohibited else "Empirical text contains unsupported harness text or has no completed experiment",
+    }
+
+
 def _format_hard_feedback(citation: Dict, stats_results: List[Dict]) -> str:
     parts = [f"Citations: {citation.get('note')}"]
     if citation.get("failed"):

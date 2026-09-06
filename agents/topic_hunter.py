@@ -72,7 +72,7 @@ class TopicHunterAgent:
             }
             artifact = self.source_client.fetch_json(
                 "openalex",
-                f"{url}/",
+                url,
                 headers=self.openalex_headers,
                 params=params,
                 validator=lambda payload: isinstance(payload, dict) and "results" in payload,

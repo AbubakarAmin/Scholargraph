@@ -305,8 +305,19 @@ def dashboard(run_id: Optional[str] = None):
             "execution_artifacts": state.get("execution_artifacts", {}),
             "analysis_reports": state.get("analysis_reports", {}),
             "verification_findings": state.get("verification_findings", []),
+            "evidence_gate": state.get("evidence_gate", {}),
+            "terminal_error": state.get("terminal_error"),
+            "experiment_contracts": state.get("experiment_contracts", {}),
         }
     dash["evidence_trace"] = research_db.claims(dash.get("run_id"))
+    workspace = dash.get("workspace") or {}
+    terminal = bool(workspace.get("terminal_error") or workspace.get("evidence_gate", {}).get("terminal"))
+    dash["release"] = {
+        "status": "blocked" if terminal else "ready" if workspace.get("reproducibility", {}).get("passed") and not any(
+            finding.get("blocking") for finding in workspace.get("verification_findings", [])
+        ) else "incomplete",
+        "reason": workspace.get("terminal_error") or workspace.get("evidence_gate", {}).get("message", ""),
+    }
     dash["capabilities"] = DEFAULT_MANIFESTS
     return dash
 
@@ -393,6 +404,9 @@ def _workspace_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
         "execution_artifacts": state.get("execution_artifacts", {}),
         "analysis_reports": state.get("analysis_reports", {}),
         "verification_findings": state.get("verification_findings", []),
+        "evidence_gate": state.get("evidence_gate", {}),
+        "terminal_error": state.get("terminal_error"),
+        "experiment_contracts": state.get("experiment_contracts", {}),
     }
 
 

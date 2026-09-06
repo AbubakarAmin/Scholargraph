@@ -208,6 +208,11 @@ class ExperimentSpec(TypedDict, total=False):
     statistical_test: str
     claimed_components: List[str]
     evaluation_metrics: List[str]
+    dataset: Dict[str, Any]
+    split_policy: str
+    seeds: List[int]
+    stopping_rule: str
+    contract_hash: str
 
 
 class Plan(TypedDict, total=False):
@@ -236,6 +241,33 @@ class ExperimentOutput(TypedDict, total=False):
     raw_results_path: str
     error: str
     timestamp: str
+    contract_hash: str
+    outcome: str
+    failure_kind: str
+    attempts: List[Dict[str, Any]]
+
+
+class ExperimentContract(TypedDict, total=False):
+    experiment_name: str
+    hypothesis: str
+    dataset: Dict[str, Any]
+    requirements: Dict[str, Any]
+    baselines: List[str]
+    evaluation_metrics: List[str]
+    split_policy: str
+    seeds: List[int]
+    stopping_rule: str
+    analysis_protocol: Dict[str, Any]
+    contract_hash: str
+
+
+class EvidenceGateDecision(TypedDict, total=False):
+    allowed: bool
+    terminal: bool
+    reason_code: str
+    message: str
+    experiment_names: List[str]
+    contract_hashes: Dict[str, str]
 
 
 class VerificationReport(TypedDict, total=False):

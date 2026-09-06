@@ -18,7 +18,8 @@ ScholarGraph is a local research-paper generation system. It combines LLM-assist
 - `core.state.ResearchState` is the shared workflow contract.
 - `core.contracts` defines typed handoffs and `core.context.RunContext` carries per-run dependencies.
 - `core.workflow` owns graph assembly and `core.pipeline` owns graph execution for CLI and web.
-- `core.verification` contains deterministic checks. LLM review is advisory and cannot rescue a hard failure.
+- `core.evidence_gate` owns immutable experiment contracts and fail-closed handoffs. LLM review is advisory and cannot rescue a hard failure.
+- `core.verification` contains deterministic statistical, provenance, and manuscript checks. LLM review is advisory and cannot rescue a hard failure.
 - `core.sandbox` is a local lockdown mechanism, not a security boundary.
 - `core.research_db` is the durable source of truth for runs, events, claims, and artifacts.
 - `web.app` reads workflow state and persistence services but starts the pipeline in a background thread.
@@ -27,7 +28,7 @@ ScholarGraph is a local research-paper generation system. It combines LLM-assist
 
 `TopicHunterAgent -> HypothesisDebateSystem -> PlannerAgent -> WriterAgent (narrative) -> EngineerAgent -> WriterAgent (results) -> SupervisorAgent -> MetaAgent or EditorAgent`
 
-State is passed between these phases as a mutable `ResearchState` dictionary. An engineering failure can send revision requests back to the planner. Results writing can redraft when numeric grounding fails.
+State is passed between these phases as a mutable `ResearchState` dictionary. Before engineering, each experiment receives a content-hashed contract and dataset identity. Code repairs may change implementation only; contract drift is terminal. Technical execution failure produces a failure dossier and stops downstream agents. Successful but unsupported hypotheses continue as explicitly labeled negative-result papers. Results writing can redraft numeric grounding, but cannot invent measurements or override the evidence gate.
 
 ## Current coupling risks
 

@@ -84,7 +84,8 @@ class EngineerAgent:
         alternatives: other designs from Planner for PIVOT.
         """
         log_agent_action("EngineerAgent", "start_experiment", {"experiment": experiment.get("name")})
-        alternatives = alternatives or experiment.get("alternatives") or []
+        contract_hash = experiment.get("contract_hash")
+        alternatives = [] if contract_hash else (alternatives or experiment.get("alternatives") or [])
         max_attempts = 4
         approach = experiment
         decision_log = []
@@ -160,6 +161,9 @@ class EngineerAgent:
                     "raw_results_path": raw_path,
                     "timestamp": str(datetime.now()),
                     "approach": approach.get("name"),
+                    "contract_hash": contract_hash,
+                    "outcome": approach.get("hypothesis_outcome") or "inconclusive",
+                    "attempts": decision_log,
                 }
                 self._store_experiment_results(output, approach)
                 tracker = get_tracker()
@@ -403,6 +407,9 @@ Return ONLY Python. Still print JSON metrics.
             "failure_artifact": artifact,
             "code": (code or "")[:2000],
             "timestamp": str(datetime.now()),
+            "contract_hash": experiment.get("contract_hash"),
+            "failure_kind": "technical",
+            "attempts": decision_log,
         }
         self._progress("experiment_failed", {
             "experiment": experiment.get("name"),

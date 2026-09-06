@@ -8,10 +8,12 @@ from typing import Any, Dict, List
 
 from core.config import config
 from core.context import get_active_context
+from core.evidence_gate import build_contract, gate_engineering_outputs, validate_dataset_identity, validate_experiments
 from core.run_log import get_tracker
+from core.research_db import research_db
 from core.state import ResearchState, initialize_state
 from core.utils import log_agent_action
-from core.verification import reproducibility_dossier
+from core.verification import reproducibility_dossier, validate_empirical_claims
 
 from agents.editor import EditorAgent
 from agents.data import DataAgent
@@ -244,6 +246,10 @@ def write_results_sections(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("writing_results")
+    if state.get("terminal_error") or state.get("evidence_gate", {}).get("terminal"):
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     if not state.get("plan"):
         state["should_reset"] = True
         return state
@@ -257,9 +263,57 @@ def write_results_sections(state: ResearchState) -> ResearchState:
             if section_name.lower() in RESULTS_SECTION_NAMES:
                 state["draft_sections"][section_name] = writer.draft_section(section_name, state["selected_topic"], state["plan"], state["engineer_outputs"])
                 state["current_section"] = section_name
-        checked = {name: verify_result_numbers(state["draft_sections"][name], state["engineer_outputs"]) for name in names if name.lower() in RESULTS_SECTION_NAMES and name in state["draft_sections"]}
+        checked = {}
+        for name in names:
+            if name.lower() not in RESULTS_SECTION_NAMES or name not in state["draft_sections"]:
+                continue
+            section = state["draft_sections"][name]
+            numeric_check = verify_result_numbers(section, state["engineer_outputs"])
+            empirical_check = validate_empirical_claims(section, state["engineer_outputs"])
+            checked[name] = {
+                **numeric_check,
+                "empirical_claims": empirical_check,
+                "passed": numeric_check["passed"] and empirical_check["passed"],
+            }
+            tracker = get_tracker()
+            if tracker:
+                context = get_active_context()
+                ledger = context.research_db if context and context.research_db else research_db
+                ledger.record_claim(
+                    tracker.run_id,
+                    name,
+                    section[:1000],
+                    "empirical_section",
+                    "verified" if checked[name]["passed"] else "rejected",
+                    {
+                        "numeric": numeric_check,
+                        "empirical": empirical_check,
+                        "contract_hashes": {
+                            exp_name: output.get("contract_hash")
+                            for exp_name, output in state["engineer_outputs"].items()
+                            if isinstance(output, dict)
+                        },
+                    },
+                )
         failures = {name: result for name, result in checked.items() if not result["passed"]}
         state["results_verification"] = checked
+        hard_failures = {
+            name: result for name, result in failures.items()
+            if result.get("empirical_claims", {}).get("prohibited_text")
+        }
+        if hard_failures:
+            message = "Manuscript contains leaked execution diagnostics"
+            state["terminal_error"] = message
+            state["evidence_gate"] = {
+                "allowed": False,
+                "terminal": True,
+                "reason_code": "prohibited_manuscript_text",
+                "message": message,
+                "sections": list(hard_failures),
+            }
+            state["current_phase"] = "complete"
+            state["should_continue"] = False
+            return state
         if failures and state["results_redraft_count"] < 2:
             state["results_redraft_count"] += 1
             state["meta_feedback"].append(f"Results numeric grounding failed: {failures}")
@@ -284,8 +338,41 @@ def engineering_node(state: ResearchState) -> ResearchState:
         if not state["plan"]:
             state["current_phase"] = "supervision"
             return state
-        engineer = _create_agent(EngineerAgent)
         experiments = state["plan"].get("experiments", [])
+        plan_errors = validate_experiments(experiments)
+        plan_errors.extend(validate_dataset_identity(experiments, state.get("data_artifacts")))
+        if plan_errors:
+            message = "; ".join(plan_errors)
+            state["terminal_error"] = message
+            state["evidence_gate"] = {
+                "allowed": False,
+                "terminal": True,
+                "reason_code": "invalid_experiment_plan",
+                "message": message,
+            }
+            state["current_phase"] = "complete"
+            state["should_continue"] = False
+            log_agent_action("Orchestrator", "engineering_blocked_invalid_plan", {"message": message})
+            return state
+        for experiment in experiments:
+            name = experiment["name"]
+            contract = build_contract(experiment)
+            prior_contract = state["experiment_contracts"].get(name)
+            if prior_contract and prior_contract.get("contract_hash") != contract.get("contract_hash"):
+                message = f"Committed experiment contract changed: {name}"
+                state["terminal_error"] = message
+                state["evidence_gate"] = {
+                    "allowed": False,
+                    "terminal": True,
+                    "reason_code": "experiment_contract_drift",
+                    "message": message,
+                }
+                state["current_phase"] = "complete"
+                state["should_continue"] = False
+                log_agent_action("Orchestrator", "engineering_blocked_contract_drift", {"experiment": name})
+                return state
+            state["experiment_contracts"][name] = prior_contract or contract
+        engineer = _create_agent(EngineerAgent)
         method_text = "\n".join(state["draft_sections"].get(section, "") for section in ("Methods", "Method", "Experiments"))
         branch_winner_name = None
         if experiments and any(isinstance(item, dict) and (item.get("variants") or item.get("alternatives")) for item in experiments):
@@ -294,6 +381,8 @@ def engineering_node(state: ResearchState) -> ResearchState:
                     tracker.message("Engineering: branching cheap probes…")
                 branched = engineer.run_branching_search([item for item in experiments if isinstance(item, dict)], method_description=method_text)
                 branch_winner_name = branched.get("experiment_name") or branched.get("approach") or "branch_winner"
+                if branch_winner_name in state["experiment_contracts"]:
+                    branched["contract_hash"] = state["experiment_contracts"][branch_winner_name]["contract_hash"]
                 state["engineer_outputs"][branch_winner_name] = branched
                 winner = (branched.get("branch_search") or {}).get("winner")
                 if winner and winner not in state["engineer_outputs"]:
@@ -304,7 +393,9 @@ def engineering_node(state: ResearchState) -> ResearchState:
                     tracker.message(f"Branching search failed: {exc}", level="error")
         for experiment in experiments:
             exp_name = experiment.get("name", "unknown_experiment") if isinstance(experiment, dict) else str(experiment)
-            exp_config = experiment if isinstance(experiment, dict) else {"name": exp_name}
+            exp_config = dict(experiment) if isinstance(experiment, dict) else {"name": exp_name}
+            if isinstance(experiment, dict) and exp_name in state["experiment_contracts"]:
+                exp_config["contract_hash"] = state["experiment_contracts"][exp_name]["contract_hash"]
             if exp_name in state["engineer_outputs"] or (branch_winner_name and exp_name == branch_winner_name):
                 continue
             try:
@@ -312,17 +403,40 @@ def engineering_node(state: ResearchState) -> ResearchState:
                     tracker.message(f"Engineering: running {exp_name}")
                 alternatives = list(exp_config.get("variants") or exp_config.get("alternatives") or [])
                 state["engineer_outputs"][exp_name] = engineer.run_experiment(exp_config, alternatives=alternatives, method_description=method_text)
+                state["engineer_outputs"][exp_name]["contract_hash"] = state["experiment_contracts"][exp_name]["contract_hash"]
                 log_agent_action("Orchestrator", "experiment_run", {"experiment": exp_name})
             except Exception as exc:
                 logger.error(f"Experiment {exp_name} failed: {exc}")
-                state["engineer_outputs"][exp_name] = {"success": False, "error": str(exc), "experiment_name": exp_name}
+                state["engineer_outputs"][exp_name] = {
+                    "success": False,
+                    "error": str(exc),
+                    "experiment_name": exp_name,
+                    "contract_hash": state["experiment_contracts"][exp_name]["contract_hash"],
+                    "failure_kind": "technical",
+                }
+        gate = gate_engineering_outputs(
+            state.get("plan"),
+            state.get("engineer_outputs"),
+            state.get("experiment_contracts"),
+        )
+        state["evidence_gate"] = gate
+        if not gate.get("allowed"):
+            state["terminal_error"] = gate.get("message") or gate.get("reason_code")
+            state["technical_failures"] = {
+                name: output
+                for name, output in state.get("engineer_outputs", {}).items()
+                if isinstance(output, dict) and not output.get("success")
+            }
+            state["current_phase"] = "complete"
+            state["should_continue"] = False
+            log_agent_action("Orchestrator", "engineering_terminal_failure", gate)
+            return state
         requests = engineer.consume_plan_revision_requests()
         if requests:
-            state["plan_revision_requests"] = requests
-            state["current_phase"] = "planning"
-            state["engineer_outputs"] = {f"prior_{key}": value for key, value in state.get("engineer_outputs", {}).items()}
-            log_agent_action("Orchestrator", "plan_revision_requested", {"n": len(requests)})
-            return state
+            state["meta_feedback"].append(
+                "Plan revision requested after a successful run; contract remains immutable: "
+                + json.dumps(requests, default=str)
+            )
         state["current_phase"] = "writing_results"
         return state
     except Exception as exc:
@@ -354,8 +468,17 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
             if output.get("success") and output.get("code")
         }
         if not code_artifacts:
-            state["meta_feedback"].append("Independent validation skipped: no executable code artifacts")
-            state["current_phase"] = "writing_results"
+            message = "Independent validation failed: no executable code artifacts"
+            state["terminal_error"] = message
+            state["evidence_gate"] = {
+                "allowed": False,
+                "terminal": True,
+                "reason_code": "missing_code_artifact",
+                "message": message,
+            }
+            state["meta_feedback"].append(message)
+            state["current_phase"] = "complete"
+            state["should_continue"] = False
             return state
 
         execution_agent = _create_agent(ExecutionAgent)
@@ -393,7 +516,18 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
             reports_by_experiment,
         )
         if any(finding.get("blocking") for finding in state["verification_findings"]):
-            state["meta_feedback"].append("Independent validation produced blocking findings")
+            message = "Independent validation produced blocking findings"
+            state["terminal_error"] = message
+            state["evidence_gate"] = {
+                "allowed": False,
+                "terminal": True,
+                "reason_code": "blocking_verification_finding",
+                "message": message,
+            }
+            state["meta_feedback"].append(message)
+            state["current_phase"] = "complete"
+            state["should_continue"] = False
+            return state
         state["current_phase"] = "writing_results"
         return state
     except Exception as exc:
@@ -407,7 +541,9 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
             "status": "failed",
         })
         state["meta_feedback"].append(f"Independent validation error: {exc}")
-        state["current_phase"] = "writing_results"
+        state["terminal_error"] = f"Independent validation failed: {exc}"
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
         return state
 def supervision_node(state: ResearchState) -> ResearchState:
     log_agent_action("Orchestrator", "start_supervision", {})
@@ -452,6 +588,11 @@ def meta_evaluation_node(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("meta_evaluation")
+    if state.get("terminal_error") or state.get("evidence_gate", {}).get("terminal"):
+        state["should_continue"] = False
+        state["current_phase"] = "complete"
+        log_agent_action("Orchestrator", "meta_blocked_terminal_failure", {})
+        return state
     try:
         agent = _create_agent(MetaAgent)
         state["meta_feedback"].append(agent.evaluate_system_performance(state))
@@ -470,10 +611,10 @@ def meta_evaluation_node(state: ResearchState) -> ResearchState:
     except Exception as exc:
         logger.error(f"Meta evaluation failed: {exc}")
         state["meta_feedback"].append(f"Meta evaluation error: {exc}")
-        state["iteration"] += 1
-        state["should_continue"] = True
-        state["current_phase"] = "writing_narrative"
-        log_agent_action("Orchestrator", "meta_error_continue", {"iteration": state["iteration"]})
+        state["terminal_error"] = f"Meta evaluation failed: {exc}"
+        state["should_continue"] = False
+        state["current_phase"] = "complete"
+        log_agent_action("Orchestrator", "meta_error_stop", {})
         return state
 
 
@@ -482,6 +623,10 @@ def editing_node(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("editing")
+    if state.get("terminal_error") or state.get("evidence_gate", {}).get("terminal"):
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     try:
         editor = _create_agent(EditorAgent)
         final_paper = editor.create_final_paper(state["selected_topic"], state["draft_sections"], state["plan"], state["engineer_outputs"], debate_results=state.get("debate_results"))

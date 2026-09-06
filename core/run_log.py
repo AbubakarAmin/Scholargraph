@@ -149,6 +149,14 @@ def emit_event(
     run_id: Optional[str] = None,
     agent: Optional[str] = None,
 ):
+    if run_id is None:
+        from .context import get_active_context
+
+        active_context = get_active_context()
+        if active_context is not None:
+            run_id = active_context.run_id or (
+                active_context.tracker.run_id if active_context.tracker else None
+            )
     record = {
         "ts": _now(),
         "type": event_type,

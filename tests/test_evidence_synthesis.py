@@ -1,4 +1,4 @@
-from core.evidence_synthesis import build_cross_paper_evidence_map, validate_topic_admission
+from core.evidence_synthesis import build_cross_paper_evidence_map, validate_candidate_bridge_claim, validate_topic_admission
 
 
 def test_cross_paper_synthesis_requires_two_distinct_grounded_sources():
@@ -23,6 +23,14 @@ def test_cross_paper_synthesis_requires_two_distinct_grounded_sources():
     assert set(bridge["source_paper_ids"]) == {"method-paper", "setting-paper"}
     assert bridge["status"] == "candidate_requires_literature_screening"
     assert all(item["excerpt"] for item in bridge["evidence"])
+
+    grounded = validate_candidate_bridge_claim(
+        {"title": "Robustness validation for healthcare IoT", "evidence_bridge_ids": [bridge["bridge_id"]]},
+        result,
+    )
+    ungrounded = validate_candidate_bridge_claim({"title": "Unrelated topic"}, result)
+    assert grounded["valid"]
+    assert not ungrounded["valid"]
 
 
 def test_cross_paper_synthesis_does_not_create_a_bridge_without_roles():

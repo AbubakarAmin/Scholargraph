@@ -11,6 +11,26 @@
 
 ScholarGraph is a local, evidence-oriented multi-agent research system. Given a research domain, it discovers candidate gaps, debates hypotheses adversarially, creates falsifiable plans, validates explicitly supplied datasets, generates and executes experiments, independently replays and analyzes results, verifies citations and evidence, and assembles a LaTeX paper plus reproducibility artifacts.
 
+## Current research-discovery guarantees
+
+Topic discovery is evidence-first rather than idea-first. The hunter retrieves
+papers, creates an auditable cross-paper evidence map, and identifies candidate
+method-to-setting bridges. Every bridge retains source-paper identifiers and
+verbatim excerpts. A topic that relies on a cross-paper synthesis must cite the
+bridge IDs it uses; unsupported or fabricated bridge references are rejected
+before expensive debate calls.
+
+Before a topic can enter debate, its structured hypothesis must pass an
+admission contract: a measurable question, falsification condition, local or
+synthetic minimum viable experiment, named baseline, metrics, falsification
+test, and at least three seeds. A failed debate may receive one bounded
+contract-repair attempt and a re-debate; the revision must satisfy the same
+admission checks and cannot discard provenance.
+
+These controls make a candidate **reviewable**, not automatically novel or
+publishable. Scholarly novelty, causal validity, and external generalization
+still require independent expert review and appropriate real-world evaluation.
+
 The current implementation is intentionally incremental. The legacy `EngineerAgent`
 path remains available for compatibility, while the newer execution, analysis, and
 verification artifacts are now inserted into the live workflow as an independent
@@ -66,7 +86,10 @@ python run_ui.py
 python main.py
 
 # 4. Tests (no API keys required for most)
-python -m pytest tests/test_eval_harness.py -q
+python -m pytest tests -q
+
+# 5. Offline smoke check (no external APIs or keys)
+python tests/smoke_offline.py
 ```
 
 > After changing backend Python files, restart `python run_ui.py`; a running
@@ -85,6 +108,12 @@ system therefore treats a paper as the final view over a research record:
 question → candidate gap → adversarial hypothesis → registered plan
          → executable experiment → raw measurements → verified claims
          → peer-style review → paper + reproducibility artifacts
+```
+
+For cross-paper discovery, the candidate-gap step is explicitly:
+
+```
+retrieved papers → evidence map → cited bridge → admission contract → debate
 ```
 
 ### What the system is designed to establish
@@ -182,6 +211,8 @@ and [ACM artifact evaluation guidance](https://sigsim.acm.org/conf/pads/2024/blo
 | Don’t trust host Python | AST + restricted builtins sandbox (`core/sandbox.py`) |
 | Don’t lose context across agents | Append-only scratchpad (`run_scratchpad.jsonl`) |
 | Improve across runs | `CrossRunMemory` JSONL lessons fed into Topic Hunter / Planner |
+| Ground cross-paper synthesis | `core/evidence_synthesis.py` creates cited bridges with exact excerpts |
+| Reject vague ideas early | deterministic topic admission contract before debate |
 | Cost-aware generation | `tier=cheap\|strong\|judge` model routing in `call_llm` |
 | Separate scientific responsibilities | Data, execution, analysis, and verification agents use distinct manifests |
 | Broker external knowledge | OpenAlex retrieval uses allowlists, retries, validation, hashes, and cache replay |
@@ -494,6 +525,9 @@ Re-exports LLM helpers; JSON I/O; `parse_json_from_llm`; SymPy `validate_math_ex
 | Novelty | Embed topic vs last abstracts; reject if cosine ≥ `NOVELTY_SIMILARITY_REJECT` |
 | Feasibility | Heuristic blocklist (GPU fine-tune, wet lab, proprietary data, low feasibility score) |
 | Parallelism | `ThreadPoolExecutor` with 3 seed angles; lightweight LLM judge ranks survivors |
+| Cross-paper synthesis | `core.evidence_synthesis` builds auditable method-to-setting bridges from retrieved papers |
+| Bridge grounding | candidates must cite valid bridge IDs and match their method/setting signals |
+| Admission | structured hypothesis requires an executable local MVE, baseline, metrics, falsification test, and ≥3 seeds |
 | Logging | Every rejection → `CrossRunMemory` + tracker bump |
 
 OpenAlex retrieval is routed through `core.sources.SourceClient`, which caches
@@ -518,6 +552,7 @@ the research question lacks value.
 | Challenger | Must cover checklist: soundness, significance, reproducibility, ethics, novelty, feasibility → JSON objections with severity |
 | Moderator | Ensemble over `ENSEMBLE_JUDGE_MODELS` or judge/strong/cheap; disagreement (`max−min > 1.5`) → longer debate / harder PASS |
 | Rounds | Min `DEBATE_MIN_ROUNDS`, max `DEBATE_MAX_ROUNDS` |
+| Repair | one bounded contract revision after a failed debate, followed by re-debate; all normal hard gates remain active |
 | Elo | `memory/elo_ratings.json` — hypothesis *kind* buckets vs fixed bar 1500 |
 | Output | `DebateResult` dataclass: rounds, unresolved_objections, ensemble_scores, elo_delta |
 

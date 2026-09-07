@@ -26,7 +26,7 @@ from core.run_log import CrossRunMemory, get_tracker
 from core.sources import SourceClient
 from agents.hypothesis_debate import EloStore, hypothesis_kind
 from core.capabilities import SANDBOX_CAPABILITY_MANIFEST, check_plan_feasibility
-from core.evidence_synthesis import build_cross_paper_evidence_map, validate_topic_admission
+from core.evidence_synthesis import build_cross_paper_evidence_map, validate_candidate_bridge_claim, validate_topic_admission
 
 
 _FAILED_TOPIC_OVERLAP_THRESHOLD = 0.55
@@ -611,14 +611,25 @@ A real gap: foundational work is cited but rarely extended lately.
 Propose 3 topics executable with CPU sklearn/numpy synthetic or small public data.
 For each topic include an explicit "contribution" sentence for novelty checking.
 
+For every proposed topic, include `evidence_bridge_ids` containing the bridge IDs
+that support its cross-paper synthesis. Do not fabricate IDs.
 JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "impact": "...",
-"feasibility": 7, "keywords": [], "anchor_paper": "...", "dataset_plan": "synthetic|public"}}]}}
+"feasibility": 7, "keywords": [], "anchor_paper": "...", "dataset_plan": "synthetic|public",
+"evidence_bridge_ids": ["bridge-..."]}}]}}
 """
         parsed = parse_json_from_llm(call_llm(prompt, temperature=0.8, tier="cheap")) or {}
         gaps = parsed.get("gaps") or []
 
         kept = []
         for gap in gaps:
+            bridge_validation = validate_candidate_bridge_claim(gap, evidence_map)
+            gap["bridge_validation"] = bridge_validation
+            if not bridge_validation["valid"]:
+                self._reject(gap, "unsupported_cross_paper_synthesis", {
+                    "lesson_type": "evidence_grounding_failure",
+                    "reason_code": bridge_validation["reason"],
+                })
+                continue
             gap["literature_evidence"] = [
                 {
                     "title": paper.get("title", ""),

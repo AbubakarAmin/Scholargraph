@@ -112,6 +112,7 @@ def build_cross_paper_evidence_map(
             mechanism = mechanisms[0]
             setting = settings[0]
             bridges.append({
+                "bridge_id": f"bridge-{method_paper['paper_id']}-{setting_paper['paper_id']}-{mechanism}-{setting}",
                 "bridge_type": "method_to_setting_transfer",
                 "source_paper_ids": [method_paper["paper_id"], setting_paper["paper_id"]],
                 "method_signal": mechanism,
@@ -139,6 +140,37 @@ def build_cross_paper_evidence_map(
             "Every candidate requires the ordinary literature, novelty, feasibility, and debate gates.",
         ],
     }
+
+
+def validate_candidate_bridge_claim(candidate: Dict[str, Any], evidence_map: Dict[str, Any]) -> Dict[str, Any]:
+    """Require a synthesis-backed candidate to identify its supporting bridges.
+
+    This is an anti-hallucination gate: a model cannot claim that two papers
+    imply a research opportunity unless it points to bridge IDs created from
+    the retrieved corpus.  It validates provenance, not scientific truth.
+    """
+    available = {str(item.get("bridge_id")): item for item in evidence_map.get("bridges", [])}
+    requested = candidate.get("evidence_bridge_ids") or []
+    if isinstance(requested, str):
+        requested = [requested]
+    requested = [str(value) for value in requested]
+    if not available:
+        return {"valid": True, "bridge_ids": [], "reason": "no_cross_paper_bridges_available"}
+    if not requested:
+        return {"valid": False, "bridge_ids": [], "reason": "candidate_did_not_cite_cross_paper_evidence"}
+    unknown = [value for value in requested if value not in available]
+    if unknown:
+        return {"valid": False, "bridge_ids": requested, "reason": f"unknown_evidence_bridge_ids: {unknown}"}
+    text = " ".join(str(candidate.get(key) or "") for key in ("title", "description", "rationale", "contribution")).lower()
+    supported = []
+    for bridge_id in requested:
+        bridge = available[bridge_id]
+        terms = {str(bridge.get("method_signal", "")).lower(), str(bridge.get("target_setting_signal", "")).lower()}
+        if any(term and term in text for term in terms):
+            supported.append(bridge_id)
+    if not supported:
+        return {"valid": False, "bridge_ids": requested, "reason": "candidate_text_does_not_match_cited_bridge_signals"}
+    return {"valid": True, "bridge_ids": supported, "reason": "grounded_cross_paper_bridge"}
 
 
 def validate_topic_admission(structured_hypothesis: Dict[str, Any]) -> Dict[str, Any]:

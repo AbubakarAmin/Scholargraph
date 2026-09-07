@@ -49,9 +49,27 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
             state["current_phase"] = "hypothesis_debate"
             log_agent_action("Orchestrator", "topics_discovered", {"count": len(topics), "iteration": state["iteration"], "topics": [topic["title"] for topic in topics[:3]]})
         elif state["iteration"] >= 3:
+            # Exhausting discovery is a failed research run, not a successful
+            # completion.  Preserve that distinction so the artifact layer
+            # writes a failure dossier rather than an empty normal summary.
+            message = "No viable, evidence-supported, sandbox-executable topic was discovered after multiple attempts"
             state["current_phase"] = "complete"
-            state["meta_feedback"].append("No topics discovered after multiple attempts - stopping")
-            log_agent_action("Orchestrator", "no_topics_found_after_retries", {"iteration": state["iteration"]})
+            state["should_continue"] = False
+            state["should_reset"] = False
+            state["terminal_error"] = message
+            state["technical_failures"] = {
+                "topic_discovery": {
+                    "success": False,
+                    "failure_kind": "research_exhausted",
+                    "reason_code": "no_viable_topic_after_retries",
+                    "message": message,
+                }
+            }
+            state["meta_feedback"].append(message)
+            log_agent_action("Orchestrator", "no_topics_found_after_retries", {
+                "iteration": state["iteration"],
+                "reason_code": "no_viable_topic_after_retries",
+            })
         else:
             state["should_reset"] = True
             state["meta_feedback"].append("No topics discovered - resetting")
@@ -128,8 +146,16 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
             state["selected_topic"] = current_topic
             topics_tried += 1
             log_agent_action("Orchestrator", "trying_topic", {"topic": current_topic["title"], "attempt": topics_tried, "topics_remaining": len(state["topics"])})
-            result = debater.conduct_debate(current_topic)
-            state["debate_results"].append(result)
+            # Both tournament and serial discovery use the same bounded
+            # repair protocol.  Without this branch, a run with one or two
+            # candidates silently lost the contract-revision capability.
+            attempts = (
+                debater.conduct_with_repair(current_topic)
+                if hasattr(debater, "conduct_with_repair")
+                else [debater.conduct_debate(current_topic)]
+            )
+            state["debate_results"].extend(attempts)
+            result = attempts[-1]
             if result.passed:
                 state["hypothesis_passed"] = True
                 state["current_phase"] = "planning"

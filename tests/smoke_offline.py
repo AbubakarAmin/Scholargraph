@@ -1,4 +1,13 @@
 """Quick smoke test for research-grade upgrades (no API keys required)."""
+import sys
+from pathlib import Path
+
+# Support the documented direct invocation: ``python tests/smoke_offline.py``.
+# Python otherwise places only ``tests/`` on sys.path, hiding the project root.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from core.sandbox import validate_code, execute_sandboxed, run_multi_seed
 from agents.planner import PlannerAgent
 from agents.hypothesis_debate import DebateResult
@@ -6,7 +15,6 @@ from agents.engineer import EngineerAgent
 from core.run_log import CrossRunMemory
 from core.verification import extract_citation_ids, verify_statistics
 import tempfile
-from pathlib import Path
 
 ok, err = validate_code("import subprocess\nsubprocess.run(['x'])")
 assert not ok, err

@@ -7,6 +7,7 @@ from core.artifacts import save_results
 from core.state import initialize_state
 from core.verification import validate_empirical_claims
 from core.workflow_nodes import engineering_node, independent_validation_node
+from core.workflow_nodes import topic_discovery_node
 
 
 def test_validate_experiments_rejects_null_and_string_candidates():
@@ -205,6 +206,26 @@ def test_terminal_run_writes_failure_dossier_without_latex(tmp_path):
 
     assert (tmp_path / "failure_dossier.json").exists()
     assert not (tmp_path / "paper_output.tex").exists()
+
+
+def test_discovery_exhaustion_is_a_terminal_failed_run(monkeypatch):
+    state = initialize_state()
+    state["iteration"] = 3
+
+    class EmptyTopicHunter:
+        def __init__(self, *_args):
+            pass
+
+        def discover_topics(self, *_args):
+            return []
+
+    monkeypatch.setattr("core.workflow_nodes.TopicHunterAgent", EmptyTopicHunter)
+    result = topic_discovery_node(state)
+
+    assert result["current_phase"] == "complete"
+    assert not result["should_continue"]
+    assert result["terminal_error"]
+    assert result["technical_failures"]["topic_discovery"]["reason_code"] == "no_viable_topic_after_retries"
 
 
 def test_empirical_claim_check_rejects_harness_diagnostics():

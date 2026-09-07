@@ -150,6 +150,45 @@ def test_workflow_graph_compiles_with_injected_nodes():
     assert compiled is not None
 
 
+def test_offline_workflow_runs_every_phase_to_a_release_candidate():
+    """Exercise the actual LangGraph routing without network, models, or APIs."""
+    phases = [
+        "topic_discovery", "hypothesis_debate", "planning", "data_validation",
+        "writing_narrative", "engineering", "independent_validation",
+        "writing_results", "supervision", "editing",
+    ]
+    observed = []
+
+    def node(name, next_phase):
+        def run(state):
+            observed.append(name)
+            state["current_phase"] = next_phase
+            return state
+        return run
+
+    nodes = {
+        "topic_discovery": node("topic_discovery", "hypothesis_debate"),
+        "hypothesis_debate": node("hypothesis_debate", "planning"),
+        "planning": node("planning", "data_validation"),
+        "data_validation": node("data_validation", "writing_narrative"),
+        "writing_narrative": node("writing_narrative", "engineering"),
+        "engineering": node("engineering", "independent_validation"),
+        "independent_validation": node("independent_validation", "writing_results"),
+        "writing_results": node("writing_results", "supervision"),
+        "supervision": node("supervision", "editing"),
+        "meta_evaluation": node("meta_evaluation", "complete"),
+        "editing": node("editing", "complete"),
+        "reset": node("reset", "topic_discovery"),
+        "should_reset": should_reset,
+        "should_continue": should_continue,
+    }
+    graph = create_research_graph(nodes).compile()
+    result = graph.invoke(initialize_state(), {"recursion_limit": 30})
+
+    assert observed == phases
+    assert result["current_phase"] == "complete"
+
+
 def test_route_selectors_honor_terminal_state():
     state = initialize_state()
     state["current_phase"] = "complete"

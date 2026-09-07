@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from core.context import RunContext, get_active_context
 from core.memory import memory
 from core.run_log import get_tracker
 from core.capabilities import SANDBOX_CAPABILITY_MANIFEST, check_plan_feasibility
+from core.evidence_synthesis import validate_topic_admission
 
 
 REVIEWER_CHECKLIST = [
@@ -240,9 +242,20 @@ Feasibility: {topic.get('feasibility', 5)}/10
 
 Include: hypothesis, theory, evidence, novelty, methodology, expected outcomes, falsifiable prediction.
 """
-        arg = call_llm(prompt, temperature=0.7, tier="strong")
-        log_agent_action("ProposerAgent", "built_argument", {"len": len(arg or "")})
-        return arg or "Failed to build argument."
+        arg = ""
+        for attempt in range(2):
+            raw = call_llm(prompt, temperature=0.7, tier="strong")
+            if not is_degenerate_llm_output(raw, min_chars=30):
+                arg = raw
+                break
+            log_agent_action("ProposerAgent", "degenerate_argument_retry", {"attempt": attempt + 1})
+
+        if not arg:
+            arg = "PROPOSER_ARGUMENT_INVALID"
+            log_agent_action("ProposerAgent", "argument_failed_closed", {"topic": topic.get("title")})
+        else:
+            log_agent_action("ProposerAgent", "built_argument", {"len": len(arg)})
+        return arg
 
     def respond_to_objections(
         self,
@@ -264,7 +277,15 @@ Objections:
 Format:
 For each objection: OBJECTION: ... RESPONSE: ... CONCESSION (if any): ...
 """
-        return call_llm(prompt, temperature=0.5, tier="strong") or ""
+        response = ""
+        for attempt in range(2):
+            raw = call_llm(prompt, temperature=0.5, tier="strong")
+            if not is_degenerate_llm_output(raw, min_chars=20):
+                response = raw
+                break
+            log_agent_action("ProposerAgent", "degenerate_response_retry", {"attempt": attempt + 1})
+
+        return response or "PROPOSER_RESPONSE_INVALID"
 
 
 class ChallengerAgent:
@@ -292,7 +313,7 @@ class ChallengerAgent:
         return tags
 
     def build_rebuttal(self, topic: Dict[str, Any], proposer_argument: str) -> str:
-        """Checklist-grounded critique — must address each reviewer criterion."""
+        """Checklist-grounded critique — attacks scientific validity, confounders, baselines, and feasibility."""
         rating = float(topic.get("elo_rating", EloStore(context=self.context).get(hypothesis_kind(topic.get("title", "")))))
         kind = topic.get("hypothesis_kind") or hypothesis_kind(topic.get("title", ""))
         history_note = (
@@ -302,27 +323,44 @@ class ChallengerAgent:
             f"This is a {kind} hypothesis with historical Elo {rating:.0f}; still independently verify its claims."
         )
         prior_tags = self._prior_objection_tags()
+        structured_hyp = topic.get("structured_hypothesis") or {}
         prompt = f"""
-You are a critical reviewer. Address EACH criterion explicitly:
-{', '.join(REVIEWER_CHECKLIST)}
+You are an adversarial scientific reviewer. Your goal is to find the strongest legitimate reasons this hypothesis may be flawed, unfalsifiable, confounded, or unexecutable.
 
 Topic: {topic.get('title')}
-Argument: {proposer_argument[:4000]}
+Structured Hypothesis Contract:
+{json.dumps(structured_hyp, indent=2, default=str)[:3000]}
+
+Proposer Argument:
+{proposer_argument[:3000]}
+
 Historical signal: {history_note}
 Prior objection tags only (never reuse prior prose): {json.dumps(prior_tags)[:1500]}
 Sandbox capability manifest: {json.dumps(SANDBOX_CAPABILITY_MANIFEST.as_dict(), sort_keys=True)}
 
-Treat any requirement outside this manifest as a first-class feasibility objection
-with severity 5. Do not assume unavailable network, GPU, libraries, or data.
+Scrutinize:
+1. Hypothesis clarity & falsifiability (is the falsification condition concrete and measurable?)
+2. Confounders & competing explanations (could an alternative mechanism produce the same result?)
+3. Baseline adequacy (are meaningful comparison baselines included?)
+4. Evaluation & metric adequacy (can the chosen metrics detect the proposed effect?)
+5. Statistical adequacy & power (sample size, seed count, statistical test)
+6. Feasibility vs Sandbox Manifest and Local Dataset Catalog (local datasets only, no downloads, CPU limits)
+7. Minimum Viable Experiment sufficiency (does the experiment distinguish the hypothesis from competing explanations?)
 
 Return JSON:
 {{
   "objections": [
-    {{"criterion": "soundness", "objection": "...", "severity": 1-5}}
+    {{
+      "criterion": "confounder|baseline|falsifiability|soundness|feasibility|evaluation|statistical|novelty",
+      "objection": "...",
+      "severity": 1-5,
+      "status": "unresolved",
+      "required_resolution": "...",
+      "source": "challenger_audit"
+    }}
   ],
   "summary_rebuttal": "..."
 }}
-Require at least one objection per criterion (can note 'no major issue' with severity 1).
 """
         self._challenger_invalid = False
         parsed: Dict[str, Any] = {}
@@ -331,15 +369,25 @@ Require at least one objection per criterion (can note 'no major issue' with sev
         raw = ""
         for attempt in range(2):
             raw = call_llm(prompt, temperature=0.5, tier="strong")
+            if is_degenerate_llm_output(raw, min_chars=20):
+                log_agent_action("ChallengerAgent", "degenerate_rebuttal", {
+                    "attempt": attempt + 1,
+                    "preview": str(raw)[:120],
+                })
+                continue
             parsed = parse_json_from_llm(raw) or {}
-            objections = list(parsed.get("objections") or [])
-            summary = parsed.get("summary_rebuttal") or raw
-            if isinstance(summary, str) and not is_degenerate_llm_output(summary, min_chars=40) and len(objections) > 0:
+            raw_objections = parsed.get("objections")
+            if isinstance(raw_objections, list) and len(raw_objections) > 0:
+                for obj in raw_objections:
+                    if isinstance(obj, dict):
+                        obj.setdefault("status", "unresolved")
+                        obj.setdefault("source", "challenger_audit")
+                        objections.append(obj)
+                summary = str(parsed.get("summary_rebuttal") or raw)
                 break
-            log_agent_action("ChallengerAgent", "degenerate_rebuttal", {
+            log_agent_action("ChallengerAgent", "malformed_rebuttal_json", {
                 "attempt": attempt + 1,
-                "n_objections": len(objections),
-                "preview": str(summary)[:120],
+                "parsed_keys": list(parsed.keys()) if isinstance(parsed, dict) else [],
             })
         else:
             # Fail closed: never treat empty/garbled challenger output as zero objections.
@@ -348,6 +396,8 @@ Require at least one objection per criterion (can note 'no major issue' with sev
                 "criterion": "soundness",
                 "objection": "Challenger produced empty or garbled output; debate fails closed.",
                 "severity": 5,
+                "status": "unresolved",
+                "required_resolution": "Challenger must produce valid critique.",
                 "source": "challenger_output_guard",
             }]
             summary = "CHALLENGER_OUTPUT_INVALID"
@@ -361,8 +411,24 @@ Require at least one objection per criterion (can note 'no major issue' with sev
             "criterion": "feasibility",
             "objection": reason,
             "severity": 5,
+            "status": "unresolved",
+            "required_resolution": "Rescope experiment within sandbox capabilities",
             "source": "capability_manifest",
         } for reason in feasibility_errors)
+
+        # Minimum viable experiment validation
+        mve_check = self.validate_minimum_experiment(topic)
+        if not mve_check.get("is_discriminative", True) or not mve_check.get("is_executable", True):
+            for note in mve_check.get("validation_notes", []):
+                objections.append({
+                    "criterion": "soundness",
+                    "objection": f"Minimum viable experiment flaw: {note}",
+                    "severity": 4,
+                    "status": "unresolved",
+                    "required_resolution": "Refine MVE to be executable and discriminative",
+                    "source": "minimum_experiment_check",
+                })
+
         self._last_objections = objections
         log_agent_action("ChallengerAgent", "built_rebuttal", {
             "n_objections": len(objections),
@@ -370,18 +436,74 @@ Require at least one objection per criterion (can note 'no major issue' with sev
         })
         return summary if isinstance(summary, str) else json.dumps(parsed)
 
+    def validate_minimum_experiment(self, topic: Dict[str, Any]) -> Dict[str, Any]:
+        """Verify that the minimum viable experiment is both executable and scientifically discriminative."""
+        structured_hyp = topic.get("structured_hypothesis") or {}
+        mve = structured_hyp.get("minimum_viable_experiment") or {}
+        notes: List[str] = []
+        is_executable = True
+        is_discriminative = True
+
+        if not mve:
+            return {
+                "is_executable": True,
+                "is_discriminative": True,
+                "validation_notes": [],
+            }
+
+        # Executability check against local catalog
+        from core.datasets import list_datasets
+        catalog_names = {d["name"] for d in list_datasets()}
+        dataset_name = mve.get("dataset", "bundled_synthetic")
+        if dataset_name not in catalog_names and "synthetic" not in dataset_name.lower():
+            is_executable = False
+            notes.append(f"Dataset '{dataset_name}' not found in local catalog and not synthetic")
+
+        # Discriminative power check
+        competing = structured_hyp.get("competing_explanations") or []
+        falsification = structured_hyp.get("falsification_condition") or mve.get("falsification_test")
+        if not falsification:
+            is_discriminative = False
+            notes.append("No defined falsification test in minimum viable experiment")
+        if competing and not mve.get("baseline") and not mve.get("models"):
+            is_discriminative = False
+            notes.append("MVE lacks baselines to distinguish hypothesis from competing explanations")
+
+        return {
+            "is_executable": is_executable,
+            "is_discriminative": is_discriminative,
+            "validation_notes": notes,
+        }
+
     def followup_objections(
         self,
         topic: Dict[str, Any],
         proposer_response: str,
         prior_objections: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """Track objections across rounds with invariant: no objection may silently disappear."""
         prompt = f"""
-Given the proposer's point-by-point responses, which objections remain unresolved?
-Prior objections: {json.dumps(prior_objections)[:3000]}
-Proposer responses: {proposer_response[:3000]}
+Given the proposer's point-by-point responses, evaluate each prior objection.
+Prior objections:
+{json.dumps(prior_objections, indent=2)[:3000]}
 
-Return JSON: {{"unresolved": [{{"criterion": "...", "objection": "...", "severity": 3}}], "resolved": ["..."]}}
+Proposer responses:
+{proposer_response[:3000]}
+
+For EACH prior objection, decide if it is resolved or remains unresolved.
+Return JSON:
+{{
+  "objections": [
+    {{
+      "criterion": "...",
+      "objection": "...",
+      "severity": 3,
+      "status": "resolved|unresolved",
+      "resolution": "...",
+      "required_resolution": "..."
+    }}
+  ]
+}}
 """
         for attempt in range(2):
             raw = call_llm(prompt, temperature=0.3, tier="judge")
@@ -389,10 +511,27 @@ Return JSON: {{"unresolved": [{{"criterion": "...", "objection": "...", "severit
                 log_agent_action("ChallengerAgent", "degenerate_followup", {"attempt": attempt + 1})
                 continue
             parsed = parse_json_from_llm(raw) or {}
-            if "unresolved" in parsed or "resolved" in parsed:
-                return parsed.get("unresolved") or []
-        # Fail closed: keep prior objections rather than inventing a clean slate.
-        return list(prior_objections)
+            raw_objs = parsed.get("objections")
+            if isinstance(raw_objs, list) and len(raw_objs) > 0:
+                # Merge status onto prior objections to ensure no objection is dropped
+                updated = []
+                seen_texts = set()
+                for obj in raw_objs:
+                    if isinstance(obj, dict):
+                        text = str(obj.get("objection", ""))
+                        seen_texts.add(text.lower().strip())
+                        updated.append(obj)
+                for prior in prior_objections:
+                    p_text = str(prior.get("objection", "")).lower().strip()
+                    if p_text not in seen_texts:
+                        # Prior objection was dropped by LLM; preserve as unresolved
+                        unresolved_copy = dict(prior)
+                        unresolved_copy["status"] = "unresolved"
+                        updated.append(unresolved_copy)
+                return updated
+
+        # Fail closed: preserve all prior objections as unresolved
+        return [dict(obj, status="unresolved") for obj in prior_objections]
 
 
 class ModeratorAgent:
@@ -405,60 +544,99 @@ class ModeratorAgent:
         self,
         topic: Dict[str, Any],
         rounds: List[Dict[str, Any]],
-        unresolved: List[Dict[str, Any]],
+        objections: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Ensemble judge: multiple models; disagreement extends debate signal."""
+        """Ensemble judge: hard deterministic gates dominate; soft scores cannot rescue hard fails."""
         models = self._judge_models()
-        scores = []
-        reasonings = []
+        scores: List[float] = []
+        reasonings: List[str] = []
+        valid_judge_responses = 0
         transcript = json.dumps(rounds, default=str)[:6000]
+
+        unresolved = [o for o in objections if o.get("status") != "resolved"]
+
+        # Hard Gates evaluation
+        hard_gates = {
+            "hypothesis_falsifiable": bool(
+                topic.get("falsifiable_prediction")
+                or (topic.get("structured_hypothesis") or {}).get("falsification_condition")
+            ),
+            "measurable_outcome_exists": bool(
+                (topic.get("structured_hypothesis") or {}).get("dependent_variables")
+                or topic.get("rationale")
+            ),
+            "no_severe_unresolved_objections": not any(
+                _coerce_int(u.get("severity"), 0) >= 4 for u in unresolved
+            ),
+            "resources_available": not any(
+                u.get("criterion") == "feasibility" and _coerce_int(u.get("severity"), 0) >= 4 for u in unresolved
+            ),
+        }
+        all_hard_passed = all(hard_gates.values())
+
         base_prompt = f"""
 Moderate this multi-round research debate.
 Topic: {topic.get('title')}
+Structured Hypothesis: {json.dumps(topic.get('structured_hypothesis', {}), default=str)[:1500]}
 Transcript: {transcript}
-Unresolved objections: {json.dumps(unresolved)[:2000]}
+Unresolved objections: {json.dumps(unresolved, default=str)[:2000]}
 Pass threshold: {self.runtime_config.debate_pass_threshold}
 
-Score overall scientific merit 1-10. PASS only if score >= {self.runtime_config.debate_pass_threshold}
-and unresolved high-severity (>=4) objections are empty.
-
+Score overall scientific merit 1-10 on soft dimensions (significance, novelty, clarity, expected contribution).
 JSON: {{"score": 7.5, "passed": true, "reasoning": "...", "decision": "PASS|FAIL"}}
 """
         for model in models:
             raw = call_llm(base_prompt, temperature=0.2, tier="judge", model=model)
+            if is_degenerate_llm_output(raw, min_chars=20):
+                continue
             parsed = parse_json_from_llm(raw) or {}
-            try:
-                scores.append(float(parsed.get("score", 5)))
-            except (TypeError, ValueError):
-                scores.append(5.0)
-            reasonings.append(parsed.get("reasoning", raw[:300]))
+            if isinstance(parsed, dict) and "score" in parsed:
+                try:
+                    score_val = float(parsed["score"])
+                    scores.append(score_val)
+                    reasonings.append(str(parsed.get("reasoning", raw[:300])))
+                    valid_judge_responses += 1
+                except (TypeError, ValueError):
+                    pass
 
-        if not scores:
-            scores = [5.0]
-            reasonings = ["no judge response"]
+        if valid_judge_responses == 0:
+            # Fail closed: missing judge output must never become a passing score.
+            return {
+                "score": 0.0,
+                "passed": False,
+                "ensemble_scores": [],
+                "disagreement": 0.0,
+                "needs_longer_debate": False,
+                "reasoning": "No valid judge responses obtained; debate fails closed.",
+                "decision": "FAIL",
+                "valid_judge_responses": 0,
+                "hard_gates": hard_gates,
+            }
 
         mean = sum(scores) / len(scores)
         disagreement = max(scores) - min(scores) if len(scores) > 1 else 0.0
-        # Agreement required: if disagreement high, do not pass even if mean is high
         agreed = disagreement <= 1.5
-        passed = agreed and mean >= self.runtime_config.debate_pass_threshold and not any(
-            _coerce_int(u.get("severity"), 0) >= 4 for u in unresolved
-        )
+
+        # Key rule: soft score cannot override hard FAIL
+        passed = all_hard_passed and agreed and (mean >= self.runtime_config.debate_pass_threshold)
+
         return {
             "score": mean,
             "passed": passed,
             "ensemble_scores": scores,
             "disagreement": disagreement,
-            "needs_longer_debate": disagreement > 1.5,
+            "needs_longer_debate": disagreement > 1.5 and len(rounds) < self.runtime_config.debate_max_rounds,
             "reasoning": " | ".join(reasonings[:3]),
             "decision": "PASS" if passed else "FAIL",
+            "valid_judge_responses": valid_judge_responses,
+            "hard_gates": hard_gates,
+            "unresolved_objections": unresolved,
         }
 
     def _judge_models(self) -> List[str]:
         models = self.runtime_config.get_ensemble_models()
         if models:
             return models[:3]
-        # Single configured judge/strong model repeated is weak; use cheap+strong if set
         out = []
         for tier in ("judge", "strong", "cheap"):
             m = self.runtime_config.resolve_model(tier)
@@ -483,7 +661,7 @@ class HypothesisDebateSystem:
         argument = self.proposer.build_argument(topic)
         rebuttal = self.challenger.build_rebuttal(topic, argument)
         objections = getattr(self.challenger, "_last_objections", []) or [
-            {"criterion": "soundness", "objection": rebuttal[:500], "severity": 3}
+            {"criterion": "soundness", "objection": rebuttal[:500], "severity": 3, "status": "unresolved"}
         ]
         rounds.append({
             "round": 1,
@@ -494,44 +672,43 @@ class HypothesisDebateSystem:
 
         min_r = self.runtime_config.debate_min_rounds
         max_r = self.runtime_config.debate_max_rounds
-        unresolved = objections
+        current_objections = objections
         final = None
 
         for r in range(2, max_r + 1):
-            response = self.proposer.respond_to_objections(topic, argument, unresolved)
-            unresolved = self.challenger.followup_objections(topic, response, unresolved)
+            response = self.proposer.respond_to_objections(topic, argument, current_objections)
+            current_objections = self.challenger.followup_objections(topic, response, current_objections)
             rounds.append({
                 "round": r,
                 "proposer": response,
-                "objections": unresolved,
+                "objections": current_objections,
             })
             argument = response
             tracker = get_tracker()
             if tracker:
                 tracker.bump("debate_rounds")
 
+            unresolved_now = [o for o in current_objections if o.get("status") != "resolved"]
             # Early stop after min rounds if no severe unresolved
-            if r >= min_r and not any(_coerce_int(u.get("severity"), 0) >= 3 for u in unresolved):
+            if r >= min_r and not any(_coerce_int(u.get("severity"), 0) >= 3 for u in unresolved_now):
                 break
 
             # Ensemble disagreement can force another round
             if r >= min_r:
-                mid = self.moderator.evaluate_debate(topic, rounds, unresolved)
+                mid = self.moderator.evaluate_debate(topic, rounds, current_objections)
                 if not mid.get("needs_longer_debate"):
-                    # continue to final eval below with this mid result cached
                     final = mid
                     break
         else:
             final = None
 
         if not final:
-            final = self.moderator.evaluate_debate(topic, rounds, unresolved)
-            # If disagreement, one forced extra round already handled in loop; mark longer
+            final = self.moderator.evaluate_debate(topic, rounds, current_objections)
             if final.get("needs_longer_debate") and len(rounds) < max_r:
-                response = self.proposer.respond_to_objections(topic, argument, unresolved)
-                unresolved = self.challenger.followup_objections(topic, response, unresolved)
-                rounds.append({"round": len(rounds) + 1, "proposer": response, "objections": unresolved})
-                final = self.moderator.evaluate_debate(topic, rounds, unresolved)
+                response = self.proposer.respond_to_objections(topic, argument, current_objections)
+                current_objections = self.challenger.followup_objections(topic, response, current_objections)
+                rounds.append({"round": len(rounds) + 1, "proposer": response, "objections": current_objections})
+                final = self.moderator.evaluate_debate(topic, rounds, current_objections)
 
         if getattr(self.challenger, "_challenger_invalid", False):
             final = {
@@ -542,8 +719,9 @@ class HypothesisDebateSystem:
                 "reasoning": "Challenger output invalid after retry; debate fails closed.",
             }
 
+        unresolved_now = [o for o in current_objections if o.get("status") != "resolved"]
         delta = self.elo.update(topic.get("title", "general"), final["score"], final["passed"])
-        unresolved_text = [f"[{u.get('criterion')}] {u.get('objection')}" for u in unresolved]
+        unresolved_text = [f"[{u.get('criterion')}] {u.get('objection')}" for u in unresolved_now]
 
         result = DebateResult(
             topic=topic.get("title", ""),
@@ -554,7 +732,7 @@ class HypothesisDebateSystem:
             passed=bool(final.get("passed")),
             reasoning=final.get("reasoning", ""),
             rounds=rounds,
-            objections=objections,
+            objections=current_objections,
             unresolved_objections=unresolved_text,
             ensemble_scores=final.get("ensemble_scores") or [],
             elo_delta=delta,
@@ -566,10 +744,10 @@ class HypothesisDebateSystem:
             result.moderator_decision,
             result.score,
             structured_signal={
-                "objection_type": (unresolved[0].get("criterion") if unresolved else "none"),
-                "objection_types": sorted({str(item.get("criterion")) for item in unresolved if item.get("criterion")}),
-                "severity": max((_coerce_int(item.get("severity"), 0) for item in unresolved), default=0),
-                "resolution_status": "unresolved" if unresolved else "resolved",
+                "objection_type": (unresolved_now[0].get("criterion") if unresolved_now else "none"),
+                "objection_types": sorted({str(item.get("criterion")) for item in unresolved_now if item.get("criterion")}),
+                "severity": max((_coerce_int(item.get("severity"), 0) for item in unresolved_now), default=0),
+                "resolution_status": "unresolved" if unresolved_now else "resolved",
             },
             run_id=get_tracker().run_id if get_tracker() else "unknown",
             outcome_status="released",
@@ -583,6 +761,91 @@ class HypothesisDebateSystem:
                 "unresolved": unresolved_text,
             })
         return result
+
+    def revise_topic_from_objections(
+        self,
+        topic: Dict[str, Any],
+        result: DebateResult,
+    ) -> Optional[Dict[str, Any]]:
+        """Produce one bounded, auditable scientific repair before rejection.
+
+        The old workflow let a proposer answer objections rhetorically but did
+        not permit it to change the experimental contract.  This method is the
+        narrow repair loop: it can repair a baseline, metric, falsification
+        condition, or MVE, but it may not erase provenance or silently turn a
+        failed study into a pass.
+        """
+        if not getattr(self, "runtime_config", None) or getattr(getattr(self, "challenger", None), "_challenger_invalid", False):
+            return None
+        unresolved = [item for item in (result.objections or []) if item.get("status") != "resolved"]
+        if not unresolved:
+            return None
+        repairable = {"baseline", "confounder", "evaluation", "statistical", "feasibility", "falsifiability", "soundness"}
+        if not any(str(item.get("criterion")) in repairable for item in unresolved):
+            return None
+        current = topic.get("structured_hypothesis") or {}
+        if not current:
+            return None
+        prompt = f"""
+You are a research-methods repair agent. Revise the structured hypothesis below
+to resolve the listed reviewer objections. Keep its research domain and every
+evidence/provenance field intact. Do not claim novelty, performance, or a gap
+without existing evidence. Produce a smaller executable study when necessary.
+
+Current contract:
+{json.dumps(current, indent=2, default=str)[:6000]}
+
+Unresolved objections:
+{json.dumps(unresolved, indent=2, default=str)[:3500]}
+
+Hard requirements:
+- preserve or strengthen the falsification condition;
+- use only a catalogued local dataset or named synthetic data;
+- name a baseline, metrics, a falsification test, and >=3 seeds;
+- specify controls that address each confounder/baseline objection;
+- return JSON for the complete structured hypothesis only.
+"""
+        for attempt in range(2):
+            parsed = parse_json_from_llm(call_llm(prompt, temperature=0.2, tier="strong")) or {}
+            admission = validate_topic_admission(parsed) if isinstance(parsed, dict) else {"admitted": False}
+            if not admission.get("admitted"):
+                log_agent_action("HypothesisDebate", "repair_contract_rejected", {
+                    "attempt": attempt + 1,
+                    "errors": admission.get("errors", ["invalid response"]),
+                })
+                continue
+            revised = deepcopy(topic)
+            revised["structured_hypothesis"] = parsed
+            revised["falsifiable_prediction"] = parsed.get("falsification_condition", "")
+            revised["research_question"] = parsed.get("research_question", "")
+            revised.setdefault("repair_history", []).append({
+                "source": "hypothesis_debate",
+                "attempt": attempt + 1,
+                "addressed_objections": [str(item.get("criterion")) for item in unresolved],
+                "admission": admission,
+            })
+            log_agent_action("HypothesisDebate", "repair_contract_accepted", {
+                "topic": topic.get("title"),
+                "attempt": attempt + 1,
+                "objections": len(unresolved),
+            })
+            return revised
+        return None
+
+    def conduct_with_repair(self, topic: Dict[str, Any]) -> List[DebateResult]:
+        """Debate once, then allow exactly one contract repair and re-debate."""
+        first = self.conduct_debate(topic)
+        if first.passed:
+            return [first]
+        revised = self.revise_topic_from_objections(topic, first)
+        if not revised:
+            return [first]
+        # Preserve the candidate object's identity: the tournament/workflow
+        # selects from its original topic list after this method returns.
+        topic.clear()
+        topic.update(revised)
+        second = self.conduct_debate(revised)
+        return [first, second]
 
     def conduct_tournament(self, topics: List[Dict[str, Any]], rounds: int = 1) -> List[DebateResult]:
         """Debate candidates until one passes, then hand off immediately.
@@ -598,8 +861,8 @@ class HypothesisDebateSystem:
             if not title or title.lower() in debated_titles:
                 continue
             debated_titles.add(title.lower())
-            result = self.conduct_debate(topic)
-            results.append(result)
-            if result.passed:
+            attempts = self.conduct_with_repair(topic)
+            results.extend(attempts)
+            if attempts[-1].passed:
                 return sorted(results, key=lambda item: (item.passed, item.score), reverse=True)
         return sorted(results, key=lambda item: (item.passed, item.score), reverse=True)

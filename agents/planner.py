@@ -19,6 +19,7 @@ from core.evidence_gate import validate_experiments
 from core.memory import memory
 from core.run_log import get_tracker, CrossRunMemory
 from core.capabilities import SANDBOX_CAPABILITY_MANIFEST, check_plan_feasibility
+from core.verification import preregister_power
 from core.datasets import list_datasets
 
 
@@ -43,6 +44,25 @@ class PlannerAgent:
 
         plan = self._generate_plan_structure(topic, lessons)
         plan["dataset_catalog"] = list_datasets()
+
+        # Retain upstream lineage to StructuredHypothesis
+        structured_hyp = topic.get("structured_hypothesis")
+        if isinstance(structured_hyp, dict):
+            plan["structured_hypothesis"] = structured_hyp
+            if structured_hyp.get("research_question"):
+                plan["research_questions"] = [structured_hyp["research_question"]]
+            if structured_hyp.get("falsification_condition"):
+                plan["falsification_condition"] = structured_hyp["falsification_condition"]
+            if structured_hyp.get("closest_prior_work"):
+                plan["closest_prior_work"] = structured_hyp["closest_prior_work"]
+            # Power analysis integration if required
+            if plan.get("require_power_analysis"):
+                effect = structured_hyp.get("planned_effect_size")
+                alpha = structured_hyp.get("alpha", 0.05)
+                target_power = structured_hyp.get("target_power", 0.8)
+                if effect is not None:
+                    plan["power_analysis"] = preregister_power(effect, alpha=alpha, target_power=target_power)
+
         plan["contributions"] = self._ensure_falsifiable_contributions(plan, topic)
         plan["experiments"] = self._generate_experiments(topic, plan)
         plan["experiments"] = self._normalize_experiments(plan["experiments"])
@@ -111,7 +131,7 @@ class PlannerAgent:
 
     @staticmethod
     def _apply_capability_rescope(plan: Plan, topic: Topic, reasons: List[str]) -> None:
-        """Rewrite publication framing when execution scope changes."""
+        """Rewrite publication framing when execution scope changes with full dataset rescoping traceability."""
         original_title = str(plan.get("title") or topic.get("title") or "Research study")
         original_contributions = plan.get("contributions") or plan.get("expected_contributions") or []
         replacement = "bounded local synthetic or bundled benchmark"
@@ -135,6 +155,9 @@ class PlannerAgent:
             "from": reasons,
             "original_title": original_title,
             "to": replacement,
+            "original_dataset_requirement": str((topic or {}).get("dataset_plan") or "external_dataset"),
+            "replacement_dataset": "bundled_synthetic",
+            "reason": "; ".join(reasons) or "Outbound downloads/GPU unavailable in sandbox; rescoped to catalogued synthetic benchmark",
             "replacement_dataset_policy": "catalogued or generated locally; no outbound downloads",
         }
         plan["title"] = title

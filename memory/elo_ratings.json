@@ -1,19 +1,19 @@
 {
   "graph": {
-    "rating": 1490.8317835567757,
-    "raw_rating": 1472.495350670327,
-    "observations": 4,
+    "rating": 1480.6072624633398,
+    "raw_rating": 1461.2145249266798,
+    "observations": 8,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-07T16:06:28.345247"
+    "updated_at": "2026-09-07T22:05:43.705970"
   },
   "general": {
-    "rating": 1450.3848276711722,
-    "raw_rating": 1442.1156322830343,
-    "observations": 48,
+    "rating": 1349.8672774044198,
+    "raw_rating": 1336.061969579539,
+    "observations": 87,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-07T16:49:42.240158"
+    "updated_at": "2026-09-07T22:19:19.391437"
   },
   "vision": {
     "rating": 1500.0,
@@ -30,5 +30,13 @@
     "prior": 1500.0,
     "shrinkage_k": 8.0,
     "updated_at": "2026-09-07T16:36:20.407404"
+  },
+  "llm": {
+    "rating": 1498.2222222222222,
+    "raw_rating": 1484.0,
+    "observations": 1,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-07T22:04:59.602954"
   }
 }

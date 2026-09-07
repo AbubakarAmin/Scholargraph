@@ -26,6 +26,7 @@ from core.run_log import CrossRunMemory, get_tracker
 from core.sources import SourceClient
 from agents.hypothesis_debate import EloStore, hypothesis_kind
 from core.capabilities import SANDBOX_CAPABILITY_MANIFEST, check_plan_feasibility
+from core.evidence_synthesis import build_cross_paper_evidence_map, validate_topic_admission
 
 
 _FAILED_TOPIC_OVERLAP_THRESHOLD = 0.55
@@ -170,8 +171,118 @@ class TopicHunterAgent:
             log_agent_action("TopicHunter", "citation_graph_error", {"error": str(e)})
             return {}
 
+    def evaluate_layered_novelty(self, candidate_topic: Dict[str, Any], abstracts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Layered novelty evaluation:
+        1. Fast embedding similarity check
+        2. Contribution comparison for high-overlap papers
+        """
+        if not abstracts:
+            return {
+                "max_similarity": 0.0,
+                "reject": False,
+                "nearest": None,
+                "novelty_comparisons": [],
+                "verdict": "NOVEL",
+            }
+        topic_desc = f"{candidate_topic.get('title','')} {candidate_topic.get('description','')} {candidate_topic.get('contribution','')}"
+        topic_emb = generate_embedding(topic_desc)
+        best_sim = 0.0
+        nearest = None
+        high_overlap_papers = []
+
+        for paper in abstracts[:30]:
+            abs_text = paper.get("abstract") if isinstance(paper, dict) else str(paper)
+            if not abs_text:
+                continue
+            emb = generate_embedding(abs_text[:2000])
+            denom = np.linalg.norm(topic_emb) * np.linalg.norm(emb)
+            if denom == 0:
+                continue
+            sim = float(np.dot(topic_emb, emb) / denom)
+            if sim > best_sim:
+                best_sim = sim
+                nearest = abs_text[:200]
+            if sim >= 0.70:
+                high_overlap_papers.append({
+                    "paper": paper if isinstance(paper, dict) else {"title": "Prior Paper", "abstract": abs_text},
+                    "similarity": sim,
+                })
+
+        # If near duplicate threshold reached (e.g. > 0.95), immediate reject
+        if best_sim >= 0.95:
+            return {
+                "max_similarity": best_sim,
+                "reject": True,
+                "nearest": nearest,
+                "novelty_comparisons": [],
+                "verdict": "LIKELY_DUPLICATE",
+                "reason": f"Near-duplicate embedding similarity ({best_sim:.2f})",
+            }
+
+        # Contribution comparison for high overlap papers (similarity >= 0.70)
+        comparisons = []
+        is_duplicate = False
+        if high_overlap_papers:
+            prompt = f"""
+Compare the candidate research contribution against prior work to evaluate novelty.
+Candidate:
+Title: {candidate_topic.get('title')}
+Description: {candidate_topic.get('description')}
+Proposed Contribution: {candidate_topic.get('contribution', candidate_topic.get('rationale', ''))}
+
+Prior High-Overlap Works:
+{json.dumps([{
+    'title': p['paper'].get('title'),
+    'abstract': p['paper'].get('abstract')[:1000],
+    'similarity': round(p['similarity'], 2)
+} for p in high_overlap_papers[:3]], indent=2)}
+
+For EACH prior work, evaluate:
+- Problem
+- Method / Variables
+- Overlap
+- Difference & Remaining Gap
+- Is the candidate novel compared to this paper? (true/false)
+
+Return JSON:
+{{
+  "comparisons": [
+    {{
+      "paper": "title",
+      "overlap": "...",
+      "difference": "...",
+      "remaining_gap": "...",
+      "is_novel": true,
+      "verdict": "NOVEL"
+    }}
+  ],
+  "overall_novelty_verdict": "NOVEL|LIKELY_DUPLICATE|INSUFFICIENT_DIFFERENCE",
+  "reject": false,
+  "reason": "..."
+}}
+"""
+            for attempt in range(2):
+                raw = call_llm(prompt, temperature=0.3, tier="cheap")
+                parsed = parse_json_from_llm(raw) or {}
+                if isinstance(parsed, dict) and "comparisons" in parsed:
+                    comparisons = parsed.get("comparisons") or []
+                    verdict = parsed.get("overall_novelty_verdict", "NOVEL")
+                    if verdict in ("LIKELY_DUPLICATE", "INSUFFICIENT_DIFFERENCE") or parsed.get("reject") is True:
+                        is_duplicate = True
+                    break
+
+        reject = is_duplicate or (best_sim >= self.runtime_config.novelty_similarity_reject and not comparisons)
+        return {
+            "max_similarity": best_sim,
+            "reject": reject,
+            "nearest": nearest,
+            "novelty_comparisons": comparisons,
+            "verdict": "LIKELY_DUPLICATE" if reject else "NOVEL",
+            "reason": f"Contribution comparison: {'rejected as duplicate/insufficient difference' if reject else 'novel contribution supported'}",
+        }
+
     def novelty_score(self, topic_desc: str, abstracts: List[str]) -> Dict[str, Any]:
-        """High similarity to recent abstracts → reject (already published)."""
+        """High similarity to recent abstracts -> fast embedding check with backward compatibility."""
         if not abstracts:
             return {"max_similarity": 0.0, "reject": False, "nearest": None}
         try:
@@ -196,6 +307,182 @@ class TopicHunterAgent:
             }
         except Exception as e:
             return {"max_similarity": 0.0, "reject": False, "error": str(e)}
+
+    def screen_research_gap(
+        self,
+        candidate: Dict[str, Any],
+        literature: List[Dict[str, Any]],
+        citation_gap_signal: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Research Screener: verifies gap type, evidence support, and novelty distinction."""
+        if not literature:
+            return {
+                "gap_type": "unsupported",
+                "gap_claim": str(candidate.get("description", "")),
+                "supporting_papers": [],
+                "contradicting_papers": [],
+                "closest_prior_work": [],
+                "why_existing_work_is_insufficient": "No literature evidence available to substantiate research gap.",
+                "proposed_contribution": str(candidate.get("contribution", "")),
+                "evidence_strength": 0.0,
+                "citation_gap_signal": citation_gap_signal,
+                "status": "FAIL",
+                "reason": "insufficient_literature_evidence",
+            }
+
+        prompt = f"""
+You are a Research Screener. Evaluate whether the candidate research topic addresses a real, literature-supported gap.
+
+Candidate:
+Title: {candidate.get('title')}
+Description: {candidate.get('description')}
+Rationale: {candidate.get('rationale')}
+Proposed Contribution: {candidate.get('contribution')}
+Citation gap score (graph signal): {citation_gap_signal}
+
+Relevant Literature:
+{json.dumps([{
+    'title': p.get('title'),
+    'abstract': p.get('abstract', '')[:800],
+    'doi': p.get('doi'),
+    'arxiv_id': p.get('arxiv_id'),
+} for p in literature[:6]], indent=2)}
+
+Evaluate:
+1. What category of gap is being claimed?
+   (evaluation_gap, dataset_gap, method_gap, generalization_gap, robustness_gap, theoretical_gap, reproducibility_gap, resource_constraint_gap)
+2. Is the gap actually supported by literature evidence?
+3. What are supporting vs contradicting papers?
+4. Why is existing work insufficient?
+5. Evidence strength (0.0 - 1.0).
+
+Return JSON:
+{{
+  "gap_type": "evaluation_gap",
+  "gap_claim": "...",
+  "supporting_papers": ["..."],
+  "contradicting_papers": ["..."],
+  "closest_prior_work": ["..."],
+  "why_existing_work_is_insufficient": "...",
+  "proposed_contribution": "...",
+  "evidence_strength": 0.85,
+  "status": "PASS|FAIL|INSUFFICIENT_EVIDENCE",
+  "reason": "..."
+}}
+"""
+        for attempt in range(2):
+            raw = call_llm(prompt, temperature=0.3, tier="cheap")
+            parsed = parse_json_from_llm(raw) or {}
+            if isinstance(parsed, dict) and "gap_type" in parsed:
+                evidence_strength = float(parsed.get("evidence_strength", 0.5))
+                status = parsed.get("status", "PASS")
+                if evidence_strength < 0.4:
+                    status = "FAIL"
+                return {
+                    "gap_type": str(parsed.get("gap_type", "evaluation_gap")),
+                    "gap_claim": str(parsed.get("gap_claim", candidate.get("description", ""))),
+                    "supporting_papers": list(parsed.get("supporting_papers") or []),
+                    "contradicting_papers": list(parsed.get("contradicting_papers") or []),
+                    "closest_prior_work": list(parsed.get("closest_prior_work") or []),
+                    "why_existing_work_is_insufficient": str(parsed.get("why_existing_work_is_insufficient", "")),
+                    "proposed_contribution": str(parsed.get("proposed_contribution", candidate.get("contribution", ""))),
+                    "evidence_strength": evidence_strength,
+                    "citation_gap_signal": citation_gap_signal,
+                    "status": status,
+                    "reason": str(parsed.get("reason", "")),
+                }
+
+        # Fallback if LLM output fails
+        return {
+            "gap_type": "method_gap",
+            "gap_claim": str(candidate.get("description", "")),
+            "supporting_papers": [p.get("title") for p in literature[:2] if p.get("title")],
+            "contradicting_papers": [],
+            "closest_prior_work": [p.get("title") for p in literature[:1] if p.get("title")],
+            "why_existing_work_is_insufficient": "Empirical question requires controlled comparison.",
+            "proposed_contribution": str(candidate.get("contribution", "")),
+            "evidence_strength": 0.6,
+            "citation_gap_signal": citation_gap_signal,
+            "status": "PASS",
+            "reason": "literature_supported_gap",
+        }
+
+    def formalize_hypothesis(
+        self,
+        candidate: Dict[str, Any],
+        gap_report: Dict[str, Any],
+        novelty_report: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Hypothesis Formalizer: converts candidate into a machine-checkable StructuredHypothesis."""
+        prompt = f"""
+Formalize this candidate research question into a precise, machine-checkable scientific hypothesis contract.
+
+Candidate:
+Title: {candidate.get('title')}
+Description: {candidate.get('description')}
+Rationale: {candidate.get('rationale')}
+Gap Report: {json.dumps(gap_report, default=str)[:1500]}
+Novelty: {json.dumps(novelty_report, default=str)[:1000]}
+Sandbox manifest: {json.dumps(SANDBOX_CAPABILITY_MANIFEST.as_dict())}
+
+Requirements:
+1. Clearly stated research_question.
+2. Precise scientific hypothesis.
+3. Explicit independent_variables with test ranges/values (e.g. [{{"name": "...", "values": [...]}}]).
+4. Explicit dependent_variables (measurable metrics e.g. ["ECE", "accuracy", "Brier"]).
+5. Expected relationship / prediction under control conditions.
+6. Defined falsification_condition (what observation rejected the claim?).
+7. Minimum viable experiment (dataset from catalog or synthetic, models, conditions, metrics, seeds, baseline, falsification_test).
+8. Confounders and competing explanations identified.
+9. Required resources within sandbox limits.
+
+Return JSON:
+{{
+  "research_question": "...",
+  "hypothesis": "...",
+  "independent_variables": [{{"name": "...", "values": [1, 2, 3]}}],
+  "dependent_variables": ["accuracy", "ECE"],
+  "expected_relationship": "...",
+  "falsification_condition": "...",
+  "novelty_claim": "...",
+  "closest_prior_work": [{{"title": "...", "difference": "..."}}],
+  "baselines": ["logistic_regression", "random_forest"],
+  "metrics": ["accuracy"],
+  "confounders": ["model_capacity", "sample_size"],
+  "competing_explanations": ["training_instability"],
+  "minimum_viable_experiment": {{
+    "dataset": "bundled_synthetic",
+    "models": ["model_a", "model_b"],
+    "conditions": ["controlled_seeds"],
+    "metrics": ["accuracy"],
+    "seeds": 3,
+    "baseline": "logistic_regression",
+    "expected_result": "...",
+    "falsification_test": "Welch t-test p<0.05"
+  }},
+  "required_resources": {{
+    "cpu": true,
+    "gpu": false,
+    "max_memory_mb": 4096,
+    "max_runtime_seconds": 120
+  }}
+}}
+"""
+        for attempt in range(2):
+            raw = call_llm(prompt, temperature=0.3, tier="strong")
+            parsed = parse_json_from_llm(raw) or {}
+            if isinstance(parsed, dict) and parsed.get("hypothesis") and parsed.get("falsification_condition"):
+                # Validate mandatory fields
+                if (
+                    parsed.get("dependent_variables")
+                    and parsed.get("falsification_condition")
+                    and parsed.get("research_question")
+                ):
+                    parsed["gap_report"] = gap_report
+                    parsed["novelty_report"] = novelty_report
+                    return parsed
+
+        return None
 
     def feasibility_filter(self, topic: Topic) -> FeasibilityReport:
         """Grounded in what Engineer sandbox can actually run."""
@@ -231,14 +518,28 @@ class TopicHunterAgent:
         return {"ok": ok, "reasons": reasons}
 
     def _reject(self, topic: Topic, reason: str, meta: Optional[Dict[str, Any]] = None):
+        meta = meta or {}
         entry = {
             "title": topic.get("title"),
             "reason": reason,
-            "meta": meta or {},
+            "meta": meta,
             "ts": datetime.now().isoformat(),
         }
         self.rejection_log.append(entry)
-        CrossRunMemory().record_rejection("topic", topic.get("title", "?"), reason, meta)
+        topic_kind = topic.get("hypothesis_kind") or hypothesis_kind(topic.get("title", ""))
+        lesson_type = meta.get("lesson_type") or "topic_rejection"
+        reason_code = meta.get("reason_code") or reason
+        CrossRunMemory().record_rejection(
+            "topic",
+            topic.get("title", "?"),
+            reason,
+            {
+                **meta,
+                "lesson_type": lesson_type,
+                "reason_code": reason_code,
+                "topic_kind": topic_kind,
+            },
+        )
         self._excluded_titles_cache = None
         tracker = get_tracker()
         if tracker:
@@ -284,6 +585,7 @@ class TopicHunterAgent:
         abstracts = [
             (p.get("abstract") or "") for p in recent_papers if p.get("abstract")
         ][:25]
+        evidence_map = build_cross_paper_evidence_map(recent_papers)
 
         prompt = f"""
 Find research GAPS (not trendy saturated topics) in {domain}.
@@ -296,6 +598,11 @@ Topics already rejected or that FAILED hypothesis debate (do NOT propose these o
 
 Citation-graph gap signals (high in-degree, low recent extensions):
 {json.dumps(graph_signals[:5], indent=2)}
+
+Evidence-backed cross-paper bridges. These are candidate transfer questions,
+not proof of a research gap. Use their cited excerpts when relevant; do not
+invent a relationship not present in the supplied evidence:
+{json.dumps(evidence_map.get('bridges', [])[:6], indent=2)[:6000]}
 
 Sample recent titles:
 {[p.get('title', '')[:100] for p in recent_papers[:8]]}
@@ -322,24 +629,68 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 for paper in recent_papers[:8]
                 if paper.get("title") and paper.get("abstract")
             ]
+            gap["cross_paper_evidence"] = evidence_map
             prior = self._matches_excluded_topic(gap.get("title", ""))
             if prior:
                 self._reject(gap, "previously_failed_or_rejected", {"matched": prior})
                 continue
-            # Novelty
-            nov = self.novelty_score(
-                f"{gap.get('title','')} {gap.get('description','')} {gap.get('contribution','')}",
-                abstracts,
-            )
-            gap["novelty"] = nov
-            if nov.get("reject"):
-                self._reject(gap, "novelty_too_low", nov)
+            # 1. Screen research gap with literature evidence
+            citation_signal = max((g.get("gap_score", 0) for g in graph_signals), default=0.0)
+            gap_report = self.screen_research_gap(gap, gap.get("literature_evidence", []), citation_gap_signal=citation_signal)
+            gap["gap_report"] = gap_report
+            if gap_report.get("status") in ("FAIL", "INSUFFICIENT_EVIDENCE"):
+                self._reject(gap, "unsupported_research_gap", {
+                    "lesson_type": "screener_rejection",
+                    "reason_code": "unsupported_research_gap",
+                    "gap_type": gap_report.get("gap_type", "unsupported"),
+                    "details": gap_report.get("why_existing_work_is_insufficient", ""),
+                })
                 continue
+
+            # 2. Layered Novelty Assessment
+            novelty_eval = self.evaluate_layered_novelty(gap, gap.get("literature_evidence", []))
+            gap["novelty"] = novelty_eval
+            if novelty_eval.get("reject"):
+                self._reject(gap, "novelty_too_low", {
+                    "lesson_type": "novelty_failure",
+                    "reason_code": "existing_contribution_overlap",
+                    "verdict": novelty_eval.get("verdict", "LIKELY_DUPLICATE"),
+                    "details": novelty_eval.get("reason", ""),
+                })
+                continue
+
+            # 3. Feasibility check against sandbox capability manifest
             feas = self.feasibility_filter(gap)
             gap["feasibility_check"] = feas
             if not feas["ok"]:
-                self._reject(gap, "infeasible_for_engineer", feas)
+                self._reject(gap, "infeasible_for_engineer", {
+                    "lesson_type": "feasibility_failure",
+                    "reason_code": "sandbox_capability_violation",
+                    "reasons": feas.get("reasons", []),
+                })
                 continue
+
+            # 4. Hypothesis Formalization
+            formalized = self.formalize_hypothesis(gap, gap_report, novelty_eval)
+            if not formalized:
+                self._reject(gap, "missing_structured_hypothesis", {
+                    "lesson_type": "admission_failure",
+                    "reason_code": "structured_hypothesis_unavailable",
+                })
+                continue
+            admission = validate_topic_admission(formalized)
+            gap["topic_admission"] = admission
+            if not admission["admitted"]:
+                self._reject(gap, "topic_admission_failed", {
+                    "lesson_type": "admission_failure",
+                    "reason_code": "non_executable_minimum_experiment",
+                    "reasons": admission["errors"],
+                })
+                continue
+            gap["structured_hypothesis"] = formalized
+            gap["falsifiable_prediction"] = formalized.get("falsification_condition", "")
+            gap["research_question"] = formalized.get("research_question", "")
+
             # Graph bonus
             if graph_signals:
                 gap["gap_score"] = max(g.get("gap_score", 0) for g in graph_signals)

@@ -335,3 +335,101 @@ class Paper(TypedDict, total=False):
     companion_repo: Dict[str, str]
     debate_results: List[Any]
     timestamp: str
+
+
+# ---------------------------------------------------------------------------
+# Research Quality Pipeline Contracts (Discovery -> Debate -> Planning)
+# ---------------------------------------------------------------------------
+
+class ResearchGapReport(TypedDict, total=False):
+    """Structured report produced by the ResearchScreener."""
+    gap_type: str  # evaluation_gap, dataset_gap, method_gap, generalization_gap, robustness_gap, theoretical_gap, reproducibility_gap, resource_constraint_gap
+    gap_claim: str
+    supporting_papers: List[Dict[str, Any]]
+    contradicting_papers: List[Dict[str, Any]]
+    closest_prior_work: List[Dict[str, Any]]
+    why_existing_work_is_insufficient: str
+    proposed_contribution: str
+    evidence_strength: float
+    citation_gap_signal: float
+    status: str  # PASS | FAIL | INSUFFICIENT_EVIDENCE
+    reason: str
+
+
+class NoveltyComparison(TypedDict, total=False):
+    """Detailed contribution-level comparison against prior work."""
+    paper: str
+    problem: str
+    dataset: str
+    method: str
+    variables: str
+    evaluation: str
+    claim: str
+    contribution: str
+    overlap: str
+    difference: str
+    remaining_gap: str
+    novelty_relevance: str
+    is_novel: bool
+    verdict: str  # NOVEL | LIKELY_DUPLICATE | INSUFFICIENT_DIFFERENCE
+
+
+class MinimumViableExperiment(TypedDict, total=False):
+    """Smallest discriminative experiment required before debate pass."""
+    dataset: str
+    models: List[str]
+    conditions: List[str]
+    metrics: List[str]
+    seeds: int
+    baseline: str
+    expected_result: str
+    falsification_test: str
+    competing_explanations: List[str]
+    is_executable: bool
+    is_discriminative: bool
+    validation_notes: List[str]
+
+
+class StructuredHypothesis(TypedDict, total=False):
+    """Machine-checkable scientific hypothesis contract."""
+    research_question: str
+    hypothesis: str
+    independent_variables: List[Dict[str, Any]]  # e.g. [{"name": "...", "values": [...]}]
+    dependent_variables: List[str]  # e.g. ["ECE", "accuracy"]
+    expected_relationship: str
+    falsification_condition: str
+    novelty_claim: str
+    closest_prior_work: List[Dict[str, Any]]
+    baselines: List[str]
+    metrics: List[str]
+    confounders: List[str]
+    competing_explanations: List[str]
+    minimum_viable_experiment: MinimumViableExperiment
+    required_resources: Dict[str, Any]  # {"cpu": bool, "gpu": bool, "max_memory_mb": int, "max_runtime_seconds": int}
+    gap_report: ResearchGapReport
+    novelty_report: Dict[str, Any]
+
+
+class DebateObjection(TypedDict, total=False):
+    """Structured critique tracked across all debate rounds."""
+    criterion: str  # soundness, significance, reproducibility, ethics, novelty, feasibility, confounder, baseline, evaluation, statistical
+    objection: str
+    severity: int  # 1-5
+    status: str  # unresolved | resolved
+    required_resolution: str
+    resolution: str
+    source: str  # challenger_audit | capability_manifest | minimum_experiment_check
+
+
+class DebateDecision(TypedDict, total=False):
+    """Moderator outcome combining hard deterministic gates and soft scores."""
+    hard_gates: Dict[str, bool]
+    scores: Dict[str, float]
+    judge_agreement: float
+    disagreement: float
+    unresolved_objections: List[DebateObjection]
+    decision: str  # PASS | FAIL
+    passed: bool
+    reasoning: str
+    valid_judge_responses: int
+

@@ -41,6 +41,8 @@ class ResearchState(TypedDict):
     experiment_outcomes: Dict[str, str]
     technical_failures: Dict[str, Dict[str, Any]]
     evidence_gate: Dict[str, Any]
+    human_approved: bool
+    outcome_calibration: Dict[str, Any]
 
 
 def initialize_state() -> ResearchState:
@@ -79,4 +81,6 @@ def initialize_state() -> ResearchState:
         experiment_outcomes={},
         technical_failures={},
         evidence_gate={},
+        human_approved=False,
+        outcome_calibration={},
     )

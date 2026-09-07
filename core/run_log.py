@@ -338,17 +338,44 @@ class CrossRunMemory:
     def record_rejection(self, kind: str, item: str, reason: str, meta: Optional[Dict] = None):
         self.record(
             "rejection",
-            {"kind": kind, "item": item, "reason": reason, "meta": meta or {}},
+            {"kind": kind, "item": item, "reason": reason, "rejection_reason": self._reason_tag(reason), "meta": meta or {}, "content_class": "structured_signal", "retrieval_eligible": True, "outcome_status": "rejected"},
         )
+
+    def excluded_topic_titles(self, limit: int = 100) -> List[str]:
+        """Titles previously rejected or failed in debate — TopicHunter must not resurface them."""
+        titles: List[str] = []
+        seen = set()
+        for row in self.load("rejection", limit=limit):
+            if row.get("kind") != "topic":
+                continue
+            item = str(row.get("item") or "").strip()
+            key = item.lower()
+            if not item or key in seen:
+                continue
+            seen.add(key)
+            titles.append(item)
+        return titles
 
     def record_pivot(self, experiment: str, reason: str, meta: Optional[Dict] = None):
-        self.record(
-            "pivot",
-            {"experiment": experiment, "reason": reason, "meta": meta or {}},
-        )
+        self.record("pivot", {"experiment": experiment, "reason": reason, "failure_category": self._reason_tag(reason), "meta": meta or {}, "content_class": "structured_signal", "retrieval_eligible": True, "outcome_status": "inconclusive"})
 
     def record_plan_revision(self, reason: str, meta: Optional[Dict] = None):
-        self.record("plan_revision", {"reason": reason, "meta": meta or {}})
+        self.record("plan_revision", {"reason": reason, "revision_reason": self._reason_tag(reason), "meta": meta or {}, "content_class": "structured_signal", "retrieval_eligible": True, "outcome_status": "revised"})
+
+    @staticmethod
+    def _reason_tag(reason: str) -> str:
+        lowered = str(reason or "").lower()
+        if any(token in lowered for token in ("debate", "hypothesis")):
+            return "failed_debate"
+        if any(token in lowered for token in ("feasib", "sandbox", "gpu", "download")):
+            return "feasibility"
+        if any(token in lowered for token in ("novel", "similar", "saturated")):
+            return "novelty"
+        if any(token in lowered for token in ("claim", "metric", "result", "schema", "invalid_experiment")):
+            return "evidence_consistency"
+        if any(token in lowered for token in ("api", "dependency", "import")):
+            return "dependency_or_api"
+        return "other"
 
     def record_run(self, summary: Dict[str, Any]):
         self.record("run_summary", summary)
@@ -371,18 +398,41 @@ class CrossRunMemory:
                     continue
         return rows[-limit:]
 
+    def get_prompt_context(self, limit: int = 15) -> List[Dict[str, Any]]:
+        """Return structured cross-run tags without raw reasoning text."""
+        context = []
+        for entry in self.load(limit=limit * 3):
+            if entry.get("content_class") != "structured_signal" or not entry.get("retrieval_eligible"):
+                continue
+            signal = {
+                "category": entry.get("category"),
+                "kind": entry.get("kind"),
+                "item": entry.get("item"),
+                "experiment": entry.get("experiment"),
+                "rejection_reason": entry.get("rejection_reason"),
+                "failure_category": entry.get("failure_category"),
+                "revision_reason": entry.get("revision_reason"),
+                "outcome_status": entry.get("outcome_status"),
+            }
+            context.append({key: value for key, value in signal.items() if value is not None})
+            if len(context) >= limit:
+                break
+        return context
+
     def lessons_for_prompt(self, limit: int = 15) -> str:
-        """Compact text block for Topic Hunter / Planner system context."""
+        """Compatibility formatter over structured tags, never raw reasons."""
         rejections = self.load("rejection", limit=limit)
         pivots = self.load("pivot", limit=8)
         revisions = self.load("plan_revision", limit=8)
         lines = ["## Lessons from prior runs (avoid repeating these failures)"]
         for r in rejections[-10:]:
-            lines.append(f"- REJECTED {r.get('kind')}: {r.get('item')} — {r.get('reason')}")
+            tag = r.get("rejection_reason", "unknown")
+            prefix = "FAILED DEBATE" if tag == "failed_debate" else "REJECTED"
+            lines.append(f"- {prefix} {r.get('kind')}: {r.get('item')} — tag={tag}")
         for p in pivots[-5:]:
-            lines.append(f"- PIVOT on {p.get('experiment')}: {p.get('reason')}")
+            lines.append(f"- PIVOT on {p.get('experiment')}: tag={p.get('failure_category', 'unknown')}")
         for rev in revisions[-5:]:
-            lines.append(f"- PLAN REVISION: {rev.get('reason')}")
+            lines.append(f"- PLAN REVISION: tag={rev.get('revision_reason', 'unknown')}")
         if len(lines) == 1:
             return "No prior-run lessons yet."
         return "\n".join(lines)

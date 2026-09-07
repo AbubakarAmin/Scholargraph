@@ -140,6 +140,21 @@ class VerificationFinding(TypedDict, total=False):
     status: str
 
 
+class MemoryEntry(TypedDict, total=False):
+    """Persisted memory metadata with an explicit prompt-retrieval policy."""
+
+    id: int
+    timestamp: str
+    namespace: str
+    content_class: str
+    retrieval_eligible: bool
+    run_id: str
+    agent: str
+    outcome_status: str
+    signal: Dict[str, Any]
+    content: Any
+
+
 class AgentCapabilityManifest(TypedDict, total=False):
     agent: str
     role: str

@@ -53,7 +53,7 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
             logger.warning("Run stopped before release; failure dossier saved to %s", dossier)
             return
 
-        if state.get("latex_output"):
+        if state.get("latex_output") and state.get("human_approved", False):
             latex_file = os.path.join(target_dir, "paper_output.tex")
             with open(latex_file, "w", encoding="utf-8") as handle:
                 handle.write(state["latex_output"])
@@ -74,6 +74,7 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
             "supervisor_scores": state.get("supervisor_scores", {}),
             "experiments_run": list(state.get("engineer_outputs", {}).keys()),
             "meta_feedback": state.get("meta_feedback", []),
+            "publishable": bool(state.get("human_approved", False)),
         }
         summary_file = os.path.join(target_dir, "research_summary.json")
         with open(summary_file, "w", encoding="utf-8") as handle:

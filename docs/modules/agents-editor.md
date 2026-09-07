@@ -12,4 +12,4 @@ Assembles the final paper, derives limitations from unresolved debate objections
 
 ## Output
 
-Generated files are placed under `output/` and the companion repository under the configured companion directory.
+Generated files are placed under `output/` and the companion repository under the configured companion directory. The editor produces a reviewable paper with `publishable=false`; LaTeX export is deferred until the human approval endpoint is called. The companion manifest records seeds, contract hashes, Git commit, Python version, and pinned package versions.

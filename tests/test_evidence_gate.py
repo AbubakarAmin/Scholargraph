@@ -88,6 +88,69 @@ def test_engineering_node_does_not_run_malformed_experiment(monkeypatch):
     monkeypatch.setattr("core.workflow_nodes.EngineerAgent", ExplodingEngineer)
     result = engineering_node(state)
 
+    assert result["current_phase"] == "planning"
+    assert result["should_continue"]
+    assert result["plan_revision_requests"]
+    assert result["plan_revision_requests"][0]["reason"] == "invalid_experiment_plan"
+    assert result["plan"]["schema_revision_attempts"] == 1
+
+
+def test_engineering_node_normalizes_experiment_name_alias(monkeypatch):
+    state = initialize_state()
+    state.update({
+        "plan": {
+            "experiments": [{
+                "experiment_name": "toy",
+                "evaluation_metrics": ["accuracy"],
+                "baselines": ["logistic_regression"],
+            }]
+        },
+        "selected_topic": {"title": "test"},
+    })
+
+    class FakeEngineer:
+        def __init__(self, *_args):
+            self._plan_revision_requests = []
+
+        def run_branching_search(self, *_args, **_kwargs):
+            return {"success": True, "experiment_name": "toy"}
+
+        def run_experiment(self, experiment, **_kwargs):
+            assert experiment["name"] == "toy"
+            return {
+                "success": True,
+                "code": "print(1)",
+                "aggregate_metrics": {"accuracy": {"mean": 0.5}},
+                "raw_results_path": "",
+            }
+
+        def consume_plan_revision_requests(self):
+            return []
+
+    monkeypatch.setattr("core.workflow_nodes.EngineerAgent", FakeEngineer)
+    monkeypatch.setattr(
+        "core.workflow_nodes.gate_engineering_outputs",
+        lambda *_args, **_kwargs: {"allowed": True, "reason_code": "ok"},
+    )
+    result = engineering_node(state)
+    assert result["plan"]["experiments"][0]["name"] == "toy"
+    assert result["current_phase"] == "writing_results"
+
+
+def test_engineering_node_terminals_after_repeated_schema_failures(monkeypatch):
+    state = initialize_state()
+    state.update({
+        "plan": {"experiments": [None], "schema_revision_attempts": 2},
+        "selected_topic": {"title": "test"},
+    })
+
+    class ExplodingEngineer:
+        def __init__(self, *_args):
+            raise AssertionError("engineer must not be created for malformed plans")
+
+    monkeypatch.setattr("core.workflow_nodes.EngineerAgent", ExplodingEngineer)
+    result = engineering_node(state)
+
     assert result["current_phase"] == "complete"
     assert not result["should_continue"]
     assert result["evidence_gate"]["reason_code"] == "invalid_experiment_plan"
@@ -152,3 +215,37 @@ def test_empirical_claim_check_rejects_harness_diagnostics():
 
     assert not result["passed"]
     assert "tracemalloc" in result["prohibited_text"]
+
+
+def test_editor_refuses_failed_run_assembly():
+    from agents.editor import EditorAgent
+
+    editor = EditorAgent.__new__(EditorAgent)
+    try:
+        editor.create_final_paper(
+            {"title": "Toy", "description": "Test"},
+            {"Results": "No result"},
+            {"experiments": []},
+            {"toy": {"success": False}},
+        )
+    except RuntimeError as exc:
+        assert "failed experiments" in str(exc)
+    else:
+        raise AssertionError("failed runs must not produce a manuscript")
+
+
+def test_editor_refuses_dataset_drift():
+    from agents.editor import EditorAgent
+
+    editor = EditorAgent.__new__(EditorAgent)
+    try:
+        editor.create_final_paper(
+            {"title": "Toy", "description": "Test"},
+            {"Results": "Results from the bundled dataset."},
+            {"experiments": [{"name": "toy", "dataset": {"name": "Yahoo Finance"}}]},
+            {"toy": {"success": True, "aggregate_metrics": {"accuracy": {"mean": 0.8}}}},
+        )
+    except RuntimeError as exc:
+        assert "release referee" in str(exc)
+    else:
+        raise AssertionError("dataset drift must block assembly")

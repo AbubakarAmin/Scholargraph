@@ -186,13 +186,22 @@ def call_llm(
     """Primary LLM entry point used by all agents."""
     llm = client if isinstance(client, LLMClient) else get_llm_client()
     model_id = model or config.resolve_model(tier)
-    return llm.chat(
+    result = llm.chat(
         prompt,
         temperature=temperature,
         model=model_id,
         max_tokens=max_tokens,
         system=system,
     )
+    try:
+        from .run_log import get_tracker
+
+        tracker = get_tracker()
+        if tracker:
+            tracker.bump("llm_calls")
+    except Exception:
+        pass
+    return result
 
 
 def generate_embedding(text: str, model: Any = None) -> np.ndarray:

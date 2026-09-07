@@ -218,9 +218,9 @@ OPERATOR MESSAGE:
             "stuck_pattern": False,
             "content_growth": "stable",
         }
-        recent_feedback = self.feedback_memory.get_recent_feedback(limit=10)
+        recent_feedback = self.feedback_memory.get_feedback_signals(limit=10)
         if len(recent_feedback) >= 3:
-            scores = [e["score"] for e in recent_feedback]
+            scores = [e["score"] for e in recent_feedback if e.get("score") is not None]
             recent_avg = sum(scores[-3:]) / 3
             older = scores[:-3]
             older_avg = sum(older) / len(older) if older else scores[0]
@@ -250,10 +250,10 @@ JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps"
         )
 
     def _detect_stuck_loop(self, state) -> bool:
-        recent = self.feedback_memory.get_recent_feedback(limit=5)
+        recent = self.feedback_memory.get_feedback_signals(limit=5)
         if len(recent) >= 5:
-            scores = [e["score"] for e in recent]
-            if all(s < 3.0 for s in scores):
+            scores = [e["score"] for e in recent if e.get("score") is not None]
+            if len(scores) >= 5 and all(s < 3.0 for s in scores):
                 return True
         return False
 
@@ -265,6 +265,10 @@ JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps"
         if state["engineer_outputs"] and not any(
             o.get("success") for o in state["engineer_outputs"].values() if isinstance(o, dict)
         ):
+            outcomes = [o.get("outcome") for o in state["engineer_outputs"].values() if isinstance(o, dict)]
+            if outcomes and all(outcome in {"negative", "inconclusive"} for outcome in outcomes):
+                # A contract-bound, honestly reported negative result is not a system failure.
+                return False
             # Check give-up artifacts
             for o in state["engineer_outputs"].values():
                 if isinstance(o, dict) and not self.validate_failure_claim(
@@ -287,9 +291,11 @@ JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps"
         return False
 
     def _scores_improving(self, state) -> bool:
-        recent = self.feedback_memory.get_recent_feedback(limit=5)
+        recent = self.feedback_memory.get_feedback_signals(limit=5)
         if len(recent) >= 3:
-            scores = [e["score"] for e in recent]
+            scores = [e["score"] for e in recent if e.get("score") is not None]
+            if len(scores) < 3:
+                return False
             return sum(scores[-3:]) / 3 > sum(scores[:-3]) / max(len(scores) - 3, 1)
         return False
 

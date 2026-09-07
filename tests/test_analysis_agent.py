@@ -30,6 +30,8 @@ def test_analysis_agent_computes_interval_and_comparison():
     assert len(report["metrics"]["method"]["accuracy"]["confidence_interval_95"]) == 2
     assert report["comparisons"][0]["test"] == "Welch t-test"
     assert report["comparisons"][0]["cohens_d"] > 0
+    assert report["comparisons"][0]["required_n_per_group"] >= 1
+    assert "observed_power_estimate" in report["comparisons"][0]
 
 
 def test_analysis_agent_warns_on_insufficient_seeds():

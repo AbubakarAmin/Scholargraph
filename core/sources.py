@@ -28,6 +28,7 @@ class SourcePolicy:
     timeout_seconds: float = 15.0
     retries: int = 2
     max_response_bytes: int = 5_000_000
+    allow_full_text: bool = True
 
 
 class SourceClient:
@@ -89,6 +90,44 @@ class SourceClient:
                     break
 
         return self._artifact(source, url, {}, "unavailable", [last_error])
+
+    def fetch_text(self, source: str, url: str, *, headers: Optional[Mapping[str, str]] = None) -> SourceArtifact:
+        """Fetch allowlisted text while preserving the same cache/provenance contract."""
+        self._validate_url(source, url)
+        key = self._cache_key(source, url, None)
+        cache_path = self.cache_dir / f"{key}.text.json"
+        if cache_path.exists():
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            cached["status"] = "cached"
+            return cached
+        try:
+            response = self.session.get(url, headers=dict(headers or {}), timeout=self.policy.timeout_seconds)
+            response.raise_for_status()
+            if len(response.content) > self.policy.max_response_bytes:
+                raise ValueError("response exceeds configured size limit")
+            artifact = self._artifact(source, url, {"text": response.text}, "verified")
+            cache_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
+            return artifact
+        except (requests.RequestException, ValueError) as exc:
+            return self._artifact(source, url, {"text": ""}, "unavailable", [str(exc)])
+
+    def fetch_open_access_text(
+        self,
+        source: str,
+        url: str,
+        *,
+        license_name: Optional[str] = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> SourceArtifact:
+        """Fetch full text only when the caller has an explicit OA/license signal."""
+        if not self.policy.allow_full_text:
+            return self._artifact(source, url, {"text": ""}, "unavailable", ["full-text retrieval disabled by policy"])
+        if not license_name or license_name.lower() in {"unknown", "closed", "paywalled"}:
+            return self._artifact(source, url, {"text": ""}, "unavailable", ["license or open-access permission was not supplied"])
+        artifact = self.fetch_text(source, url, headers=headers)
+        artifact.setdefault("provenance", {})["license"] = license_name
+        artifact.setdefault("provenance", {})["access_policy"] = "open-access-only"
+        return artifact
 
     def _validate_url(self, source: str, url: str) -> None:
         base = self.source_bases.get(source)

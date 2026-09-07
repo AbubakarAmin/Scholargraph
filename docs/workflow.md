@@ -4,14 +4,14 @@
 
 1. `topic_discovery`: query OpenAlex and arXiv, inspect citation signals, score novelty, and reject infeasible topics.
 2. `hypothesis_debate`: run proposer, challenger, and moderator rounds; use ensemble scores and unresolved objections.
-3. `planning`: create a falsifiable plan with baselines, variants, metrics, and dependencies.
+3. `planning`: create a falsifiable plan with baselines, variants, metrics, dependencies, a catalogued local dataset, and prospective power requirements where requested.
 4. `writing_narrative`: draft non-result sections before experiments.
 5. `engineering`: commit an immutable experiment contract and dataset identity, generate and execute code in the sandbox, aggregate multiple seeds, and optionally branch over variants before commitment.
 6. `independent_validation`: replay successful code, verify hashes and statistics, and block the run on missing or contradictory evidence.
 7. `writing_results`: draft result-bearing sections only after the evidence gate passes and verify that quantitative claims are grounded in recorded artifacts.
 8. `supervision`: run deterministic citation, statistics, math, and code checks before the soft reviewer.
 9. `meta_evaluation`: improve prose only for eligible evidence; it cannot override terminal technical failure or mutate a committed contract.
-10. `editing`: add limitations, resolve bibliography entries, write LaTeX, and export a companion repository only after release gates pass.
+10. `editing`: add limitations, resolve bibliography entries, run the deterministic reviewer checklist, write a non-publishable review artifact, and export only after human approval.
 
 ## State contract
 
@@ -28,3 +28,4 @@ During a real CLI or web run, `ResearchPipeline` activates one `RunContext` for 
 - After commitment, changing data, requirements, metrics, baselines, or hypothesis is contract drift and requires a new experiment identity.
 - Results numeric grounding may trigger up to two redrafts.
 - Durable checkpoints allow CLI resume with `python main.py --resume RUN_ID`.
+- `python replay_run.py ... --clean-env` replays companion code in a fresh virtual environment; `historical_report.py` reconstructs the latest failed/completed run pair.

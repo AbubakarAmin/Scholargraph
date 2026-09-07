@@ -112,6 +112,217 @@ def test_verify_citations_real_doi_mocked(monkeypatch):
     assert result["score"] == 10.0
 
 
+def test_verify_citations_rejects_resolved_but_mismatched_metadata(monkeypatch):
+    from core import verification
+
+    monkeypatch.setattr(
+        verification,
+        "resolve_doi",
+        lambda doi: {"resolved": True, "doi": doi, "title": "Actual Paper", "authors": ["Gulrajani"]},
+    )
+    result = verification.verify_citations(
+        "doi:10.5555/3295222.3295349",
+        {"10.5555/3295222.3295349": {"title": "Wasserstein GANs with Gradient Penalty", "authors": ["Korotin"]}},
+    )
+    assert not result["passed"]
+    assert result["metadata_mismatches"]
+    mismatch = result["metadata_mismatches"][0]
+    assert mismatch["metadata_diff"]["title"]["expected"] == "Wasserstein GANs with Gradient Penalty"
+    assert mismatch["metadata_diff"]["title"]["actual"] == "Actual Paper"
+
+
+def test_verify_citations_requires_all_supplied_authors(monkeypatch):
+    from core import verification
+
+    monkeypatch.setattr(
+        verification,
+        "resolve_doi",
+        lambda doi: {
+            "resolved": True,
+            "doi": doi,
+            "title": "A Reliable Result",
+            "authors": ["Smith", "Jones"],
+        },
+    )
+    result = verification.verify_citations(
+        "doi:10.5555/example",
+        {"10.5555/example": {"title": "A Reliable Result", "authors": ["Smith", "Wrong"]}},
+    )
+    assert not result["passed"]
+    assert result["metadata_mismatches"][0]["metadata_diff"]["authors"]["actual"] == ["Smith", "Jones"]
+
+
+def test_extract_citation_metadata_reads_bibliography_fields():
+    from core.verification import extract_citation_metadata
+
+    metadata = extract_citation_metadata(
+        '@article{x, title={Actual Title}, author={Smith and Jones}, doi={10.5555/example}}'
+    )
+    assert metadata["10.5555/example"]["title"] == "Actual Title"
+    assert "Smith" in metadata["10.5555/example"]["authors"]
+
+
+def test_cross_section_numeric_consistency_rejects_conflicting_metric_values():
+    from core.verification import cross_section_numeric_consistency
+
+    result = cross_section_numeric_consistency(
+        {"Abstract": "Experiment toy accuracy was 80%.", "Results": "Experiment toy accuracy was 90%."},
+        {"toy": {"aggregate_metrics": {"accuracy": {"mean": 0.8}}}},
+    )
+    assert not result["passed"]
+    assert result["conflicts"][0]["metric"] == "accuracy"
+
+
+def test_numeric_consistency_rejects_single_claim_against_artifact():
+    from core.verification import cross_section_numeric_consistency
+
+    result = cross_section_numeric_consistency(
+        {"Results": "Experiment toy accuracy was 90%."},
+        {"toy": {"aggregate_metrics": {"accuracy": {"mean": 0.8}}}},
+    )
+    assert not result["passed"]
+    assert result["conflicts"][0]["reason"] == "manuscript claim disagrees with structured artifact"
+    assert any(claim["sections"] == ["Results"] for claim in result["claims"])
+
+
+def test_consistency_referee_blocks_model_reported_contradiction(monkeypatch):
+    from core import verification
+
+    monkeypatch.setattr(
+        verification,
+        "call_llm",
+        lambda *_args, **_kwargs: '{"findings": [{"category": "dataset", "message": "Sections name different datasets", "blocking": true}]}',
+    )
+    result = verification.consistency_referee({"Methods": "Iris", "Results": "Digits"})
+    assert not result["passed"]
+    assert result["findings"][0]["category"] == "dataset"
+
+
+def test_consistency_referee_malformed_output_blocks(monkeypatch):
+    from core import verification
+
+    monkeypatch.setattr(verification, "call_llm", lambda *_args, **_kwargs: "not json")
+    result = verification.consistency_referee({"Results": "No contradictions"})
+    assert not result["passed"]
+    assert result["findings"][0]["category"] == "referee_error"
+
+
+def test_capability_manifest_rejects_external_large_plan():
+    from core.capabilities import check_plan_feasibility
+
+    errors = check_plan_feasibility({"methodology": "download Yahoo Finance data with GPU training"})
+    assert any("outbound" in error for error in errors)
+    assert any("GPU" in error for error in errors)
+
+
+def test_planner_rescopes_infeasible_plan():
+    from agents.planner import PlannerAgent
+
+    planner = PlannerAgent.__new__(PlannerAgent)
+    plan = {
+        "methodology": "GPU model with download",
+        "experiments": [{"name": "x", "dataset": {"name": "Yahoo Finance"}, "evaluation_metrics": ["accuracy"]}],
+    }
+    planner._generate_plan_structure = lambda *_args: plan
+    planner._ensure_falsifiable_contributions = lambda current, _topic: []
+    planner._generate_experiments = lambda *_args: plan["experiments"]
+    planner._attach_variants = lambda experiments: experiments
+    planner._flag_unfalsifiable = lambda *_args: []
+    planner._flag_missing_baselines = lambda *_args: []
+    planner._generate_dependencies = lambda *_args: []
+    planner._generate_timeline = lambda *_args: []
+    planner._store_plan = lambda *_args: None
+    planner.context = type("Context", (), {"config": type("Runtime", (), {"research_domain": "test"})()})()
+    topic = {"title": "Yahoo Finance forecasting", "description": "production market forecasting"}
+    result = planner.create_plan(topic)
+    assert result["capability_rescope"]
+    assert result["experiments"][0]["dataset"]["name"] == "bundled_synthetic"
+    assert "bundled benchmark" in result["title"]
+    assert "bounded local" in result["abstract"]
+    assert "external-domain" in topic["description"]
+
+
+def test_analysis_adds_multiple_comparison_adjustment():
+    from agents.analysis import AnalysisAgent
+
+    comparisons = [{"p_value": 0.03}, {"p_value": 0.04}]
+    AnalysisAgent._apply_multiple_comparison_correction(comparisons, {})
+    assert comparisons[0]["p_value_adjusted"] == 0.06
+    assert comparisons[0]["multiple_comparison_policy"] == "bonferroni"
+
+
+def test_debate_challenger_adds_manifest_feasibility_objection(monkeypatch):
+    from agents.hypothesis_debate import ChallengerAgent
+
+    monkeypatch.setattr(
+        "agents.hypothesis_debate.call_llm",
+        lambda *_args, **_kwargs: '{"objections": [], "summary_rebuttal": "ok"}',
+    )
+    challenger = ChallengerAgent.__new__(ChallengerAgent)
+    challenger.context = None
+    challenger.client = None
+    challenger.build_rebuttal(
+        {"title": "External", "description": "download Yahoo Finance data with GPU training", "dataset_plan": "Yahoo Finance"},
+        "proposal",
+    )
+    assert any(item["criterion"] == "feasibility" and item["severity"] == 5 for item in challenger._last_objections)
+
+
+def test_writer_does_not_serialize_failed_engineer_diagnostics():
+    from agents.writer import WriterAgent
+
+    writer = WriterAgent.__new__(WriterAgent)
+    prompt_data = writer._format_engineer_outputs({"toy": {"success": False, "error": "tracemalloc import blocked"}})
+    assert "tracemalloc" not in prompt_data
+    assert "failure_summaries" in prompt_data
+    assert "sandbox_validation" in prompt_data
+    assert "experiments" in prompt_data
+
+
+def test_known_answer_check_blocks_wrong_generated_result():
+    from core.sandbox import run_known_answer_check
+
+    result = run_known_answer_check(
+        'import json\nprint(json.dumps({"metrics": {"eigenvalue": 2.0}}))',
+        {"eigenvalue": 1.0},
+    )
+    assert not result["passed"]
+    assert "eigenvalue" in result["mismatches"]
+
+
+def test_tournament_keeps_highest_scoring_survivor(monkeypatch):
+    from agents.hypothesis_debate import DebateResult, HypothesisDebateSystem
+
+    system = HypothesisDebateSystem.__new__(HypothesisDebateSystem)
+    # First fails, second passes — tournament must stop before later candidates.
+    outcomes = {
+        "a": DebateResult("a", "", "", "FAIL", 4.0, False, ""),
+        "Spectral Invariance for Dynamic Permutation Sets": DebateResult(
+            "Spectral Invariance for Dynamic Permutation Sets", "", "", "PASS", 7.5, True, ""
+        ),
+        "c": DebateResult("c", "", "", "FAIL", 5.0, False, ""),
+    }
+    called = []
+
+    def conduct(topic):
+        called.append(topic["title"])
+        return outcomes[topic["title"]]
+
+    system.conduct_debate = conduct
+    results = system.conduct_tournament(
+        [
+            {"title": "a", "score": 4},
+            {"title": "Spectral Invariance for Dynamic Permutation Sets", "score": 7.5},
+            {"title": "c", "score": 5},
+        ],
+        rounds=2,
+    )
+    assert results[0].topic == "Spectral Invariance for Dynamic Permutation Sets"
+    assert results[0].passed
+    assert "c" not in called
+    assert called == ["a", "Spectral Invariance for Dynamic Permutation Sets"]
+
+
 # ---------------------------------------------------------------------------
 # 3. Statistical validity
 # ---------------------------------------------------------------------------
@@ -190,10 +401,34 @@ def test_code_claim_consistency_mismatch():
     from agents.engineer import EngineerAgent
 
     eng = EngineerAgent.__new__(EngineerAgent)
-    method_text = "We implement Gradient Boosting with XGBoost for classification."
+    experiment = {
+        "name": "Model Comparison",
+        "baselines": ["gradient_boosting", "xgboost"],
+        "claimed_components": [],
+    }
     code = "from sklearn.ensemble import RandomForestClassifier\nmodel = RandomForestClassifier()"
-    result = EngineerAgent.check_code_claim_consistency(eng, method_text, code)
+    result = EngineerAgent.check_code_claim_consistency(eng, experiment, code)
     assert result["consistent"] is False or result["score"] < 8
+
+
+def test_code_claim_consistency_ignores_free_text_method_prose():
+    from agents.engineer import EngineerAgent
+
+    eng = EngineerAgent.__new__(EngineerAgent)
+    experiment = {
+        "name": "RF only",
+        "baselines": ["random_forest"],
+        "claimed_components": [],
+    }
+    # Free-text "neural network"/"svm" must not create false failures.
+    code = (
+        "# commentary: we considered neural network and svm but implemented RF\n"
+        "from sklearn.ensemble import RandomForestClassifier\n"
+        "model = RandomForestClassifier()\n"
+    )
+    result = EngineerAgent.check_code_claim_consistency(eng, experiment, code)
+    assert result["consistent"] is True
+    assert result["notes"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -361,14 +596,30 @@ def test_research_ledger_stores_claims_and_events(tmp_path):
         assert con.execute("SELECT count(*) FROM run_scratchpad").fetchone()[0] == 1
 
 
-def test_reproducibility_dossier_requires_executable_artifacts():
+def test_research_ledger_reconstructs_claim_lineage(tmp_path):
+    from core.research_db import ResearchDatabase
+
+    db = ResearchDatabase(str(tmp_path / "lineage.sqlite"))
+    db.create_run("r1", "2026-01-01T00:00:00Z")
+    db.record_artifact("r1", "raw", "raw.json", {"artifact_id": "a1"})
+    db.record_claim("r1", "Results", "accuracy 0.8", "empirical_result", "verified", {"artifact_ids": ["a1"]})
+    lineage = db.claim_lineage("r1")
+    assert lineage[0]["artifacts"][0]["location"] == "raw.json"
+
+
+def test_reproducibility_dossier_requires_executable_artifacts(tmp_path):
     from core.verification import reproducibility_dossier
 
     plan = {"experiments": [{"falsifiable_prediction": "A > B", "baselines": ["B"], "statistical_test": "t-test"}]}
-    complete = {"x": {"raw_results_path": "raw.json", "code": "print(1)"}}
+    raw = tmp_path / "raw.json"
+    raw.write_text("{}", encoding="utf-8")
+    complete = {"x": {"raw_results_path": str(raw), "code": "print(1)", "contract_hash": "abc"}}
     assert reproducibility_dossier(plan, complete)["passed"]
     assert not reproducibility_dossier(plan, {})["passed"]
-
+    empty = reproducibility_dossier(None, None)
+    assert empty["checks"]["contract_provenance"] is False
+    assert empty["checks"]["limitations_disclosed"] is False
+    assert not empty["passed"]
 
 
 # ---------------------------------------------------------------------------

@@ -17,10 +17,11 @@ from core.llm import call_llm, generate_embedding
 from core.llm import get_llm_client
 from core.context import RunContext, get_active_context
 from core.memory import memory
-from core.sandbox import execute_sandboxed, run_multi_seed, validate_code
+from core.sandbox import execute_sandboxed, run_multi_seed, run_known_answer_check, validate_code
 from core.run_log import get_tracker, CrossRunMemory, emit_event
 from core.research_db import research_db
 from core.contracts import CodeClaimReport, ExperimentOutput, ExperimentSpec, RevisionRequest
+from core.known_answers import fixture_for
 
 
 class EngineerAgent:
@@ -82,6 +83,7 @@ class EngineerAgent:
         """
         Run with PIVOT/REFINE loop.
         alternatives: other designs from Planner for PIVOT.
+        method_description is retained for callers/logging but is not used for claim checks.
         """
         log_agent_action("EngineerAgent", "start_experiment", {"experiment": experiment.get("name")})
         contract_hash = experiment.get("contract_hash")
@@ -108,6 +110,27 @@ class EngineerAgent:
                 code = approach.pop("_refined_code")
             else:
                 code = self._generate_experiment_code(approach)
+
+            if not (code or "").strip():
+                reason = "empty_code_generation"
+                decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": reason})
+                self._progress("experiment_refine", {
+                    "experiment": approach.get("name"),
+                    "attempt": attempt,
+                    "reason": reason,
+                })
+                if attempt >= max_attempts:
+                    self.request_plan_revision(reason, approach, detail="code generation returned empty string")
+                    return self._fail(approach, reason, decision_log, code, failure_kind=reason)
+                approach = {
+                    **approach,
+                    "refine_feedback": (
+                        "Previous generation returned NO code (empty string). "
+                        "Return COMPLETE runnable Python only — no markdown fences, no prose."
+                    ),
+                }
+                continue
+
             ok, err = validate_code(code)
             if not ok:
                 decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": err})
@@ -119,13 +142,73 @@ class EngineerAgent:
                 code = self._refine_code(code, err, approach)
                 ok, err = validate_code(code)
                 if not ok:
-                    # Plan may have required forbidden APIs
-                    self.request_plan_revision(
-                        "sandbox_blocked_required_api",
+                    if attempt >= max_attempts or self._is_plan_level_sandbox_block(err):
+                        self.request_plan_revision(
+                            "sandbox_blocked_required_api",
+                            approach,
+                            detail=err,
+                        )
+                        return self._fail(approach, err, decision_log, code)
+                    approach = {**approach, "refine_feedback": err}
+                    continue
+
+            known_answer = approach.get("known_answer") or fixture_for(approach) or {}
+            if known_answer:
+                check = run_known_answer_check(code, known_answer.get("metrics") or {}, float(known_answer.get("tolerance", 1e-3)))
+                if not check.get("passed"):
+                    detail = json.dumps(check.get("mismatches") or check.get("reason"), default=str)
+                    if attempt >= max_attempts:
+                        self.request_plan_revision("known_answer_check_failed", approach, detail=detail)
+                        return self._fail(
+                            approach,
+                            "known_answer_check_failed: " + detail,
+                            decision_log,
+                            code,
+                            failure_kind="known_answer_check_failed",
+                        )
+                    decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": "known_answer_check_failed"})
+                    approach = {
+                        **approach,
+                        "refine_feedback": f"Known-answer check failed: {detail}. Fix the implementation.",
+                    }
+                    continue
+
+            consistency = self.check_code_claim_consistency(approach, code)
+            if not consistency.get("consistent", False):
+                detail = "; ".join(
+                    consistency.get("notes") or ["generated code does not implement the committed claims"]
+                )
+                decision_log.append({
+                    "attempt": attempt,
+                    "decision": "REFINE",
+                    "reason": f"code_claim_inconsistency: {detail}",
+                })
+                self._progress("experiment_refine", {
+                    "experiment": approach.get("name"),
+                    "attempt": attempt,
+                    "reason": "code_claim_inconsistency",
+                    "detail": detail[:400],
+                })
+                if attempt >= max_attempts:
+                    self.request_plan_revision("code_claim_inconsistency", approach, detail=detail)
+                    return self._fail(
                         approach,
-                        detail=err,
+                        "code_claim_inconsistency: " + detail,
+                        decision_log,
+                        code,
+                        failure_kind="code_claim_inconsistency",
                     )
-                    return self._fail(approach, err, decision_log, code)
+                baselines = approach.get("baselines") or approach.get("baseline_comparison") or []
+                components = approach.get("claimed_components") or approach.get("components") or []
+                approach = {
+                    **approach,
+                    "refine_feedback": (
+                        f"Your last attempt was inconsistent with the experiment contract: {detail}. "
+                        f"Implement the claimed baselines/components exactly, or drop any unimplemented claim. "
+                        f"Contract baselines={baselines!r}; claimed_components={components!r}."
+                    ),
+                }
+                continue
 
             self._progress("experiment_attempt", {
                 "experiment": approach.get("name"),
@@ -134,11 +217,6 @@ class EngineerAgent:
                 "seeds": self.runtime_config.experiment_seeds,
             })
             multi = run_multi_seed(code, n_seeds=self.runtime_config.experiment_seeds)
-            consistency = self.check_code_claim_consistency(method_description, code) if method_description else {
-                "consistent": True,
-                "score": 10.0,
-                "notes": [],
-            }
 
             if multi.get("success") and multi.get("aggregate_metrics"):
                 self._progress("experiment_ablation", {
@@ -210,6 +288,7 @@ class EngineerAgent:
                     self.request_plan_revision("no_alternatives_after_pivot", approach, detail=error)
                     return self._fail(approach, error, decision_log, code)
 
+        self.request_plan_revision("max_attempts_exhausted", approach, detail="bounded code-only repair attempts exhausted")
         return self._fail(approach, "max_attempts_exhausted", decision_log, code)
 
     def run_branching_search(
@@ -262,38 +341,92 @@ class EngineerAgent:
         }
         return full
 
-    def check_code_claim_consistency(self, method_text: str, code: str) -> CodeClaimReport:
-        """Independent heuristic: claimed algorithms vs imports/classes in code."""
+    def check_code_claim_consistency(self, experiment: ExperimentSpec, code: str) -> CodeClaimReport:
+        """Compare code only against planner-authored baselines/claimed_components."""
         notes = []
         score = 10.0
-        claims = {
+        claim_markers = {
             "xgboost": ["xgboost", "XGB"],
             "random forest": ["RandomForest"],
-            "neural network": ["nn.", "torch", "tensorflow", "keras", "MLP"],
+            "neural network": ["nn.", "torch", "tensorflow", "keras", "MLP", "MLPClassifier"],
             "svm": ["SVC", "SVR", "SVM"],
             "gradient boosting": ["GradientBoosting", "xgboost", "LightGBM", "lgb"],
             "logistic regression": ["LogisticRegression"],
+            "ridge": ["Ridge"],
             "transformer": ["Transformer", "Attention", "Bert"],
             "lstm": ["LSTM"],
             "cnn": ["Conv2d", "Conv1d", "CNN"],
         }
-        text_l = method_text.lower()
-        for claim, markers in claims.items():
-            if claim in text_l:
-                if not any(m.lower() in code.lower() for m in markers):
-                    notes.append(f"Claims '{claim}' but code lacks {markers}")
-                    score -= 3.0
+        aliases = {
+            "random_forest": "random forest",
+            "rf": "random forest",
+            "neural_network": "neural network",
+            "mlp": "neural network",
+            "nn": "neural network",
+            "support_vector": "svm",
+            "support vector": "svm",
+            "gradient_boosting": "gradient boosting",
+            "gbdt": "gradient boosting",
+            "logistic_regression": "logistic regression",
+            "logreg": "logistic regression",
+        }
+
+        if isinstance(experiment, str):
+            # Legacy callers mistakenly passed free-text method prose; ignore it.
+            claim_terms: List[str] = []
+        else:
+            baselines = experiment.get("baselines") or experiment.get("baseline_comparison") or []
+            if isinstance(baselines, str):
+                baselines = [baselines]
+            components = experiment.get("claimed_components") or experiment.get("components") or []
+            if isinstance(components, str):
+                components = [components]
+            claim_terms = [str(item).strip() for item in list(baselines) + list(components) if str(item).strip()]
+
+        code_l = (code or "").lower()
+        matched_keys = set()
+        for term in claim_terms:
+            normalized = term.lower().replace("-", " ").replace("_", " ").strip()
+            compact = normalized.replace(" ", "_")
+            key = aliases.get(compact) or aliases.get(normalized)
+            if not key:
+                for claim_key in claim_markers:
+                    if claim_key in normalized or normalized in claim_key:
+                        key = claim_key
+                        break
+            if key:
+                matched_keys.add(key)
+
+        for claim in matched_keys:
+            markers = claim_markers[claim]
+            if not any(marker.lower() in code_l for marker in markers):
+                notes.append(f"Contract claims '{claim}' but code lacks {markers}")
+                score -= 3.0
 
         # Detect simplified stub
-        if "pass  # TODO" in code or "NotImplemented" in code:
+        if "pass  # TODO" in (code or "") or "NotImplemented" in (code or ""):
             notes.append("Code contains stubs/NotImplemented")
             score -= 4.0
 
         return {
-            "consistent": score >= 7.0,
+            "consistent": score >= 8.0 and not notes,
             "score": max(0.0, score),
             "notes": notes,
         }
+
+    @staticmethod
+    def _is_plan_level_sandbox_block(error: str) -> bool:
+        err_l = (error or "").lower()
+        return any(
+            token in err_l
+            for token in (
+                "forbidden",
+                "blocked",
+                "import blocked",
+                "sandbox violation",
+                "not allowed",
+            )
+        )
 
     def _decide_pivot_or_refine(
         self,
@@ -324,6 +457,7 @@ Experiment: {experiment.get('name')}
 Purpose: {experiment.get('purpose')}
 Methodology: {experiment.get('methodology')}
 Baselines: {experiment.get('baselines') or experiment.get('baseline_comparison')}
+Claimed components: {experiment.get('claimed_components') or experiment.get('components') or []}
 Metrics: {experiment.get('evaluation_metrics')}
 Data: {experiment.get('data_requirements')} (use synthetic data if needed)
 Falsifiable prediction: {experiment.get('falsifiable_prediction', 'N/A')}
@@ -394,21 +528,31 @@ Return ONLY Python. Still print JSON metrics.
             json.dump(multi, f, indent=2, default=str)
         return path
 
-    def _fail(self, experiment, error, decision_log, code=""):
+    def _fail(self, experiment, error, decision_log, code="", failure_kind: str = "technical"):
         # Give-up guard: require concrete artifact
         artifact = {"error": str(error), "decision_log": decision_log, "code_snippet": (code or "")[:500]}
         if not artifact["error"] or artifact["error"] == "this isn't feasible":
             artifact["suspicious_bare_claim"] = True
+        error_text = str(error)
+        if failure_kind == "technical":
+            if error_text.startswith("empty_code_generation"):
+                failure_kind = "empty_code_generation"
+            elif error_text.startswith("code_claim_inconsistency"):
+                failure_kind = "code_claim_inconsistency"
+            elif error_text.startswith("known_answer_check_failed"):
+                failure_kind = "known_answer_check_failed"
+            elif error_text == "max_attempts_exhausted":
+                failure_kind = "max_attempts_exhausted"
         out = {
             "experiment_name": experiment.get("name"),
-            "error": str(error),
+            "error": error_text,
             "success": False,
             "decision_log": decision_log,
             "failure_artifact": artifact,
             "code": (code or "")[:2000],
             "timestamp": str(datetime.now()),
             "contract_hash": experiment.get("contract_hash"),
-            "failure_kind": "technical",
+            "failure_kind": failure_kind,
             "attempts": decision_log,
         }
         self._progress("experiment_failed", {
@@ -480,6 +624,11 @@ print(json.dumps({{"metrics": metrics, "raw": {{"y_test": y_test.tolist(), "pred
                 generate_embedding(json.dumps({"name": experiment["name"], "metrics": output.get("aggregate_metrics")})),
                 {
                     "type": "experiment_results",
+                    "namespace": "engineer",
+                    "content_class": "generated_narrative",
+                    "retrieval_eligible": False,
+                    "agent": "EngineerAgent",
+                    "outcome_status": "released" if output.get("success") else "failed",
                     "experiment": experiment["name"],
                     "success": output["success"],
                     "results_file": results_file,

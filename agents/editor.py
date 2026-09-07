@@ -20,7 +20,7 @@ from core.llm import get_llm_client
 from core.context import RunContext, get_active_context
 from core.contracts import ExperimentOutput, Paper, Plan, Topic
 from core.memory import memory
-from core.verification import extract_citation_ids, resolve_doi, resolve_arxiv
+from core.verification import extract_citation_ids, resolve_doi, resolve_arxiv, final_manuscript_referee
 
 
 class EditorAgent:
@@ -44,10 +44,17 @@ class EditorAgent:
         engineer_outputs: Optional[Dict[str, ExperimentOutput]] = None,
         debate_results: Optional[List[Any]] = None,
     ) -> Paper:
+        failed = [name for name, output in (engineer_outputs or {}).items() if isinstance(output, dict) and not output.get("success")]
+        if failed:
+            raise RuntimeError("Cannot assemble manuscript from failed experiments: " + ", ".join(failed))
         sections = dict(sections)
         # Honest Limitations from unresolved Challenger objections
         if "Limitations" not in sections or len(sections.get("Limitations", "")) < 80:
             sections["Limitations"] = self._limitations_from_debate(debate_results, plan)
+
+        referee = final_manuscript_referee(sections, plan, engineer_outputs)
+        if not referee["passed"]:
+            raise RuntimeError("Cannot assemble manuscript: release referee failed: " + json.dumps(referee["findings"], default=str))
 
         bib_entries, bib_map = self._bibliography_from_dois(sections)
         companion = self._write_companion_repo(topic, plan, engineer_outputs or {})
@@ -61,6 +68,8 @@ class EditorAgent:
             "bib_map": bib_map,
             "companion_repo": companion,
             "debate_results": debate_results or [],
+            "publishable": False,
+            "approval_required": True,
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -82,7 +91,16 @@ class EditorAgent:
         try:
             self.vector_memory.add_embedding(
                 generate_embedding(topic.get("title", "")),
-                {"type": "final_paper", "topic": topic.get("title"), "latex": latex_path},
+                {
+                    "type": "final_paper",
+                    "namespace": "editor",
+                    "content_class": "generated_narrative",
+                    "retrieval_eligible": False,
+                    "agent": "EditorAgent",
+                    "outcome_status": "released",
+                    "topic": topic.get("title"),
+                    "latex": latex_path,
+                },
             )
         except Exception:
             pass
@@ -186,8 +204,33 @@ class EditorAgent:
         root.mkdir(parents=True, exist_ok=True)
         (root / "experiments").mkdir(exist_ok=True)
 
-        req = "numpy\npandas\nscikit-learn\nmatplotlib\nscipy\n"
+        from importlib.metadata import PackageNotFoundError, version
+
+        requirements = []
+        for package in ("numpy", "pandas", "scikit-learn", "matplotlib", "scipy"):
+            try:
+                requirements.append(f"{package}=={version(package)}")
+            except PackageNotFoundError:
+                requirements.append(package)
+        req = "\n".join(requirements) + "\n"
         (root / "requirements.txt").write_text(req, encoding="utf-8")
+        manifest = {
+            "topic": topic.get("title"),
+            "contract_hashes": {
+                name: output.get("contract_hash")
+                for name, output in engineer_outputs.items()
+                if isinstance(output, dict) and output.get("contract_hash")
+            },
+            "seeds": {
+                name: (output.get("multi_seed") or {}).get("seeds", [])
+                for name, output in engineer_outputs.items()
+                if isinstance(output, dict)
+            },
+            "generated_at": datetime.now().isoformat(),
+            "git_commit": self._git_commit(),
+            "python_version": __import__("sys").version,
+        }
+        (root / "reproducibility_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
         readme = f"""# Companion code — {topic.get('title', 'Research')}
 
@@ -220,7 +263,11 @@ Raw multi-seed results live alongside the paper outputs.
         ]
         (root / "run_experiments.py").write_text("\n".join(runner_lines) + "\n", encoding="utf-8")
 
-        paths = {"readme": str(root / "README.md"), "requirements": str(root / "requirements.txt")}
+        paths = {
+            "readme": str(root / "README.md"),
+            "requirements": str(root / "requirements.txt"),
+            "reproducibility_manifest": str(root / "reproducibility_manifest.json"),
+        }
         for name, out in engineer_outputs.items():
             code = out.get("code") if isinstance(out, dict) else None
             if code:
@@ -229,6 +276,13 @@ Raw multi-seed results live alongside the paper outputs.
                 path.write_text(code, encoding="utf-8")
                 paths[safe] = str(path)
         return paths
+
+    @staticmethod
+    def _git_commit() -> str:
+        try:
+            return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+        except Exception:
+            return "unknown"
 
     def _generate_latex_document(self, topic, sections, plan) -> str:
         abstract = self._extract_abstract(sections) if sections.get("Abstract") else topic.get("description", "")

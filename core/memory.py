@@ -1,7 +1,13 @@
 """
 Memory module for the multi-agent research system.
 Handles vector database operations and persistent knowledge storage.
+
+Prompt retrieval is fail-closed: only structured_signal entries that are
+explicitly retrieval_eligible may enter prompts, and only via get_prompt_context().
+Raw narrative stays on disk for audit.
 """
+
+from __future__ import annotations
 
 import json
 import pickle
@@ -13,149 +19,335 @@ from pathlib import Path
 
 from .config import config
 
+
 class ResearchMemory:
     """Memory system for storing research knowledge and agent interactions."""
-    
+
     def __init__(self):
         self.vector_db_path = Path(config.vector_db_path)
         self.vector_db_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize FAISS index
-        self.dimension = 768  # Standard embedding dimension
+
+        self.dimension = 768
         self.index = faiss.IndexFlatL2(self.dimension)
-        
-        # Metadata storage
+
         self.metadata: List[Dict[str, Any]] = []
         self.debate_log: List[Dict[str, Any]] = []
         self.feedback_log: List[Dict[str, Any]] = []
-        
-        # Load existing data if available
+
         self._load_existing_data()
-    
+
     def _load_existing_data(self):
         """Load existing memory data from disk."""
         try:
-            # Load FAISS index
             if (self.vector_db_path / "index.faiss").exists():
                 self.index = faiss.read_index(str(self.vector_db_path / "index.faiss"))
-            
-            # Load metadata
+
             if (self.vector_db_path / "metadata.pkl").exists():
                 with open(self.vector_db_path / "metadata.pkl", "rb") as f:
                     self.metadata = pickle.load(f)
-            
-            # Load debate log
+
             if Path(config.debate_log_path).exists():
-                with open(config.debate_log_path, "r") as f:
+                with open(config.debate_log_path, "r", encoding="utf-8") as f:
                     self.debate_log = json.load(f)
-            
-            # Load feedback log
+
             if Path(config.feedback_log_path).exists():
-                with open(config.feedback_log_path, "r") as f:
+                with open(config.feedback_log_path, "r", encoding="utf-8") as f:
                     self.feedback_log = json.load(f)
-                    
+
         except Exception as e:
             print(f"Warning: Could not load existing memory data: {e}")
-    
+
     def save(self):
         """Save all memory data to disk."""
         try:
-            # Save FAISS index
             faiss.write_index(self.index, str(self.vector_db_path / "index.faiss"))
-            
-            # Save metadata
+
             with open(self.vector_db_path / "metadata.pkl", "wb") as f:
                 pickle.dump(self.metadata, f)
-            
-            # Save debate log
-            with open(config.debate_log_path, "w") as f:
+
+            with open(config.debate_log_path, "w", encoding="utf-8") as f:
                 json.dump(self.debate_log, f, indent=2)
-            
-            # Save feedback log
-            with open(config.feedback_log_path, "w") as f:
+
+            with open(config.feedback_log_path, "w", encoding="utf-8") as f:
                 json.dump(self.feedback_log, f, indent=2)
-                
+
         except Exception as e:
             print(f"Error saving memory data: {e}")
-    
+
+    @staticmethod
+    def _active_run_defaults() -> Dict[str, Any]:
+        """Pull run provenance from the active tracker when present."""
+        defaults = {"run_id": "unknown", "agent": "unknown", "outcome_status": "unknown"}
+        try:
+            from .run_log import get_tracker
+
+            tracker = get_tracker()
+            if tracker and getattr(tracker, "run_id", None):
+                defaults["run_id"] = tracker.run_id
+        except Exception:
+            pass
+        return defaults
+
+    @classmethod
+    def _normalize_metadata(cls, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply a fail-closed prompt policy to new and legacy entries."""
+        normalized = dict(metadata)
+        defaults = cls._active_run_defaults()
+        content_class = normalized.get("content_class")
+        if content_class not in {"structured_signal", "generated_narrative"}:
+            content_class = "generated_narrative"
+        normalized["content_class"] = content_class
+        # generated_narrative can never be prompt-eligible, even if a caller asks.
+        normalized["retrieval_eligible"] = bool(
+            normalized.get("retrieval_eligible", False)
+            and content_class == "structured_signal"
+            and normalized.get("signal") is not None
+        )
+        normalized.setdefault("namespace", "unclassified")
+        for key in ("run_id", "agent", "outcome_status"):
+            if not normalized.get(key) or normalized.get(key) == "unknown":
+                if defaults.get(key) and defaults[key] != "unknown":
+                    normalized[key] = defaults[key]
+                else:
+                    normalized.setdefault(key, defaults[key])
+        return normalized
+
+    @classmethod
+    def _prompt_safe_entry(cls, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Strip raw narrative and keep only prompt-safe structured signals."""
+        normalized = cls._normalize_metadata(item)
+        if not normalized.get("retrieval_eligible"):
+            return None
+        if normalized.get("content_class") != "structured_signal":
+            return None
+        signal = normalized.get("signal")
+        if not isinstance(signal, dict) or not signal:
+            return None
+        outcome = normalized.get("outcome_status", "unknown")
+        if outcome in {"failed", "rejected", "unknown", "unclassified"}:
+            # Fail closed unless the caller explicitly opts into a non-released status
+            # via get_prompt_context(outcome_status=...). Default path requires release.
+            pass
+        safe = {
+            "id": normalized.get("id"),
+            "namespace": normalized.get("namespace"),
+            "content_class": normalized.get("content_class"),
+            "run_id": normalized.get("run_id"),
+            "agent": normalized.get("agent"),
+            "outcome_status": normalized.get("outcome_status"),
+            "signal": dict(signal),
+        }
+        return {k: v for k, v in safe.items() if v is not None}
+
     def add_embedding(self, embedding: np.ndarray, metadata: Dict[str, Any]):
         """Add an embedding with metadata to the vector database."""
         if embedding.shape[0] != self.dimension:
             raise ValueError(f"Embedding dimension {embedding.shape[0]} != {self.dimension}")
-        
-        # Add to FAISS index
+
+        metadata = self._normalize_metadata(metadata)
         self.index.add(embedding.reshape(1, -1))
-        
-        # Store metadata
-        metadata["timestamp"] = datetime.now().isoformat()
+
+        metadata["timestamp"] = metadata.get("timestamp") or datetime.now().isoformat()
         metadata["id"] = len(self.metadata)
         self.metadata.append(metadata)
-    
-    def search_similar(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for similar embeddings."""
+
+    def audit_search_similar(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
+        """Audit-only raw similarity search. Never use for prompt construction."""
         if query_embedding.shape[0] != self.dimension:
             raise ValueError(f"Query embedding dimension {query_embedding.shape[0]} != {self.dimension}")
-        
-        # Search FAISS index
+
         distances, indices = self.index.search(query_embedding.reshape(1, -1), k)
-        
-        # Return metadata for similar items
         results = []
         for i, idx in enumerate(indices[0]):
-            if idx < len(self.metadata):
-                result = self.metadata[idx].copy()
+            if 0 <= idx < len(self.metadata):
+                result = dict(self.metadata[idx])
                 result["distance"] = float(distances[0][i])
                 results.append(result)
-        
         return results
-    
-    def add_debate_entry(self, topic: str, proposer_argument: str, challenger_argument: str, 
-                         moderator_decision: str, score: float):
-        """Add a debate entry to the log."""
+
+    def search_similar(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
+        """Prompt-safe similarity results only; prefer get_prompt_context() in agents."""
+        if query_embedding.shape[0] != self.dimension:
+            raise ValueError(f"Query embedding dimension {query_embedding.shape[0]} != {self.dimension}")
+
+        distances, indices = self.index.search(query_embedding.reshape(1, -1), max(k * 4, k))
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if idx < 0 or idx >= len(self.metadata):
+                continue
+            result = self._prompt_safe_entry(self.metadata[idx])
+            if result is None:
+                continue
+            result["distance"] = float(distances[0][i])
+            results.append(result)
+            if len(results) >= k:
+                break
+        return results
+
+    def get_prompt_context(
+        self,
+        query_embedding: Optional[np.ndarray] = None,
+        *,
+        k: int = 5,
+        namespace: Optional[str] = None,
+        outcome_status: Optional[str] = None,
+        purpose: Optional[str] = None,
+        run_id: Optional[str] = None,
+        allow_non_released: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Central fail-closed boundary for prompt retrieval.
+
+        Returns only structured_signal entries that are retrieval_eligible.
+        Raw content, feedback prose, and debate arguments are never included.
+        By default, only outcome_status=released items are returned unless
+        allow_non_released=True or an explicit outcome_status filter is set
+        (e.g. for cross-run rejection tags stored elsewhere).
+        """
+        if query_embedding is not None:
+            candidates = self.audit_search_similar(query_embedding, max(k * 8, k))
+        else:
+            candidates = list(self.metadata)
+        candidates.extend(self.debate_log)
+        candidates.extend(self.feedback_log)
+
+        eligible: List[Dict[str, Any]] = []
+        for item in candidates:
+            normalized = self._normalize_metadata(item)
+            if normalized.get("content_class") != "structured_signal":
+                continue
+            if not normalized.get("retrieval_eligible"):
+                continue
+            if namespace and normalized.get("namespace") != namespace:
+                continue
+            if run_id and normalized.get("run_id") != run_id:
+                continue
+            if purpose and normalized.get("signal", {}).get("purpose") != purpose:
+                continue
+            status = normalized.get("outcome_status", "unknown")
+            if outcome_status:
+                if status != outcome_status:
+                    continue
+            elif not allow_non_released and status != "released":
+                continue
+            safe = self._prompt_safe_entry(normalized)
+            if safe is None:
+                continue
+            eligible.append(safe)
+            if len(eligible) >= k:
+                break
+        return eligible
+
+    def add_debate_entry(
+        self,
+        topic: str,
+        proposer_argument: str,
+        challenger_argument: str,
+        moderator_decision: str,
+        score: float,
+        structured_signal: Optional[Dict[str, Any]] = None,
+        run_id: Optional[str] = None,
+        agent: str = "HypothesisDebate",
+        outcome_status: Optional[str] = None,
+    ):
+        """Add a debate entry. Raw arguments stay for audit; prompts use signal only."""
+        defaults = self._active_run_defaults()
+        # Curated objection tags are published for future debates even when the
+        # debate itself failed; raw arguments remain stripped by _prompt_safe_entry.
+        if outcome_status is None:
+            outcome_status = "released" if structured_signal else "unknown"
         entry = {
             "timestamp": datetime.now().isoformat(),
+            "content_class": "structured_signal" if structured_signal else "generated_narrative",
+            "retrieval_eligible": bool(structured_signal),
+            "namespace": "debate_transcripts",
+            "run_id": run_id or defaults["run_id"],
+            "agent": agent,
+            "outcome_status": outcome_status,
+            "signal": structured_signal or {},
             "topic": topic,
             "proposer_argument": proposer_argument,
             "challenger_argument": challenger_argument,
             "moderator_decision": moderator_decision,
-            "score": score
+            "score": score,
         }
-        self.debate_log.append(entry)
+        self.debate_log.append(self._normalize_metadata(entry))
         self.save()
-    
-    def add_feedback_entry(self, agent_name: str, section: str, score: float, 
-                          feedback: str, iteration: int):
-        """Add a feedback entry to the log."""
+
+    def add_feedback_entry(
+        self,
+        agent_name: str,
+        section: str,
+        score: float,
+        feedback: str,
+        iteration: int,
+        structured_signal: Optional[Dict[str, Any]] = None,
+        run_id: Optional[str] = None,
+        outcome_status: str = "unknown",
+    ):
+        """Store raw review prose for audit plus optional structured verdict signal."""
+        defaults = self._active_run_defaults()
+        signal = structured_signal or {
+            "verdict": "block" if score < 5 else ("pass" if score >= 8 else "revise"),
+            "score": float(score),
+            "section": section,
+            "blocking": score < 5,
+            "category": "supervisor_review",
+        }
         entry = {
             "timestamp": datetime.now().isoformat(),
+            "content_class": "structured_signal",
+            "retrieval_eligible": True,
+            "namespace": "supervisor_feedback",
+            "run_id": run_id or defaults["run_id"],
+            "outcome_status": outcome_status if outcome_status != "unknown" else (
+                "released" if score >= 8 else ("failed" if score < 5 else "revised")
+            ),
+            "signal": signal,
             "agent": agent_name,
             "section": section,
             "score": score,
             "feedback": feedback,
-            "iteration": iteration
+            "iteration": iteration,
         }
-        self.feedback_log.append(entry)
+        self.feedback_log.append(self._normalize_metadata(entry))
         self.save()
-    
+
     def get_recent_debates(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent debate entries."""
+        """Audit-only: full debate rows including raw arguments."""
         return self.debate_log[-limit:]
-    
+
     def get_recent_feedback(self, agent_name: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent feedback entries, optionally filtered by agent."""
+        """Audit-only: full feedback rows including raw review prose."""
         if agent_name:
-            filtered = [entry for entry in self.feedback_log if entry["agent"] == agent_name]
+            filtered = [entry for entry in self.feedback_log if entry.get("agent") == agent_name]
             return filtered[-limit:]
         return self.feedback_log[-limit:]
-    
+
+    def get_feedback_signals(self, agent_name: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
+        """Prompt/control-safe feedback: scores and verdicts only, never review prose."""
+        rows = self.get_recent_feedback(agent_name=agent_name, limit=limit)
+        signals = []
+        for entry in rows:
+            signal = entry.get("signal") if isinstance(entry.get("signal"), dict) else {}
+            signals.append({
+                "run_id": entry.get("run_id", "unknown"),
+                "agent": entry.get("agent", "unknown"),
+                "outcome_status": entry.get("outcome_status", "unknown"),
+                "section": entry.get("section") or signal.get("section"),
+                "score": entry.get("score", signal.get("score")),
+                "verdict": signal.get("verdict"),
+                "blocking": signal.get("blocking"),
+                "category": signal.get("category"),
+            })
+        return signals
+
     def get_average_score(self, agent_name: str, recent_n: int = 5) -> float:
         """Get average score for an agent over recent iterations."""
-        recent_feedback = self.get_recent_feedback(agent_name, recent_n)
-        if not recent_feedback:
+        recent = self.get_feedback_signals(agent_name, recent_n)
+        if not recent:
             return 0.0
-        
-        scores = [entry["score"] for entry in recent_feedback]
-        return sum(scores) / len(scores)
+        scores = [float(entry["score"]) for entry in recent if entry.get("score") is not None]
+        return sum(scores) / len(scores) if scores else 0.0
 
     def clear_all(self):
         """Clear all in-memory and on-disk memory data."""
@@ -165,6 +357,6 @@ class ResearchMemory:
         self.feedback_log = []
         self.save()
 
+
 # Global memory instance
 memory = ResearchMemory()
- 

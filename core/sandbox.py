@@ -249,6 +249,20 @@ def execute_sandboxed(
         }
 
 
+def run_known_answer_check(code: str, expected_metrics: Dict[str, float], tolerance: float = 1e-3) -> Dict[str, Any]:
+    """Run a small known-answer probe before accepting generated scientific code."""
+    result = execute_sandboxed(code, seed=0)
+    if not result.get("success"):
+        return {"passed": False, "reason": result.get("error", "known-answer execution failed"), "result": result}
+    metrics = (result.get("parsed") or {}).get("metrics") or {}
+    mismatches = {
+        key: {"expected": expected, "actual": metrics.get(key)}
+        for key, expected in expected_metrics.items()
+        if not isinstance(metrics.get(key), (int, float)) or abs(float(metrics[key]) - float(expected)) > tolerance
+    }
+    return {"passed": not mismatches, "mismatches": mismatches, "result": result}
+
+
 def _parse_json_from_stdout(stdout: str) -> Dict[str, Any]:
     for line in reversed(stdout.strip().splitlines()):
         line = line.strip()

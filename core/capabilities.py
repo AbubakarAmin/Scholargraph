@@ -7,7 +7,7 @@ artifact adapters can be added behind these capability names later.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Set
+from typing import Any, Dict, Iterable, List, Mapping, Set
 
 from .contracts import AgentCapabilityManifest
 
@@ -35,6 +35,59 @@ class CapabilityDecision:
     agent: str
     capability: str
     reason: str
+
+
+@dataclass(frozen=True)
+class SandboxCapabilityManifest:
+    """Shared execution limits used by planning, debate, and engineering."""
+
+    max_wall_clock_seconds: int = 120
+    available_libraries: tuple[str, ...] = ("numpy", "scipy", "pandas", "sklearn")
+    gpu_available: bool = False
+    outbound_network: bool = False
+    dataset_downloads: bool = False
+    max_dataset_rows: int = 100_000
+    max_training_epochs: int = 50
+    max_samples: int = 100_000
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "max_wall_clock_seconds": self.max_wall_clock_seconds,
+            "available_libraries": list(self.available_libraries),
+            "gpu_available": self.gpu_available,
+            "outbound_network": self.outbound_network,
+            "dataset_downloads": self.dataset_downloads,
+            "max_dataset_rows": self.max_dataset_rows,
+            "max_training_epochs": self.max_training_epochs,
+            "max_samples": self.max_samples,
+        }
+
+
+SANDBOX_CAPABILITY_MANIFEST = SandboxCapabilityManifest()
+
+
+def check_plan_feasibility(plan: Mapping[str, Any], manifest: SandboxCapabilityManifest = SANDBOX_CAPABILITY_MANIFEST) -> List[str]:
+    """Return blocking reasons before an experiment contract is committed."""
+    errors: List[str] = []
+    plan_text = str(plan).lower()
+    if not manifest.dataset_downloads and any(token in plan_text for token in ("download", "internet", "outbound", "yahoo finance", "wikipedia traffic", "uci")):
+        errors.append("plan requires outbound dataset access, which the sandbox forbids")
+    if not manifest.gpu_available and any(token in plan_text for token in ("gpu", "cuda", "large language model fine-tune", "deep neural network")):
+        errors.append("plan requires GPU-scale execution, but no GPU is available")
+    for index, experiment in enumerate(plan.get("experiments") or []):
+        if not isinstance(experiment, Mapping):
+            continue
+        dataset = experiment.get("dataset") or {}
+        rows = dataset.get("rows") or dataset.get("row_count") or dataset.get("size")
+        if isinstance(rows, (int, float)) and rows > manifest.max_dataset_rows:
+            errors.append(f"experiment[{index}] dataset exceeds max rows ({manifest.max_dataset_rows})")
+        epochs = experiment.get("epochs") or experiment.get("training_epochs")
+        if isinstance(epochs, (int, float)) and epochs > manifest.max_training_epochs:
+            errors.append(f"experiment[{index}] exceeds max training epochs ({manifest.max_training_epochs})")
+        samples = experiment.get("samples") or experiment.get("n_samples")
+        if isinstance(samples, (int, float)) and samples > manifest.max_samples:
+            errors.append(f"experiment[{index}] exceeds max samples ({manifest.max_samples})")
+    return errors
 
 
 def manifest_for(

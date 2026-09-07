@@ -48,7 +48,21 @@ class ResearchLedgerPort(EventPort, Protocol):
 class VectorMemoryPort(Protocol):
     def add_embedding(self, embedding: Any, metadata: Dict[str, Any]) -> None: ...
 
+    def get_prompt_context(
+        self,
+        query_embedding: Any = None,
+        *,
+        k: int = 5,
+        namespace: Optional[str] = None,
+        outcome_status: Optional[str] = None,
+        purpose: Optional[str] = None,
+        run_id: Optional[str] = None,
+        allow_non_released: bool = False,
+    ) -> List[Dict[str, Any]]: ...
+
     def search_similar(self, query_embedding: Any, k: int = 5) -> List[Dict[str, Any]]: ...
+
+    def audit_search_similar(self, query_embedding: Any, k: int = 5) -> List[Dict[str, Any]]: ...
 
     def add_debate_entry(
         self,
@@ -57,6 +71,10 @@ class VectorMemoryPort(Protocol):
         challenger_argument: str,
         moderator_decision: str,
         score: float,
+        structured_signal: Optional[Dict[str, Any]] = None,
+        run_id: Optional[str] = None,
+        agent: str = "HypothesisDebate",
+        outcome_status: Optional[str] = None,
     ) -> None: ...
 
     def add_feedback_entry(
@@ -66,7 +84,16 @@ class VectorMemoryPort(Protocol):
         score: float,
         feedback: str,
         iteration: int,
+        structured_signal: Optional[Dict[str, Any]] = None,
+        run_id: Optional[str] = None,
+        outcome_status: str = "unknown",
     ) -> None: ...
+
+    def get_feedback_signals(
+        self,
+        agent_name: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]: ...
 
 
 class ArtifactPort(Protocol):

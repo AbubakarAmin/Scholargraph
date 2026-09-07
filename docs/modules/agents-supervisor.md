@@ -8,6 +8,10 @@ Scores paper sections using hard deterministic checks first, then math/code chec
 
 `SupervisorAgent.evaluate_section()` returns `(score, feedback)`. `MathChecker`, `CodeChecker`, and `ReviewerBot` implement focused checks.
 
+## Memory integrity
+
+Raw review prose is stored for human audit. Prompt-facing retrieval uses structured verdicts only (`verdict`, `score`, `blocking`, `category`, `section`). MetaAgent reads `get_feedback_signals()`, never raw `get_recent_feedback()`.
+
 ## Quality rule
 
 A hard citation or statistics failure caps the section score and cannot be rescued by an LLM reviewer.

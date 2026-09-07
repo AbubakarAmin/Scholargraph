@@ -38,7 +38,7 @@ print("PASS debate fields")
 
 eng = EngineerAgent.__new__(EngineerAgent)
 cc = eng.check_code_claim_consistency(
-    "We implement Gradient Boosting with XGBoost",
+    {"baselines": ["gradient_boosting", "xgboost"], "claimed_components": []},
     "from sklearn.ensemble import RandomForestClassifier\nmodel = RandomForestClassifier()",
 )
 assert cc["score"] < 8 or not cc["consistent"]

@@ -18,9 +18,13 @@ ScholarGraph is a local research-paper generation system. It combines LLM-assist
 - `core.state.ResearchState` is the shared workflow contract.
 - `core.contracts` defines typed handoffs and `core.context.RunContext` carries per-run dependencies.
 - `core.workflow` owns graph assembly and `core.pipeline` owns graph execution for CLI and web.
+- `core.memory.get_prompt_context` is the only allowed prompt-retrieval boundary. Raw drafts, debates, reviews, and fallbacks stay on disk for audit; `generated_narrative` is never prompt-eligible by default. Legacy unclassified entries fail closed.
 - `core.evidence_gate` owns immutable experiment contracts and fail-closed handoffs. LLM review is advisory and cannot rescue a hard failure.
 - `core.verification` contains deterministic statistical, provenance, and manuscript checks. LLM review is advisory and cannot rescue a hard failure.
 - `core.sandbox` is a local lockdown mechanism, not a security boundary.
+- `core.datasets` is the local-only dataset catalog; planners may use catalogued assets or generated synthetic data, never implicit downloads.
+- `core.sources` caches allowlisted source responses. Full text requires an explicit open-access/license signal.
+- `core.replay` and `core.forensics` provide clean-environment replay and durable incident reports.
 - `core.research_db` is the durable source of truth for runs, events, claims, and artifacts.
 - `web.app` reads workflow state and persistence services but starts the pipeline in a background thread.
 
@@ -36,5 +40,9 @@ State is passed between these phases as a mutable `ResearchState` dictionary. Be
 - Several agents write directly to global stores and read global configuration.
 - The web server and CLI each own a similar pipeline execution loop.
 - Some older agent code uses compatibility helpers from `core.utils` instead of the provider-neutral `core.llm` API.
+
+## Release guarantees
+
+The editor runs deterministic citation, numeric, dataset, checklist, reproducibility, and failure checks before assembly. A manuscript is reviewable but not publishable until a human calls `POST /api/release/approve`; approval is persisted in the research ledger and triggers artifact export.
 
 These are recorded as staged work in [the refactor roadmap](refactor-roadmap.md).

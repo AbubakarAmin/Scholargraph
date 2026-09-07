@@ -15,10 +15,19 @@ from core.llm import call_llm
 from core.llm import get_llm_client
 from core.context import RunContext, get_active_context
 from core.memory import memory
-from core.verification import hard_verify_section, verify_citations
+from core.verification import hard_verify_section, verify_citations, classify_claim
 from core.run_log import get_tracker
 from core.research_db import research_db
 from core.contracts import ExperimentOutput, VerificationReport
+
+
+REVIEW_CHECKLIST = (
+    "every quantitative claim has a traceable artifact and uncertainty",
+    "baselines and datasets match the committed experiment contract",
+    "negative or inconclusive outcomes are reported",
+    "limitations and reproducibility details are disclosed",
+    "literature claims are supported by retrieved source text",
+)
 
 
 class SupervisorAgent:
@@ -42,11 +51,17 @@ class SupervisorAgent:
         section_name: str,
         content: str,
         engineer_outputs: Optional[Dict[str, ExperimentOutput]] = None,
+        content_requirements: Optional[str] = None,
     ) -> Tuple[float, str]:
         log_agent_action("SupervisorAgent", "start_evaluation", {"section": section_name})
 
         # --- HARD CHECKS FIRST ---
-        hard = hard_verify_section(content, engineer_outputs=engineer_outputs)
+        hard = hard_verify_section(
+            content,
+            engineer_outputs=engineer_outputs,
+            section_name=section_name,
+            content_requirements=content_requirements,
+        )
         self._record_claim_evidence(section_name, content, hard, engineer_outputs)
         math_score, math_fb = self.math_checker.evaluate(content, section_name)
         code_score, code_fb = self.code_checker.evaluate(content, section_name)
@@ -62,12 +77,24 @@ class SupervisorAgent:
             tracker = get_tracker()
             if tracker:
                 tracker.bump("hard_check_fails")
-            # Soft LLM review still runs but cannot rescue a hard failure above 4.0
-            soft_score, soft_fb = self.reviewer_bot.evaluate(content, section_name)
-            feedbacks.append(f"reviewer_bot (post-hard): {soft_fb}")
-            overall = min(hard_bundle_score, soft_score, 4.0)
-            overall_feedback = "HARD CHECK FAILED — regenerate citations/stats.\n" + "\n".join(feedbacks)
-            self.feedback_memory.add_feedback_entry("SupervisorAgent", section_name, overall, overall_feedback, 1)
+            overall = min(hard_bundle_score, 4.0)
+            overall_feedback = "HARD CHECK FAILED — deterministic checks block release.\n" + "\n".join(feedbacks)
+            self.feedback_memory.add_feedback_entry(
+                "SupervisorAgent",
+                section_name,
+                overall,
+                overall_feedback,
+                1,
+                structured_signal={
+                    "verdict": "block",
+                    "score": float(overall),
+                    "section": section_name,
+                    "blocking": True,
+                    "category": "hard_check_failed",
+                },
+                run_id=tracker.run_id if tracker else None,
+                outcome_status="failed",
+            )
             return overall, overall_feedback
 
         # --- SOFT LLM REVIEW LAST ---
@@ -87,7 +114,23 @@ class SupervisorAgent:
         )
         overall_feedback = "\n".join(feedbacks)
 
-        self.feedback_memory.add_feedback_entry("SupervisorAgent", section_name, overall, overall_feedback, 1)
+        tracker = get_tracker()
+        self.feedback_memory.add_feedback_entry(
+            "SupervisorAgent",
+            section_name,
+            overall,
+            overall_feedback,
+            1,
+            structured_signal={
+                "verdict": "pass" if overall >= self.runtime_config.supervisor_threshold else "revise",
+                "score": float(overall),
+                "section": section_name,
+                "blocking": False,
+                "category": "supervisor_review",
+            },
+            run_id=tracker.run_id if tracker else None,
+            outcome_status="released" if overall >= self.runtime_config.supervisor_threshold else "revised",
+        )
         log_agent_action("SupervisorAgent", "evaluation_complete", {
             "section": section_name,
             "overall_score": overall,
@@ -111,7 +154,9 @@ class SupervisorAgent:
         stat_status = "verified" if hard.get("passed") else "needs_revision"
         for sentence in re.split(r"(?<=[.!?])\s+", content):
             if re.search(r"\d+(?:\.\d+)?\s*%|\b(?:mean|std|p\s*[<=>]|accuracy|f1)\b", sentence, re.I):
-                self.ledger.record_claim(tracker.run_id, section_name, sentence[:500], "quantitative", stat_status, {"statistics": hard.get("statistics", [])})
+                claim_type = classify_claim(sentence, [item.get("experiment") for item in hard.get("statistics", [])])
+                eligible = claim_type == "empirical_result" and bool(hard.get("statistics"))
+                self.ledger.record_claim(tracker.run_id, section_name, sentence[:500], claim_type, stat_status if eligible else "unverifiable_by_construction", {"statistics": hard.get("statistics", [])})
 
     def _soft_hallucination_check(self, content: str, section_name: str, hard: Dict) -> Tuple[float, str]:
         prompt = f"""
@@ -233,10 +278,13 @@ You are a peer reviewer. Soft qualitative review ONLY (hard citation/stats alrea
 Section: {section_name}
 Content: {content[:5000]}
 
+Checklist:
+{json.dumps(REVIEW_CHECKLIST)}
+
 Criteria 1-10: clarity, accuracy, flow, completeness, writing.
 JSON:
 {{"scores": {{"clarity": 8, "accuracy": 7, "flow": 8, "completeness": 6, "writing": 7}},
-  "overall_score": 7.2, "strengths": [], "weaknesses": [], "suggestions": []}}
+    "overall_score": 7.2, "checklist": {{"item": true}}, "strengths": [], "weaknesses": [], "suggestions": []}}
 """
         try:
             result = parse_json_from_llm(call_llm(prompt, temperature=0.3, tier="judge")) or {}

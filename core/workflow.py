@@ -42,29 +42,102 @@ def create_research_graph(nodes: Mapping[str, Node]) -> StateGraph:
         nodes["should_reset"],
         {"reset": "reset", "continue": "planning", "end": END},
     )
-    workflow.add_edge("planning", "data_validation")
+
+    def _after_planning(state: ResearchState) -> str:
+        if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
+            return "end"
+        if state.get("should_reset"):
+            return "reset"
+        return "continue"
+
+    workflow.add_conditional_edges(
+        "planning",
+        _after_planning,
+        {"continue": "data_validation", "reset": "reset", "end": END},
+    )
+
+    def _after_data_validation(state: ResearchState) -> str:
+        if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
+            return "end"
+        if state.get("should_reset"):
+            return "reset"
+        return "continue"
+
     workflow.add_conditional_edges(
         "data_validation",
-        lambda state: "end" if state.get("current_phase") == "complete" else "continue",
-        {"continue": "writing_narrative", "end": END},
+        _after_data_validation,
+        {"continue": "writing_narrative", "reset": "reset", "end": END},
     )
-    workflow.add_edge("writing_narrative", "engineering")
+
+    def _after_writing_narrative(state: ResearchState) -> str:
+        if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
+            return "end"
+        if state.get("should_reset"):
+            return "reset"
+        return "continue"
+
+    workflow.add_conditional_edges(
+        "writing_narrative",
+        _after_writing_narrative,
+        {"continue": "engineering", "reset": "reset", "end": END},
+    )
+
+    def _after_engineering(state: ResearchState) -> str:
+        if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
+            return "end"
+        if state.get("current_phase") == "planning":
+            return "planning"
+        if state.get("should_reset"):
+            return "reset"
+        return "continue"
 
     workflow.add_conditional_edges(
         "engineering",
-        lambda state: "planning" if state.get("current_phase") == "planning" else "independent_validation",
-        {"planning": "planning", "independent_validation": "independent_validation"},
+        _after_engineering,
+        {"planning": "planning", "continue": "independent_validation", "reset": "reset", "end": END},
     )
-    workflow.add_edge("independent_validation", "writing_results")
+
+    def _after_independent_validation(state: ResearchState) -> str:
+        if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
+            return "end"
+        if state.get("should_reset"):
+            return "reset"
+        return "continue"
+
+    workflow.add_conditional_edges(
+        "independent_validation",
+        _after_independent_validation,
+        {"continue": "writing_results", "reset": "reset", "end": END},
+    )
+
+    def _after_writing_results(state: ResearchState) -> str:
+        if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
+            return "end"
+        if state.get("current_phase") == "writing_results":
+            return "redraft"
+        if state.get("should_reset"):
+            return "reset"
+        return "continue"
+
     workflow.add_conditional_edges(
         "writing_results",
-        lambda state: "redraft" if state.get("current_phase") == "writing_results" else "supervision",
-        {"redraft": "writing_results", "supervision": "supervision"},
+        _after_writing_results,
+        {"redraft": "writing_results", "continue": "supervision", "reset": "reset", "end": END},
     )
+
+    def _after_supervision(state: ResearchState) -> str:
+        if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
+            return "end"
+        if state.get("current_phase") == "editing":
+            return "editing"
+        if state.get("should_reset"):
+            return "reset"
+        return "meta_evaluation"
+
     workflow.add_conditional_edges(
         "supervision",
-        lambda state: "editing" if state["current_phase"] == "editing" else "meta_evaluation",
-        {"editing": "editing", "meta_evaluation": "meta_evaluation"},
+        _after_supervision,
+        {"editing": "editing", "meta_evaluation": "meta_evaluation", "reset": "reset", "end": END},
     )
     workflow.add_conditional_edges(
         "meta_evaluation",

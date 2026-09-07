@@ -36,6 +36,7 @@ def test_artifact_service_writes_paper_plan_and_summary(tmp_path):
             "engineer_outputs": {"baseline": {"success": True}},
             "meta_feedback": ["kept grounded"],
             "latex_output": "\\section{Results}\nObserved result.",
+                "human_approved": True,
         }
     )
 

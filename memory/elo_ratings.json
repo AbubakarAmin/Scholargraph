@@ -1,5 +1,34 @@
 {
-  "graph": 1486.108950864224,
-  "general": 1471.9293452451561,
-  "vision": 1500.0
+  "graph": {
+    "rating": 1490.8317835567757,
+    "raw_rating": 1472.495350670327,
+    "observations": 4,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-07T16:06:28.345247"
+  },
+  "general": {
+    "rating": 1450.3848276711722,
+    "raw_rating": 1442.1156322830343,
+    "observations": 48,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-07T16:49:42.240158"
+  },
+  "vision": {
+    "rating": 1500.0,
+    "raw_rating": 1500.0,
+    "observations": 0,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": null
+  },
+  "federated": {
+    "rating": 1500.0,
+    "raw_rating": 1500.0,
+    "observations": 1,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-07T16:36:20.407404"
+  }
 }

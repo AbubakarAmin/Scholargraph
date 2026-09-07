@@ -8,11 +8,24 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from core.config import config
-from core.utils import log_agent_action, extract_citations
+from core.utils import log_agent_action, extract_citations, is_degenerate_llm_output, strip_markdown_headers
 from core.llm import call_llm, generate_embedding, get_llm_client
 from core.context import RunContext, get_active_context
 from core.contracts import ExperimentOutput, Plan, PlanSection, Topic
 from core.memory import memory
+
+
+_MIN_SECTION_BODY_CHARS = {
+    "abstract": 120,
+    "introduction": 400,
+    "related work": 400,
+    "methods": 300,
+    "experiments": 250,
+    "results": 200,
+    "discussion": 250,
+    "conclusion": 150,
+    "limitations": 120,
+}
 
 class WriterAgent:
     """Agent for drafting research paper sections."""
@@ -34,14 +47,17 @@ class WriterAgent:
         """Draft a specific section of the research paper."""
         log_agent_action("WriterAgent", "start_drafting", {"section": section_name})
         
+        # Released exemplars only — cold-start returns empty until runs clear the release gate.
+        exemplars = self._released_exemplars(section_name)
+
         # Get section requirements from plan
         section_plan = self._get_section_plan(section_name, plan)
         
         # Generate content based on section type
         if section_name.lower() == 'abstract':
-            content = self._draft_abstract(topic, plan, engineer_outputs)
+            content = self._draft_abstract(topic, plan, engineer_outputs, exemplars=exemplars)
         elif section_name.lower() == 'introduction':
-            content = self._draft_introduction(topic, plan)
+            content = self._draft_introduction(topic, plan, exemplars=exemplars)
         elif section_name.lower() == 'related work':
             content = self._draft_related_work(topic, plan)
         elif section_name.lower() == 'methods':
@@ -66,6 +82,15 @@ class WriterAgent:
         })
         
         return content
+
+    def _released_exemplars(self, section_name: str) -> List[Dict[str, Any]]:
+        """Only released structured exemplars may enter Writer prompts."""
+        return self.vector_memory.get_prompt_context(
+            namespace="writer_exemplars",
+            outcome_status="released",
+            k=3,
+            purpose=section_name.lower(),
+        )
     
     def _get_section_plan(self, section_name: str, plan: Plan) -> PlanSection:
         """Get the plan for a specific section."""
@@ -73,9 +98,50 @@ class WriterAgent:
             if section['name'].lower() == section_name.lower():
                 return section
         return {}
+
+    def _min_body_chars(self, section_name: str) -> int:
+        return _MIN_SECTION_BODY_CHARS.get(section_name.lower(), 200)
+
+    def _draft_with_retry(
+        self,
+        section_name: str,
+        prompt: str,
+        *,
+        temperature: float = 0.6,
+        fallback: Optional[str] = None,
+    ) -> str:
+        """Call the LLM once, retry on empty/garbled stubs, then fall back."""
+        last_content = ""
+        min_chars = self._min_body_chars(section_name)
+        for attempt in range(2):
+            try:
+                raw = call_llm(prompt, temperature=temperature, tier="strong")
+                formatted = self._format_section_content(raw, section_name)
+                body = strip_markdown_headers(formatted)
+                if not is_degenerate_llm_output(formatted, min_chars=min_chars) and len(body) >= min_chars:
+                    return formatted
+                last_content = formatted
+                log_agent_action("WriterAgent", "degenerate_section", {
+                    "section": section_name,
+                    "attempt": attempt + 1,
+                    "content_length": len(formatted),
+                    "preview": formatted[:120],
+                })
+            except Exception as exc:
+                log_agent_action("WriterAgent", f"{section_name.lower().replace(' ', '_')}_error", {"error": str(exc)})
+                break
+        if fallback:
+            return fallback
+        if last_content and not is_degenerate_llm_output(last_content, min_chars=20):
+            return last_content
+        return self._format_section_content(
+            f"Section draft unavailable after degenerate model output for {section_name}.",
+            section_name,
+        )
     
     def _draft_abstract(self, topic: Topic, plan: Plan,
-                       engineer_outputs: Dict[str, ExperimentOutput]) -> str:
+                       engineer_outputs: Dict[str, ExperimentOutput],
+                       exemplars: Optional[List[Dict[str, Any]]] = None) -> str:
         """Draft the abstract section."""
         prompt = f"""
         Write a concise abstract for the following research paper:
@@ -84,6 +150,7 @@ class WriterAgent:
         Description: {topic['description']}
         Research Questions: {plan.get('research_questions', [])}
         Expected Contributions: {plan.get('expected_contributions', [])}
+        Released exemplar signals (metadata only): {json.dumps(exemplars or [])[:800]}
         
         Key Results (if available):
         {self._format_engineer_outputs(engineer_outputs)}
@@ -98,14 +165,15 @@ class WriterAgent:
         Write a professional, academic abstract suitable for a research paper.
         """
         
-        try:
-            content = call_llm(prompt, temperature=0.6, tier="strong")
-            return self._format_section_content(content, "Abstract")
-        except Exception as e:
-            log_agent_action("WriterAgent", "abstract_error", {"error": str(e)})
-            return self._create_fallback_abstract(topic, plan)
+        return self._draft_with_retry(
+            "Abstract",
+            prompt,
+            temperature=0.6,
+            fallback=self._create_fallback_abstract(topic, plan),
+        )
     
-    def _draft_introduction(self, topic: Topic, plan: Plan) -> str:
+    def _draft_introduction(self, topic: Topic, plan: Plan,
+                            exemplars: Optional[List[Dict[str, Any]]] = None) -> str:
         """Draft the introduction section."""
         prompt = f"""
         Write an introduction section for the following research paper:
@@ -116,6 +184,7 @@ class WriterAgent:
         Impact: {topic.get('impact', 'N/A')}
         Research Questions: {plan.get('research_questions', [])}
         Expected Contributions: {plan.get('expected_contributions', [])}
+        Released exemplar signals (metadata only): {json.dumps(exemplars or [])[:800]}
         
         The introduction should include:
         1. Background and motivation
@@ -128,21 +197,25 @@ class WriterAgent:
         Include proper citations where appropriate.
         """
         
-        try:
-            content = call_llm(prompt, temperature=0.7, tier="strong")
-            return self._format_section_content(content, "Introduction")
-        except Exception as e:
-            log_agent_action("WriterAgent", "introduction_error", {"error": str(e)})
-            return self._create_fallback_introduction(topic, plan)
+        return self._draft_with_retry(
+            "Introduction",
+            prompt,
+            temperature=0.7,
+            fallback=self._create_fallback_introduction(topic, plan),
+        )
     
     def _draft_related_work(self, topic: Topic, plan: Plan) -> str:
         """Draft the related work section."""
+        retrieved = topic.get("literature_evidence") or plan.get("literature_evidence") or []
         prompt = f"""
         Write a related work section for the following research topic:
         
         Topic: {topic['title']}
         Description: {topic['description']}
         Research Questions: {plan.get('research_questions', [])}
+
+        Retrieved literature evidence (use only these abstracts for paper-specific claims):
+        {json.dumps(retrieved, indent=2, default=str)[:12000]}
         
         The related work should:
         1. Survey relevant literature
@@ -152,15 +225,16 @@ class WriterAgent:
         5. Build motivation for our work
         
         Write 2-3 pages of comprehensive literature review.
-        Include citations to relevant papers.
+        Do not invent paper methods, authors, titles, or citations. If the retrieved
+        evidence is insufficient, state that the claim is not established.
         """
         
-        try:
-            content = call_llm(prompt, temperature=0.6, tier="strong")
-            return self._format_section_content(content, "Related Work")
-        except Exception as e:
-            log_agent_action("WriterAgent", "related_work_error", {"error": str(e)})
-            return self._create_fallback_related_work(topic, plan)
+        return self._draft_with_retry(
+            "Related Work",
+            prompt,
+            temperature=0.6,
+            fallback=self._create_fallback_related_work(topic, plan),
+        )
     
     def _draft_methods(self, topic: Topic, plan: Plan,
                       engineer_outputs: Dict[str, ExperimentOutput]) -> str:
@@ -185,12 +259,12 @@ class WriterAgent:
         Write 3-4 pages of detailed methodology description.
         """
         
-        try:
-            content = call_llm(prompt, temperature=0.5, tier="strong")
-            return self._format_section_content(content, "Methods")
-        except Exception as e:
-            log_agent_action("WriterAgent", "methods_error", {"error": str(e)})
-            return self._create_fallback_methods(topic, plan)
+        return self._draft_with_retry(
+            "Methods",
+            prompt,
+            temperature=0.5,
+            fallback=self._create_fallback_methods(topic, plan),
+        )
     
     def _draft_experiments(self, topic: Topic, plan: Plan,
                           engineer_outputs: Dict[str, ExperimentOutput]) -> str:
@@ -214,12 +288,12 @@ class WriterAgent:
         Write 4-5 pages of comprehensive experimental evaluation.
         """
         
-        try:
-            content = call_llm(prompt, temperature=0.6, tier="strong")
-            return self._format_section_content(content, "Experiments")
-        except Exception as e:
-            log_agent_action("WriterAgent", "experiments_error", {"error": str(e)})
-            return self._create_fallback_experiments(topic, plan)
+        return self._draft_with_retry(
+            "Experiments",
+            prompt,
+            temperature=0.6,
+            fallback=self._create_fallback_experiments(topic, plan),
+        )
     
     def _draft_results(self, topic: Topic, plan: Plan,
                       engineer_outputs: Dict[str, ExperimentOutput]) -> str:
@@ -243,12 +317,12 @@ class WriterAgent:
         Write 3-4 pages of detailed results analysis.
         """
         
-        try:
-            content = call_llm(prompt, temperature=0.6, tier="strong")
-            return self._format_section_content(content, "Results")
-        except Exception as e:
-            log_agent_action("WriterAgent", "results_error", {"error": str(e)})
-            return self._create_fallback_results(topic, plan)
+        return self._draft_with_retry(
+            "Results",
+            prompt,
+            temperature=0.6,
+            fallback=self._create_fallback_results(topic, plan),
+        )
     
     def _draft_conclusion(self, topic: Topic, plan: Plan,
                          engineer_outputs: Dict[str, ExperimentOutput]) -> str:
@@ -272,12 +346,12 @@ class WriterAgent:
         Write 1-2 pages of conclusion.
         """
         
-        try:
-            content = call_llm(prompt, temperature=0.7, tier="strong")
-            return self._format_section_content(content, "Conclusion")
-        except Exception as e:
-            log_agent_action("WriterAgent", "conclusion_error", {"error": str(e)})
-            return self._create_fallback_conclusion(topic, plan)
+        return self._draft_with_retry(
+            "Conclusion",
+            prompt,
+            temperature=0.7,
+            fallback=self._create_fallback_conclusion(topic, plan),
+        )
 
     def _draft_discussion(self, topic: Topic, plan: Plan,
                           engineer_outputs: Dict[str, ExperimentOutput]) -> str:
@@ -292,12 +366,12 @@ Interpret implications, limitations, and failures. Any quantitative statement mu
 be copied from the experimental source of truth above; do not estimate, fabricate,
 or introduce a new number. If a measurement is absent, describe it qualitatively.
 """
-        try:
-            content = call_llm(prompt, temperature=0.5, tier="strong")
-            return self._format_section_content(content, "Discussion")
-        except Exception as e:
-            log_agent_action("WriterAgent", "discussion_error", {"error": str(e)})
-            return "# Discussion\n\nThe observed experimental results are interpreted using the recorded outputs; no additional measurements are claimed."
+        return self._draft_with_retry(
+            "Discussion",
+            prompt,
+            temperature=0.5,
+            fallback="# Discussion\n\nThe observed experimental results are interpreted using the recorded outputs; no additional measurements are claimed.",
+        )
     
     def _draft_generic_section(self, section_name: str, topic: Topic,
                               plan: Plan, engineer_outputs: Dict[str, ExperimentOutput]) -> str:
@@ -320,21 +394,60 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
             return f"Error drafting {section_name} section: {str(e)}"
     
     def _format_engineer_outputs(self, engineer_outputs: Dict[str, ExperimentOutput]) -> str:
-        """Format engineer outputs for inclusion in text."""
+        """Serialize structured evidence without exposing raw Engineer diagnostics."""
         if not engineer_outputs:
-            return "No experimental results available yet."
-        
-        formatted = []
+            return json.dumps({"experiments": []}, sort_keys=True)
+
+        evidence = []
+        failures = []
         for exp_name, output in engineer_outputs.items():
-            formatted.append(f"Experiment: {exp_name}")
-            if isinstance(output, dict):
-                for key in ("success", "outcome", "aggregate_metrics", "results", "raw_results_path", "error", "contract_hash"):
-                    if key in output:
-                        formatted.append(f"  {key}: {output[key]}")
-            else:
-                formatted.append(f"  Result: {output}")
-        
-        return "\n".join(formatted)
+            if not isinstance(output, dict):
+                continue
+            if not output.get("success"):
+                failures.append(self._summarize_engineer_failure(exp_name, output))
+                continue
+            evidence.append({
+                "experiment": exp_name,
+                "outcome": output.get("outcome", "inconclusive"),
+                "aggregate_metrics": output.get("aggregate_metrics") or {},
+                "results": output.get("results") or {},
+                "contract_hash": output.get("contract_hash"),
+            })
+        return json.dumps(
+            {"experiments": evidence, "failure_summaries": failures},
+            sort_keys=True,
+            default=str,
+        )
+
+    @staticmethod
+    def _summarize_engineer_failure(exp_name: str, output: Dict[str, Any]) -> Dict[str, Any]:
+        """Map failure evidence to safe categories; never copy exception text."""
+        raw = str(output.get("error") or "").lower()
+        if any(token in raw for token in ("timeout", "timed out", "resource")):
+            category = "timeout_or_resource"
+            impact = "The experiment did not complete within the execution budget."
+        elif any(token in raw for token in ("sandbox", "forbidden", "blocked")):
+            category = "sandbox_validation"
+            impact = "The generated implementation was rejected by execution policy."
+        elif any(token in raw for token in ("syntax", "nameerror", "typeerror", "import", "dependency", "api")):
+            category = "dependency_or_api"
+            impact = "The implementation could not be executed with the available runtime dependencies."
+        elif "claim" in raw or output.get("code_claim_consistency"):
+            category = "code_claim_mismatch"
+            impact = "The implementation did not satisfy the committed methodological claims."
+        elif "feasible" in raw or "dataset" in raw:
+            category = "plan_infeasible"
+            impact = "The committed experiment requirements were not executable in the available environment."
+        else:
+            category = "missing_metrics"
+            impact = "The experiment did not produce a verified result artifact."
+        return {
+            "experiment": exp_name,
+            "status": "failed",
+            "category": category,
+            "impact": impact,
+            "attempt_count": len(output.get("decision_log") or output.get("attempts") or []),
+        }
     
     def _format_section_content(self, content: str, section_name: str) -> str:
         """Format section content with proper structure."""
@@ -348,26 +461,59 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
         return content
     
     def _store_section(self, section_name: str, content: str, topic: Topic):
-        """Store section content in memory."""
+        """Store section content in memory as generated_narrative (prompt-ineligible)."""
         try:
-            # Extract citations
+            from core.run_log import get_tracker
+
             citations = extract_citations(content)
-            
-            # Store in memory
+            tracker = get_tracker()
             self.vector_memory.add_embedding(
                 generate_embedding(content),
                 {
-                    'type': 'paper_section',
-                    'section': section_name,
-                    'topic': topic['title'],
-                    'content_length': len(content),
-                    'citations': citations,
-                    'timestamp': datetime.now().isoformat()
-                }
+                    "type": "paper_section",
+                    "namespace": "writer_sections",
+                    "content_class": "generated_narrative",
+                    "retrieval_eligible": False,
+                    "agent": "WriterAgent",
+                    "run_id": tracker.run_id if tracker else "unknown",
+                    "outcome_status": "unknown",
+                    "section": section_name,
+                    "topic": topic["title"],
+                    "content_length": len(content),
+                    "citations": citations,
+                    "content": content[:2000],
+                    "timestamp": datetime.now().isoformat(),
+                },
             )
-            
         except Exception as e:
             log_agent_action("WriterAgent", "section_storage_error", {"error": str(e)})
+
+    def store_released_exemplar(self, section_name: str, topic: Topic, quality_score: float):
+        """Publish a prompt-eligible exemplar only after a section clears the release gate."""
+        try:
+            from core.run_log import get_tracker
+
+            tracker = get_tracker()
+            # Structured signal only — no draft body — so exemplars cannot poison prose.
+            self.vector_memory.add_embedding(
+                generate_embedding(f"{section_name} {topic.get('title', '')}"),
+                {
+                    "namespace": "writer_exemplars",
+                    "content_class": "structured_signal",
+                    "retrieval_eligible": True,
+                    "agent": "WriterAgent",
+                    "run_id": tracker.run_id if tracker else "unknown",
+                    "outcome_status": "released",
+                    "signal": {
+                        "purpose": section_name.lower(),
+                        "section": section_name,
+                        "topic_title": topic.get("title"),
+                        "quality_score": float(quality_score),
+                    },
+                },
+            )
+        except Exception as e:
+            log_agent_action("WriterAgent", "exemplar_storage_error", {"error": str(e)})
     
     # Fallback methods for error handling
     def _create_fallback_abstract(self, topic: Dict[str, Any], plan: Dict[str, Any]) -> str:

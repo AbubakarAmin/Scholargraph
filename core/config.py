@@ -64,6 +64,11 @@ class Config(BaseSettings):
     run_log_path: str = os.getenv("RUN_LOG_PATH", "./output/run_scratchpad.jsonl")
     run_events_path: str = os.getenv("RUN_EVENTS_PATH", "./output/run_events.jsonl")
     elo_ratings_path: str = os.getenv("ELO_RATINGS_PATH", "./memory/elo_ratings.json")
+    elo_prior_rating: float = float(os.getenv("ELO_PRIOR_RATING", "1500"))
+    elo_shrinkage_k: float = float(os.getenv("ELO_SHRINKAGE_K", "8"))
+    elo_min_observations: int = int(os.getenv("ELO_MIN_OBSERVATIONS", "5"))
+    topic_exploration_every: int = int(os.getenv("TOPIC_EXPLORATION_EVERY", "4"))
+    topic_exploration_seed: int = int(os.getenv("TOPIC_EXPLORATION_SEED", "42"))
     checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "./memory/checkpoints.sqlite")
     research_db_path: str = os.getenv("RESEARCH_DB_PATH", "./memory/research_ledger.sqlite")
 
@@ -144,6 +149,11 @@ def apply_runtime_keys(keys: dict) -> None:
         "RUN_LOG_PATH": "run_log_path",
         "RUN_EVENTS_PATH": "run_events_path",
         "ELO_RATINGS_PATH": "elo_ratings_path",
+        "ELO_PRIOR_RATING": "elo_prior_rating",
+        "ELO_SHRINKAGE_K": "elo_shrinkage_k",
+        "ELO_MIN_OBSERVATIONS": "elo_min_observations",
+        "TOPIC_EXPLORATION_EVERY": "topic_exploration_every",
+        "TOPIC_EXPLORATION_SEED": "topic_exploration_seed",
         "CHECKPOINT_PATH": "checkpoint_path",
         "RESEARCH_DB_PATH": "research_db_path",
         "OUTPUT_DIR": "output_dir",

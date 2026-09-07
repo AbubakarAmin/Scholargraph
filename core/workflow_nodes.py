@@ -3,13 +3,14 @@
 import json
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
 from core.config import config
 from core.context import get_active_context
 from core.evidence_gate import build_contract, gate_engineering_outputs, validate_dataset_identity, validate_experiments
-from core.run_log import get_tracker
+from core.run_log import CrossRunMemory, get_tracker
 from core.research_db import research_db
 from core.state import ResearchState, initialize_state
 from core.utils import log_agent_action
@@ -81,23 +82,69 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("hypothesis_debate")
+    if state.get("terminal_error") or state.get("current_phase") == "complete":
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     try:
+        # Filter out topics that already failed or were rejected (including within-iteration failures)
+        excluded = set(t.strip().lower() for t in CrossRunMemory().excluded_topic_titles() if t)
+        state["topics"] = [
+            t for t in state["topics"]
+            if (t.get("title") or "").strip().lower() not in excluded
+        ]
         if not state["topics"]:
             state["should_reset"] = True
             return state
         topics_tried = 0
+        debater = _create_agent(HypothesisDebateSystem)
+        if len(state["topics"]) >= 3 and hasattr(debater, "conduct_tournament"):
+            tournament_results = debater.conduct_tournament(state["topics"], rounds=1)
+            state["debate_results"].extend(tournament_results)
+            winner = next((result for result in tournament_results if result.passed), None)
+            if winner:
+                state["selected_topic"] = next(
+                    topic for topic in state["topics"] if topic.get("title") == winner.topic
+                )
+                state["hypothesis_passed"] = True
+                state["current_phase"] = "planning"
+                return state
+            for result in tournament_results:
+                CrossRunMemory().record_rejection(
+                    "topic",
+                    getattr(result, "topic", "?"),
+                    "failed_hypothesis_debate",
+                    {
+                        "score": getattr(result, "score", None),
+                        "decision": getattr(result, "moderator_decision", None),
+                        "unresolved": list(getattr(result, "unresolved_objections", []) or [])[:5],
+                    },
+                )
+            state["topics"] = []
+            state["should_reset"] = True
+            return state
         while state["topics"]:
             current_topic = state["topics"][0]
             state["selected_topic"] = current_topic
             topics_tried += 1
             log_agent_action("Orchestrator", "trying_topic", {"topic": current_topic["title"], "attempt": topics_tried, "topics_remaining": len(state["topics"])})
-            result = _create_agent(HypothesisDebateSystem).conduct_debate(current_topic)
+            result = debater.conduct_debate(current_topic)
             state["debate_results"].append(result)
             if result.passed:
                 state["hypothesis_passed"] = True
                 state["current_phase"] = "planning"
                 log_agent_action("Orchestrator", "hypothesis_passed", {"topic": current_topic["title"], "attempts": topics_tried})
                 return state
+            CrossRunMemory().record_rejection(
+                "topic",
+                current_topic.get("title", "?"),
+                "failed_hypothesis_debate",
+                {
+                    "score": getattr(result, "score", None),
+                    "decision": getattr(result, "moderator_decision", None),
+                    "unresolved": list(getattr(result, "unresolved_objections", []) or [])[:5],
+                },
+            )
             state["topics"] = state["topics"][1:]
             log_agent_action("Orchestrator", "topic_failed", {"topic": current_topic["title"], "topics_remaining": len(state["topics"])})
         state["should_reset"] = True
@@ -105,13 +152,26 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
         log_agent_action("Orchestrator", "all_topics_failed", {"topics_tried": topics_tried})
         return state
     except Exception as exc:
-        logger.error(f"Hypothesis debate failed: {exc}")
-        state["meta_feedback"].append(f"Hypothesis debate error: {exc}")
-        if len(state["topics"]) > 1:
-            state["topics"] = state["topics"][1:]
-            log_agent_action("Orchestrator", "trying_next_topic_after_error", {"remaining_topics": len(state["topics"])})
-        else:
-            state["should_reset"] = True
+        message = f"Hypothesis debate subsystem crashed: {exc}"
+        logger.error(message)
+        state["meta_feedback"].append(message)
+        state["terminal_error"] = message
+        state["technical_failures"] = {
+            "hypothesis_debate": {
+                "success": False,
+                "error": str(exc),
+                "failure_kind": "technical",
+                "subsystem": "hypothesis_debate",
+            }
+        }
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        state["should_reset"] = False
+        log_agent_action(
+            "Orchestrator",
+            "hypothesis_debate_technical_failure",
+            {"error": str(exc)},
+        )
         return state
 
 
@@ -120,11 +180,16 @@ def planning_node(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("planning")
+    if state.get("terminal_error") or state.get("current_phase") == "complete":
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     try:
-        if not state["selected_topic"]:
+        if not state.get("selected_topic"):
             state["should_reset"] = True
             return state
         planner = _create_agent(PlannerAgent)
+        plan = None
         if state.get("plan") and state.get("plan_revision_requests"):
             plan = state["plan"]
             for request in state["plan_revision_requests"]:
@@ -132,14 +197,59 @@ def planning_node(state: ResearchState) -> ResearchState:
             state["plan_revision_requests"] = []
         else:
             plan = planner.create_plan(state["selected_topic"])
+
+        experiments = (plan or {}).get("experiments", [])
+        plan_errors = validate_experiments(experiments)
+        if plan_errors:
+            message = "; ".join(plan_errors)
+            attempts = int((plan or {}).get("schema_revision_attempts") or 0)
+            if attempts < 2:
+                plan = dict(plan or {})
+                plan["schema_revision_attempts"] = attempts + 1
+                state["plan"] = plan
+                revision = {
+                    "reason": "invalid_experiment_plan",
+                    "experiment": None,
+                    "detail": message,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                state.setdefault("plan_revision_requests", []).append(revision)
+                CrossRunMemory().record_plan_revision("invalid_experiment_plan", meta=revision)
+                state["meta_feedback"].append(f"Plan revision requested for schema errors: {message}")
+                state["current_phase"] = "planning"
+                state["should_continue"] = True
+                log_agent_action("Orchestrator", "planning_schema_error_request_revision", {
+                    "message": message,
+                    "attempts": attempts + 1,
+                })
+                return state
+            else:
+                err_msg = f"Planning failed contract validation after retries: {message}"
+                state["terminal_error"] = err_msg
+                state["evidence_gate"] = {
+                    "allowed": False,
+                    "terminal": True,
+                    "reason_code": "invalid_experiment_plan",
+                    "message": message,
+                }
+                state["current_phase"] = "complete"
+                state["should_continue"] = False
+                state["meta_feedback"].append(err_msg)
+                log_agent_action("Orchestrator", "planning_terminal_schema_failure", {"message": message})
+                return state
+
         state["plan"] = plan
         state["current_phase"] = "writing_narrative"
         log_agent_action("Orchestrator", "plan_created", {"sections": len(plan.get("sections", []))})
         return state
     except Exception as exc:
         logger.error(f"Planning failed: {exc}")
-        state["should_reset"] = True
-        state["meta_feedback"].append(f"Planning error: {exc}")
+        err_msg = f"Planning failed: {exc}"
+        state["terminal_error"] = state.get("terminal_error") or err_msg
+        state["meta_feedback"].append(err_msg)
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        log_agent_action("Orchestrator", "planning_exception_terminal_failure", {"error": str(exc)})
         return state
 
 
@@ -149,6 +259,16 @@ def data_validation_node(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("data_validation")
+    if state.get("terminal_error") or state.get("current_phase") == "complete":
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    if not state.get("plan"):
+        err_msg = "Data validation aborted: No valid plan available"
+        state["terminal_error"] = state.get("terminal_error") or err_msg
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     try:
         plan = state.get("plan") or {}
         dataset_path = plan.get("dataset_path") or plan.get("dataset_file")
@@ -217,10 +337,17 @@ def write_narrative_sections(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("writing_narrative")
+    if state.get("terminal_error") or state.get("current_phase") == "complete":
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    if not state.get("plan"):
+        err_msg = "Writing narrative aborted: No valid plan available"
+        state["terminal_error"] = state.get("terminal_error") or err_msg
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     try:
-        if not state["plan"]:
-            state["should_reset"] = True
-            return state
         writer = _create_agent(WriterAgent)
         for section_name in _plan_section_names(state["plan"]):
             if section_name.lower() in NARRATIVE_SECTION_NAMES and section_name not in state["draft_sections"]:
@@ -246,12 +373,15 @@ def write_results_sections(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("writing_results")
-    if state.get("terminal_error") or state.get("evidence_gate", {}).get("terminal"):
+    if state.get("terminal_error") or state.get("evidence_gate", {}).get("terminal") or state.get("current_phase") == "complete":
         state["current_phase"] = "complete"
         state["should_continue"] = False
         return state
     if not state.get("plan"):
-        state["should_reset"] = True
+        err_msg = "Writing results aborted: No valid plan available"
+        state["terminal_error"] = state.get("terminal_error") or err_msg
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
         return state
     try:
         writer = _create_agent(WriterAgent)
@@ -334,25 +464,66 @@ def engineering_node(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("engineering")
+    if state.get("terminal_error") or state.get("current_phase") == "complete":
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    if not state.get("plan"):
+        err_msg = "Engineering aborted: No valid plan available"
+        state["terminal_error"] = state.get("terminal_error") or err_msg
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     try:
-        if not state["plan"]:
-            state["current_phase"] = "supervision"
-            return state
         experiments = state["plan"].get("experiments", [])
+        if (
+            isinstance(experiments, list)
+            and experiments
+            and all(isinstance(item, dict) for item in experiments)
+        ):
+            # Defensive contract alignment: LLM aliases like experiment_name → name
+            experiments = PlannerAgent._normalize_experiments(experiments)
+            state["plan"]["experiments"] = experiments
         plan_errors = validate_experiments(experiments)
         plan_errors.extend(validate_dataset_identity(experiments, state.get("data_artifacts")))
         if plan_errors:
             message = "; ".join(plan_errors)
-            state["terminal_error"] = message
-            state["evidence_gate"] = {
-                "allowed": False,
-                "terminal": True,
-                "reason_code": "invalid_experiment_plan",
-                "message": message,
+            attempts = int((state.get("plan") or {}).get("schema_revision_attempts") or 0)
+            if attempts >= 2:
+                state["terminal_error"] = message
+                state["evidence_gate"] = {
+                    "allowed": False,
+                    "terminal": True,
+                    "reason_code": "invalid_experiment_plan",
+                    "message": message,
+                }
+                state["current_phase"] = "complete"
+                state["should_continue"] = False
+                log_agent_action("Orchestrator", "engineering_blocked_invalid_plan", {
+                    "message": message,
+                    "schema_revision_attempts": attempts,
+                })
+                return state
+            plan = dict(state["plan"] or {})
+            plan["schema_revision_attempts"] = attempts + 1
+            state["plan"] = plan
+            revision = {
+                "reason": "invalid_experiment_plan",
+                "experiment": None,
+                "detail": message,
+                "timestamp": datetime.now().isoformat(),
             }
-            state["current_phase"] = "complete"
-            state["should_continue"] = False
-            log_agent_action("Orchestrator", "engineering_blocked_invalid_plan", {"message": message})
+            state.setdefault("plan_revision_requests", []).append(revision)
+            CrossRunMemory().record_plan_revision("invalid_experiment_plan", meta=revision)
+            state["meta_feedback"].append(f"Plan revision requested for schema errors: {message}")
+            state["current_phase"] = "planning"
+            state["should_continue"] = True
+            state["terminal_error"] = None
+            log_agent_action("Orchestrator", "engineering_blocked_invalid_plan", {
+                "message": message,
+                "action": "request_plan_revision",
+                "schema_revision_attempts": plan["schema_revision_attempts"],
+            })
             return state
         for experiment in experiments:
             name = experiment["name"]
@@ -420,18 +591,51 @@ def engineering_node(state: ResearchState) -> ResearchState:
             state.get("experiment_contracts"),
         )
         state["evidence_gate"] = gate
+        requests = engineer.consume_plan_revision_requests()
         if not gate.get("allowed"):
-            state["terminal_error"] = gate.get("message") or gate.get("reason_code")
             state["technical_failures"] = {
                 name: output
                 for name, output in state.get("engineer_outputs", {}).items()
                 if isinstance(output, dict) and not output.get("success")
             }
+            revision_attempts = int((state.get("plan") or {}).get("engineer_revision_attempts") or 0)
+            if requests and revision_attempts < 2:
+                plan = dict(state.get("plan") or {})
+                plan["engineer_revision_attempts"] = revision_attempts + 1
+                state["plan"] = plan
+                state.setdefault("plan_revision_requests", []).extend(requests)
+                # Revised plan gets a fresh contract identity; clear prior commit.
+                state["engineer_outputs"] = {}
+                state["experiment_contracts"] = {}
+                state["terminal_error"] = None
+                state["evidence_gate"] = {
+                    "allowed": False,
+                    "terminal": False,
+                    "reason_code": "plan_revision_requested",
+                    "message": "Engineering exhausted attempts; requesting Planner revision before terminal failure",
+                }
+                state["meta_feedback"].append(
+                    "Plan revision requested after engineering failures: "
+                    + json.dumps(requests, default=str)
+                )
+                state["current_phase"] = "planning"
+                state["should_continue"] = True
+                log_agent_action("Orchestrator", "engineering_request_plan_revision", {
+                    "gate": gate,
+                    "requests": requests,
+                    "engineer_revision_attempts": plan["engineer_revision_attempts"],
+                })
+                return state
+            state["terminal_error"] = gate.get("message") or gate.get("reason_code")
             state["current_phase"] = "complete"
             state["should_continue"] = False
+            if requests:
+                state["meta_feedback"].append(
+                    "Plan revision requests discarded at terminal engineering failure: "
+                    + json.dumps(requests, default=str)
+                )
             log_agent_action("Orchestrator", "engineering_terminal_failure", gate)
             return state
-        requests = engineer.consume_plan_revision_requests()
         if requests:
             state["meta_feedback"].append(
                 "Plan revision requested after a successful run; contract remains immutable: "
@@ -457,6 +661,16 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
     tracker = get_tracker()
     if tracker:
         tracker.set_phase("independent_validation")
+    if state.get("terminal_error") or state.get("current_phase") == "complete":
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    if not state.get("plan"):
+        err_msg = "Independent validation aborted: No valid plan available"
+        state["terminal_error"] = state.get("terminal_error") or err_msg
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     try:
         code_artifacts = {
             name: {
@@ -469,7 +683,7 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
         }
         if not code_artifacts:
             message = "Independent validation failed: no executable code artifacts"
-            state["terminal_error"] = message
+            state["terminal_error"] = state.get("terminal_error") or message
             state["evidence_gate"] = {
                 "allowed": False,
                 "terminal": True,
@@ -517,7 +731,7 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
         )
         if any(finding.get("blocking") for finding in state["verification_findings"]):
             message = "Independent validation produced blocking findings"
-            state["terminal_error"] = message
+            state["terminal_error"] = state.get("terminal_error") or message
             state["evidence_gate"] = {
                 "allowed": False,
                 "terminal": True,
@@ -541,7 +755,7 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
             "status": "failed",
         })
         state["meta_feedback"].append(f"Independent validation error: {exc}")
-        state["terminal_error"] = f"Independent validation failed: {exc}"
+        state["terminal_error"] = state.get("terminal_error") or f"Independent validation failed: {exc}"
         state["current_phase"] = "complete"
         state["should_continue"] = False
         return state
@@ -552,13 +766,24 @@ def supervision_node(state: ResearchState) -> ResearchState:
         tracker.set_phase("supervision")
     try:
         supervisor = _create_agent(SupervisorAgent)
+        section_requirements = {
+            str(section.get("name") or "").lower(): section.get("content_requirements")
+            for section in ((state.get("plan") or {}).get("sections") or [])
+            if isinstance(section, dict)
+        }
         for section_name, content in state["draft_sections"].items():
-            score, feedback = supervisor.evaluate_section(section_name, content, engineer_outputs=state.get("engineer_outputs"))
+            score, feedback = supervisor.evaluate_section(
+                section_name,
+                content,
+                engineer_outputs=state.get("engineer_outputs"),
+                content_requirements=section_requirements.get(section_name.lower()),
+            )
             state["supervisor_scores"][section_name] = score
             state["supervisor_feedback"][section_name] = feedback
             if score < config.supervisor_threshold and get_tracker():
                 get_tracker().bump("sections_bounced")
         state["reproducibility"] = reproducibility_dossier(state.get("plan"), state.get("engineer_outputs"))
+        state["outcome_calibration"] = research_db.outcome_calibration()
         if not state["reproducibility"]["passed"]:
             state["meta_feedback"].append("Reproducibility dossier incomplete: " + json.dumps(state["reproducibility"]["checks"]))
         has_blocking_findings = any(
@@ -657,12 +882,12 @@ def reset_node(state: ResearchState) -> ResearchState:
 
 
 def should_reset(state: ResearchState) -> str:
-    if state["current_phase"] == "complete":
+    if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
         return "end"
-    return "reset" if state["should_reset"] else "continue"
+    return "reset" if state.get("should_reset") else "continue"
 
 
 def should_continue(state: ResearchState) -> str:
-    if state["current_phase"] == "complete":
+    if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
         return "end"
-    return "continue" if state["should_continue"] else "end"
+    return "continue" if state.get("should_continue") else "end"

@@ -136,6 +136,55 @@ def parse_json_from_llm(response: str) -> Optional[Any]:
     return None
 
 
+# Safety refusals / empty stubs that must never be treated as valid agent output.
+_DEGENERATE_LLM_PATTERNS = (
+    re.compile(r"^\s*user\s+safety\s*:\s*safe\s*$", re.I),
+    re.compile(r"^\s*safe\s*$", re.I),
+    re.compile(r"i\s+can'?t\s+(help|assist)\s+with\s+that", re.I),
+    re.compile(r"as\s+an\s+ai\s+(language\s+)?model", re.I),
+)
+
+
+def strip_markdown_headers(text: str) -> str:
+    """Remove leading markdown headings so length checks measure body prose."""
+    lines = []
+    for line in str(text or "").splitlines():
+        if re.match(r"^\s*#{1,6}\s+", line):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def is_degenerate_llm_output(text: Any, *, min_chars: int = 40) -> bool:
+    """True when an LLM response is empty, a safety stub, or otherwise non-substantive."""
+    if text is None:
+        return True
+    if not isinstance(text, str):
+        text = str(text)
+    body = strip_markdown_headers(text)
+    if len(body) < min_chars:
+        return True
+    compact = re.sub(r"\s+", " ", body).strip()
+    for pattern in _DEGENERATE_LLM_PATTERNS:
+        if pattern.search(compact):
+            return True
+    # Repeated header-only stubs like "# Related Work\\n\\n# Related Work\\n\\nUser Safety: safe"
+    if re.search(r"user\s+safety\s*:\s*safe", compact, re.I) and len(compact) < 120:
+        return True
+    return False
+
+
+def title_token_overlap(a: str, b: str) -> float:
+    """Jaccard overlap of title tokens; used to de-duplicate failed-debate topics."""
+    def tokens(value: str) -> set:
+        return {t for t in re.findall(r"[a-z0-9]+", (value or "").lower()) if len(t) > 2}
+
+    left, right = tokens(a), tokens(b)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
 def log_agent_action(agent_name: str, action: str, details: Dict[str, Any] = None):
     from .run_log import emit_event, get_tracker
 
@@ -151,5 +200,3 @@ def log_agent_action(agent_name: str, action: str, details: Dict[str, Any] = Non
         run_id=run_id,
         agent=agent_name,
     )
-    if tracker and action:
-        tracker.bump("llm_calls", 0)  # keep stats object warm; actual bumps elsewhere

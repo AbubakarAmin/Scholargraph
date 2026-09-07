@@ -9,7 +9,7 @@ Generates experiment code, validates it, executes multi-seed runs, performs chea
 - `run_experiment()` runs the recovery loop.
 - `run_branching_search()` probes variants and promotes a winner.
 - `request_plan_revision()` and `consume_plan_revision_requests()` form the reverse planning edge.
-- `check_code_claim_consistency()` compares prose claims with generated code.
+- `check_code_claim_consistency()` compares generated code against experiment contract baselines/claimed_components (not free-text method prose).
 
 ## Safety
 

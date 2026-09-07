@@ -9,6 +9,7 @@ This folder documents the current codebase module by module. The project is a lo
 - [Refactor roadmap](refactor-roadmap.md): completed staged refactor and final cleanup status.
 - [Configuration](modules/core-config.md): environment and runtime settings.
 - [Testing](testing.md): offline checks and validation commands.
+- [Improvement status](improvements.md#implementation-status): implementation status and operational limits.
 
 ## Module guides
 
@@ -27,6 +28,7 @@ This folder documents the current codebase module by module. The project is a lo
 - [Planner](modules/agents-planner.md)
 - [Writer](modules/agents-writer.md)
 - [Engineer](modules/agents-engineer.md)
+- [Analysis](modules/agents-analysis.md)
 - [Supervisor](modules/agents-supervisor.md)
 - [Meta Agent](modules/agents-meta-agent.md)
 - [Editor](modules/agents-editor.md)
@@ -49,6 +51,9 @@ This folder documents the current codebase module by module. The project is a lo
 - [Research DB](modules/core-research-db.md)
 - [Sandbox](modules/core-sandbox.md)
 - [Verification](modules/core-verification.md)
+- [Sources](modules/core-sources.md)
+- [Datasets](modules/core-datasets.md)
+- [Replay and forensics](modules/core-replay-forensics.md)
 
 ### Web and tests
 

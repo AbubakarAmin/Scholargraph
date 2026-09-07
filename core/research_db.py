@@ -86,6 +86,32 @@ class ResearchDatabase:
                 (json.dumps(summary, default=str), run_id),
             )
 
+    def claim_lineage(self, run_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
+        """Return claim-to-artifact mappings for operator diagnosis and export."""
+        claims = self.claims(run_id, limit)
+        artifacts = self.artifacts(run_id, limit)
+        by_id = {str(item.get("metadata", {}).get("artifact_id")): item for item in artifacts}
+        lineage = []
+        for claim in claims:
+            evidence = claim.get("evidence") or {}
+            ids = evidence.get("artifact_ids") or evidence.get("artifact_id") or []
+            if isinstance(ids, str):
+                ids = [ids]
+            lineage.append({**claim, "artifacts": [by_id[identifier] for identifier in ids if identifier in by_id]})
+        return lineage
+
+    def outcome_calibration(self, limit: int = 1000) -> Dict[str, Any]:
+        """Summarize recorded outcomes for reward calibration and monitoring."""
+        counts = {"positive": 0, "negative": 0, "inconclusive": 0}
+        for run in self.list_runs(limit):
+            summary = json.loads(run.get("summary_json") or "{}")
+            outcomes = summary.get("outcomes") if isinstance(summary.get("outcomes"), list) else []
+            for outcome in outcomes:
+                if outcome in counts:
+                    counts[outcome] += 1
+        total = sum(counts.values())
+        return {"counts": counts, "total": total, "rates": {key: value / total if total else 0.0 for key, value in counts.items()}, "reward_policy": "validated outcomes receive equal base credit"}
+
     def record_scratch(self, run_id: str, agent: str, kind: str, content: Any, metadata: Dict[str, Any]):
         with self.lock, self._connect() as con:
             con.execute("INSERT INTO run_scratchpad(ts,run_id,agent,kind,content_json,metadata_json) VALUES(?,?,?,?,?,?)", (self._now(), run_id, agent, kind, json.dumps(content, default=str), json.dumps(metadata, default=str)))

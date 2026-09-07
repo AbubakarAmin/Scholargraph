@@ -13,6 +13,7 @@ class FakeResponse:
         self.payload = payload
         self.status = status
         self.content = json.dumps(payload).encode("utf-8")
+        self.text = payload if isinstance(payload, str) else json.dumps(payload)
 
     def raise_for_status(self):
         if self.status >= 400:
@@ -80,3 +81,18 @@ def test_source_client_rejects_non_allowlisted_urls(tmp_path):
 
     with pytest.raises(PermissionError):
         client.fetch_json("openalex", "https://example.com/works")
+
+
+def test_source_client_fetches_allowlisted_text(tmp_path):
+    session = FakeSession([FakeResponse("paper abstract and licensed text")])
+    client = SourceClient(str(tmp_path), session=session)
+    result = client.fetch_text("arxiv", "https://export.arxiv.org/abs/1234.5678")
+    assert result["status"] == "verified"
+    assert result["content"]["text"].startswith("paper abstract")
+
+
+def test_source_client_requires_explicit_open_access_license(tmp_path):
+    client = SourceClient(str(tmp_path))
+    result = client.fetch_open_access_text("arxiv", "https://export.arxiv.org/abs/1234.5678")
+    assert result["status"] == "unavailable"
+    assert "license" in result["warnings"][0]

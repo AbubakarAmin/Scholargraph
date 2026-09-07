@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -33,6 +34,7 @@ from core.run_log import (
 from core.memory import memory
 from core.research_db import research_db
 from core.capabilities import DEFAULT_MANIFESTS
+from core.datasets import DATASET_CATALOG
 
 app = FastAPI(title="ScholarGraph Control Deck", version="2.0")
 app.add_middleware(
@@ -59,6 +61,10 @@ class KeysPayload(BaseModel):
 class RunPayload(BaseModel):
     domain: Optional[str] = None
     provider: Optional[str] = None
+
+
+class ResetPayload(BaseModel):
+    confirmation: str
 
 
 def _keys_path() -> Path:
@@ -308,18 +314,36 @@ def dashboard(run_id: Optional[str] = None):
             "evidence_gate": state.get("evidence_gate", {}),
             "terminal_error": state.get("terminal_error"),
             "experiment_contracts": state.get("experiment_contracts", {}),
+            "human_approved": state.get("human_approved", False),
         }
     dash["evidence_trace"] = research_db.claims(dash.get("run_id"))
     workspace = dash.get("workspace") or {}
     terminal = bool(workspace.get("terminal_error") or workspace.get("evidence_gate", {}).get("terminal"))
     dash["release"] = {
-        "status": "blocked" if terminal else "ready" if workspace.get("reproducibility", {}).get("passed") and not any(
+        "status": "blocked" if terminal else "pending_human_approval" if workspace.get("paper", {}).get("approval_required") and not workspace.get("human_approved", False) else "ready" if workspace.get("reproducibility", {}).get("passed") and not any(
             finding.get("blocking") for finding in workspace.get("verification_findings", [])
         ) else "incomplete",
         "reason": workspace.get("terminal_error") or workspace.get("evidence_gate", {}).get("message", ""),
     }
     dash["capabilities"] = DEFAULT_MANIFESTS
     return dash
+
+
+@app.post("/api/release/approve")
+def approve_release():
+    """Record the explicit human checkpoint before a run is publishable."""
+    global _latest_state
+    if not _latest_state or _latest_state.get("terminal_error"):
+        raise HTTPException(status_code=409, detail="No successful run is awaiting approval")
+    _latest_state["human_approved"] = True
+    if _latest_state.get("final_paper"):
+        _latest_state["final_paper"]["publishable"] = True
+    tracker = get_tracker()
+    if tracker:
+        research_db.update_run_summary(tracker.run_id, {"human_approved": True, "publishable": True})
+    from core.artifacts import save_results
+    save_results(_latest_state)
+    return {"ok": True, "publishable": True}
 
 
 @app.get("/api/capabilities")
@@ -355,33 +379,76 @@ def get_runs(limit: int = 50):
     return {"runs": research_db.list_runs(limit=limit)}
 
 
-@app.post("/api/data/clear")
-def clear_all_data():
+@app.post("/api/data/reset/outputs")
+def reset_outputs(payload: ResetPayload):
+    """Clear generated paper artifacts without touching durable history."""
     global _latest_state, _run_error
+    if payload.confirmation != "RESET_OUTPUTS":
+        raise HTTPException(status_code=400, detail="Type RESET_OUTPUTS to confirm output reset")
     if _run_thread and _run_thread.is_alive():
-        raise HTTPException(status_code=409, detail="Stop the active run before clearing local data")
-    research_db.clear_all()
-    memory.clear_all()
-    CrossRunMemory().clear()
-    for path_value in (config.run_events_path, config.run_log_path):
-        path = Path(path_value)
-        if path.exists():
-            path.write_text("", encoding="utf-8")
-    checkpoint = Path(config.checkpoint_path)
-    for path in (checkpoint, Path(f"{checkpoint}-wal"), Path(f"{checkpoint}-shm")):
-        try:
-            path.unlink(missing_ok=True)
-        except PermissionError:
-            raise HTTPException(status_code=409, detail="Checkpoint storage is still in use")
+        raise HTTPException(status_code=409, detail="Stop the active run before resetting outputs")
+    protected = {Path(config.run_events_path).resolve(), Path(config.run_log_path).resolve()}
+    candidates = {
+        Path(config.output_dir),
+        Path(config.draft_versions_dir),
+        Path(config.raw_results_dir),
+        Path(config.companion_repo_dir),
+    }
+    removed = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in protected or not resolved.exists():
+            continue
+        if resolved.is_dir():
+            for child in resolved.iterdir():
+                if child.resolve() in protected:
+                    continue
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+                removed.append(str(child))
+        else:
+            resolved.unlink()
+            removed.append(str(resolved))
     _latest_state = {}
     _run_error = None
-    return {"ok": True, "message": "All runs, memories, and event logs cleared."}
+    return {"ok": True, "scope": "outputs", "removed": removed, "history_preserved": True}
+
+
+@app.post("/api/data/reset/catalog")
+def reset_dataset_catalog(payload: ResetPayload):
+    """Clear checked-in catalog assets only after a separate hard confirmation."""
+    if payload.confirmation != "DELETE_DATASET_CATALOG":
+        raise HTTPException(status_code=400, detail="Type DELETE_DATASET_CATALOG to confirm catalog reset")
+    catalog_root = (ROOT / "data" / "catalog").resolve()
+    removed = []
+    if catalog_root.exists():
+        for child in catalog_root.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed.append(str(child))
+    DATASET_CATALOG.clear()
+    return {"ok": True, "scope": "dataset_catalog", "removed": removed, "history_preserved": True}
+
+
+@app.post("/api/data/clear")
+def clear_all_data():
+    """Retained as an explicit refusal so clients cannot wipe history by accident."""
+    raise HTTPException(status_code=410, detail="Unscoped data clearing is disabled; use a scoped reset")
 
 
 @app.delete("/api/runs/{run_id}")
 def delete_single_run(run_id: str):
     research_db.delete_run(run_id)
     return {"ok": True, "message": f"Run {run_id} deleted."}
+
+
+@app.get("/api/runs/{run_id}/lineage")
+def run_claim_lineage(run_id: str):
+    return {"run_id": run_id, "lineage": research_db.claim_lineage(run_id)}
 
 def _workspace_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
     """Keep enough completed state for the admin panel to survive a refresh."""

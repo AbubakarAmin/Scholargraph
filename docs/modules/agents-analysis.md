@@ -1,0 +1,3 @@
+# `agents/analysis.py`
+
+`AnalysisAgent` recomputes metric summaries and Welch comparisons from execution artifacts. Reports include confidence intervals, effect sizes, multiple-comparison-adjusted p-values, prospective power requirements, and observed power estimates. Plans can set `require_power_analysis=true` with `planned_effect_size`, `alpha`, and `target_power`; missing preregistration then blocks the report.

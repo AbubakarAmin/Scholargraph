@@ -73,7 +73,7 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
             "sections_written": list(state.get("draft_sections", {}).keys()),
             "supervisor_scores": state.get("supervisor_scores", {}),
             "experiments_run": list(state.get("engineer_outputs", {}).keys()),
-            "meta_feedback": state.get("meta_feedback", []),
+            "meta_feedback": [str(item) for item in state.get("meta_feedback", [])],
             "publishable": bool(state.get("human_approved", False)),
         }
         summary_file = os.path.join(target_dir, "research_summary.json")

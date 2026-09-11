@@ -1,4 +1,10 @@
+## Module Overview
+
+Setup script for the multi-agent research system.
+Helps users install dependencies and set up the environment.
+
 # `setup.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

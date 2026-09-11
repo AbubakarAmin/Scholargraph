@@ -38,7 +38,6 @@ FORBIDDEN_MODULES: Set[str] = {
     "urllib",
     "requests",
     "os",
-    "sys",
     "shutil",
     "pathlib",
     "importlib",
@@ -86,6 +85,9 @@ ALLOWED_IMPORT_ROOTS: Set[str] = {
     "seaborn",
     "networkx",
     "sympy",
+    "sys",
+    "io",
+    "statsmodels",
 }
 
 
@@ -179,10 +181,21 @@ def execute_sandboxed(
     if not ok:
         return {"success": False, "error": f"Sandbox rejection: {err}", "stdout": "", "stderr": err}
 
-    # Inject seed preamble
+    # Inject seed preamble. MPLBACKEND=Agg is set in config.py at import time
+    # so matplotlib uses the non-interactive backend inside sandbox threads,
+    # preventing Tcl_AsyncDelete on Windows.
+    #
+    # Also inject common aliases (np, pd, plt) so generated code that uses
+    # these standard shorthand names works even if the generated import line
+    # is malformed or missing in cheap_mode probes.
     preamble = (
         f"import random as _sg_random\n"
         f"import numpy as _sg_np\n"
+        f"import numpy as np\n"
+        f"import pandas as pd\n"
+        f"import matplotlib\n"
+        f"matplotlib.use('Agg')\n"
+        f"import matplotlib.pyplot as plt\n"
         f"_sg_random.seed({seed})\n"
         f"_sg_np.random.seed({seed})\n"
     )
@@ -264,13 +277,50 @@ def run_known_answer_check(code: str, expected_metrics: Dict[str, float], tolera
 
 
 def _parse_json_from_stdout(stdout: str) -> Dict[str, Any]:
-    for line in reversed(stdout.strip().splitlines()):
+    """Extract a JSON dict from stdout, tolerating warnings/preamble before the JSON.
+
+    Strategy (ordered by specificity):
+    1. Scan lines bottom-up for a single-line JSON object (fast path).
+    2. Find the last '}' in the full text, then scan backward for the matching '{'.
+    3. Try the entire stripped stdout as a single JSON object.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return {}
+
+    # Fast path: scan lines bottom-up for single-line JSON
+    for line in reversed(text.splitlines()):
         line = line.strip()
         if line.startswith("{") and line.endswith("}"):
             try:
                 return json.loads(line)
             except json.JSONDecodeError:
                 continue
+
+    # Handle multi-line JSON (e.g. indented print): find the outermost '{...}' pair.
+    last_close = text.rfind("}")
+    if last_close >= 0:
+        # Scan backward from last_close to find the matching opening '{'
+        depth = 0
+        for i in range(last_close, -1, -1):
+            if text[i] == "}":
+                depth += 1
+            elif text[i] == "{":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[i:last_close + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break  # wrong '{', keep looking
+
+    # Last resort: try the whole output
+    if text.startswith("{"):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
     return {}
 
 
@@ -291,9 +341,22 @@ def run_multi_seed(
 
     successes = [r for r in runs if r.get("success")]
     if not successes:
+        # Collect actual error details from failed runs for debugging
+        error_details = []
+        for i, r in enumerate(runs):
+            err = r.get("error") or "unknown"
+            tb = r.get("traceback") or ""
+            stderr = r.get("stderr") or ""
+            detail = f"seed_{i}: {err}"
+            if stderr:
+                detail += f" | stderr: {stderr[:300]}"
+            if tb:
+                detail += f" | traceback: {tb[:300]}"
+            error_details.append(detail)
+        combined_error = "All seeded runs failed. Details:\n" + "\n".join(error_details)
         return {
             "success": False,
-            "error": "All seeded runs failed",
+            "error": combined_error,
             "runs": runs,
             "aggregate_metrics": {},
         }
@@ -305,6 +368,16 @@ def run_multi_seed(
         for k, v in metrics.items():
             if isinstance(v, (int, float)):
                 metric_series.setdefault(k, []).append(float(v))
+
+    # If successes exist but produced no parseable metrics, treat as failure
+    # to prevent infinite REFINE loops where code runs but produces no output
+    if not metric_series:
+        return {
+            "success": False,
+            "error": "Code executed but produced no parseable metrics - check stdout JSON format",
+            "runs": runs,
+            "aggregate_metrics": {},
+        }
 
     aggregate = {}
     for k, vals in metric_series.items():

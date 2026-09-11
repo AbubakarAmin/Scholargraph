@@ -1,4 +1,10 @@
+## Module Overview
+
+EditorAgent — submission-grade LaTeX, DOI bibliography, Limitations, companion repo.
+Provides create_final_paper / generate_latex expected by main.py.
+
 # `agents/editor.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

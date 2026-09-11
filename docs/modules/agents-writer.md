@@ -1,4 +1,10 @@
+## Module Overview
+
+WriterAgent - Drafts paper sections and integrates citations and code outputs.
+Handles abstract, introduction, methods, results, and conclusion sections.
+
 # `agents/writer.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

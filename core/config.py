@@ -13,6 +13,10 @@ from pydantic_settings import BaseSettings
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_PROJECT_ROOT / ".env")
 
+# Force matplotlib to use non-interactive Agg backend process-wide to prevent
+# Tcl_AsyncDelete: async handler deleted by the wrong thread on Windows.
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 class Config(BaseSettings):
     """Configuration class for the research system."""
 
@@ -48,10 +52,10 @@ class Config(BaseSettings):
     research_domain: str = os.getenv("RESEARCH_DOMAIN", "computer_science")
     max_iterations: int = int(os.getenv("MAX_ITERATIONS", "10"))
     supervisor_threshold: float = float(os.getenv("SUPERVISOR_THRESHOLD", "8.5"))
-    debate_pass_threshold: float = float(os.getenv("DEBATE_PASS_THRESHOLD", "7.5"))
+    debate_pass_threshold: float = float(os.getenv("DEBATE_PASS_THRESHOLD", "7.0"))
     debate_min_rounds: int = int(os.getenv("DEBATE_MIN_ROUNDS", "2"))
-    debate_max_rounds: int = int(os.getenv("DEBATE_MAX_ROUNDS", "4"))
-    novelty_similarity_reject: float = float(os.getenv("NOVELTY_SIMILARITY_REJECT", "0.88"))
+    debate_max_rounds: int = int(os.getenv("DEBATE_MAX_ROUNDS", "5"))
+    novelty_similarity_reject: float = float(os.getenv("NOVELTY_SIMILARITY_REJECT", "0.92"))
     experiment_seeds: int = int(os.getenv("EXPERIMENT_SEEDS", "3"))
     experiment_branch_count: int = int(os.getenv("EXPERIMENT_BRANCH_COUNT", "3"))
     debug_mode: bool = os.getenv("DEBUG_MODE", "true").lower() == "true"

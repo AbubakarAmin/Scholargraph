@@ -1,4 +1,10 @@
+## Module Overview
+
+ScholarGraph Control Deck — FastAPI backend.
+God's-eye view of runs, keys, events, scratchpad, cross-run memory.
+
 # `web/app.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

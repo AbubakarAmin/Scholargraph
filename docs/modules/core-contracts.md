@@ -1,4 +1,9 @@
+## Module Overview
+
+Typed handoff contracts shared by agents and workflow state.
+
 # `core/contracts.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

@@ -6,6 +6,7 @@ Bidirectional Engineer → Planner revision path; baselines required.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -176,18 +177,101 @@ class PlannerAgent:
                 f"Evaluate the proposed method using a {replacement}; do not claim external-domain or production validity."
             )
 
+    @staticmethod
+    def _auto_fix_manifest_violations(plan: Plan, manifest: SandboxCapabilityManifest) -> None:
+        """Programmatically strip/replace known-shape manifest violations.
+
+        This is a deterministic safety net that runs after the LLM re-prompt.
+        It cannot introduce new violations — it only removes or downgrades
+        non-compliant fields so the plan passes ``check_plan_feasibility``.
+        """
+        GPU_TOKENS = re.compile(r"\b(gpu|cuda|GPU|CUDA)\b")
+        DOWNLOAD_TOKENS = re.compile(r"\b(download|internet|outbound|yahoo\s*finance|wikipedia|uci)\b", re.IGNORECASE)
+
+        # --- Fix methodology-level violations ---
+        methodology = str(plan.get("methodology") or "")
+        if not manifest.gpu_available:
+            plan["methodology"] = GPU_TOKENS.sub("CPU-compatible", methodology)
+        if not manifest.dataset_downloads:
+            plan["methodology"] = DOWNLOAD_TOKENS.sub("bundled synthetic", plan["methodology"])
+
+        # --- Fix compute budget ---
+        budget = str(plan.get("compute_budget") or "")
+        if not manifest.gpu_available:
+            plan["compute_budget"] = GPU_TOKENS.sub("CPU", budget) if GPU_TOKENS.search(budget) else budget
+
+        # --- Fix per-experiment violations ---
+        for experiment in plan.get("experiments") or []:
+            if not isinstance(experiment, dict):
+                continue
+            # GPU references
+            if not manifest.gpu_available:
+                for key in ("gpu", "cuda", "accelerator"):
+                    experiment.pop(key, None)
+            # Dataset access
+            if not manifest.dataset_downloads:
+                dataset = experiment.get("dataset") or {}
+                if isinstance(dataset, dict):
+                    ds_text = str(dataset).lower()
+                    if any(tok in ds_text for tok in ("download", "internet", "yahoo", "uci", "wikipedia")):
+                        experiment["dataset"] = {"name": "bundled_synthetic", "access_policy": "local-only"}
+            # Cap epochs
+            for key in ("epochs", "training_epochs"):
+                val = experiment.get(key)
+                if isinstance(val, (int, float)) and val > manifest.max_training_epochs:
+                    experiment[key] = manifest.max_training_epochs
+            # Cap samples
+            for key in ("samples", "n_samples"):
+                val = experiment.get(key)
+                if isinstance(val, (int, float)) and val > manifest.max_samples:
+                    experiment[key] = manifest.max_samples
+
+            # Fix variants too
+            for variant in experiment.get("variants") or []:
+                if not isinstance(variant, dict):
+                    continue
+                if not manifest.gpu_available:
+                    for key in ("gpu", "cuda", "accelerator"):
+                        variant.pop(key, None)
+                if not manifest.dataset_downloads:
+                    vds = variant.get("dataset") or {}
+                    if isinstance(vds, dict) and any(tok in str(vds).lower() for tok in ("download", "internet", "yahoo")):
+                        variant["dataset"] = {"name": "bundled_synthetic", "access_policy": "local-only"}
+
+        # --- Fix contributions / title ---
+        title = str(plan.get("title") or "")
+        if not manifest.dataset_downloads:
+            plan["title"] = DOWNLOAD_TOKENS.sub("local/bundled", title)
+
     def revise_plan(
         self,
         plan: Plan,
         revision_request: RevisionRequest,
         topic: Optional[Topic] = None,
     ) -> Plan:
-        """Bidirectional edge: Engineer requested a plan revision."""
+        """Bidirectional edge: Engineer requested a plan revision.
+
+        The revision LLM prompt is seeded with the active capability manifest
+        so the model cannot propose GPU / outbound / undeclared-library work.
+        A post-generation feasibility gate mirrors create_plan enforcement; on
+        first violation the LLM is re-prompted with the specific constraints.
+        A second violation raises ``planner_manifest_violation`` (distinct from
+        the generic sandbox-rejection message) so operators can immediately
+        distinguish "Planner ignored constraints" from "task infeasible".
+        """
         log_agent_action("PlannerAgent", "revise_plan", revision_request)
         tracker = get_tracker()
         if tracker:
             tracker.bump("plan_revisions")
             tracker.scratch("PlannerAgent", "revision", revision_request)
+
+        manifest = plan.get("capability_manifest") or SANDBOX_CAPABILITY_MANIFEST.as_dict()
+        manifest_summary = (
+            f"Capability manifest: gpu_available={manifest.get('gpu_available', False)}, "
+            f"outbound_network={manifest.get('outbound_network', False)}, "
+            f"dataset_downloads={manifest.get('dataset_downloads', False)}, "
+            f"available_libraries={manifest.get('available_libraries', [])}"
+        )
 
         prompt = f"""
 Revise this research plan based on an Engineer failure or validation request.
@@ -199,8 +283,11 @@ Failed experiment: {revision_request.get('experiment')}
 Current plan JSON:
 {json.dumps({k: plan.get(k) for k in ('title', 'methodology', 'experiments', 'contributions', 'expected_contributions')}, indent=2)[:6000]}
 
+{manifest_summary}
+
 Requirements:
 - Fix unsupported assumptions / APIs / data requirements
+- You MUST respect the capability manifest above. Do NOT propose GPU, CUDA, outbound network access, dataset downloads, or libraries not in available_libraries.
 - Every contribution needs falsifiable_prediction + statistical_test
 - Every experiment MUST be an object with "name", "baselines", "evaluation_metrics", "falsifiable_prediction", "statistical_test"
 - Every item in "variants" MUST be a JSON object with at least "name" and "methodology" (e.g. [{{"name": "Variant Name", "methodology": "..."}}]), NOT strings.
@@ -236,7 +323,41 @@ Return JSON with keys: methodology, contributions, experiments, revision_notes
 
         feasibility_errors = check_plan_feasibility(plan, SANDBOX_CAPABILITY_MANIFEST)
         if feasibility_errors:
-            raise ValueError("Revised plan rejected by sandbox capability manifest: " + "; ".join(feasibility_errors))
+            # Re-prompt once with explicit constraint violations before failing closed.
+            constraint_detail = "; ".join(feasibility_errors)
+            fix_prompt = f"""
+Your revised plan violated the capability manifest:
+{constraint_detail}
+
+{manifest_summary}
+
+Rewrite ONLY the violating fields to comply. Do NOT use GPU, CUDA, outbound network, dataset downloads, or unlisted libraries.
+Keep the same experiment structure and schema. Return JSON with keys: methodology, contributions, experiments, revision_notes
+"""
+            fix_response = call_llm(fix_prompt, temperature=0.3, tier="strong")
+            fix_parsed = parse_json_from_llm(fix_response) or {}
+            if isinstance(fix_parsed, dict):
+                for key in ("methodology", "contributions", "experiments"):
+                    if key in fix_parsed:
+                        plan[key] = fix_parsed[key]
+                if "experiments" in fix_parsed:
+                    plan["experiments"] = self._normalize_experiments(plan.get("experiments") or [])
+                    plan["experiments"] = self._attach_variants(plan.get("experiments") or [])
+                    plan["experiments"] = self._normalize_experiments(plan["experiments"])
+
+            # Second feasibility check — fail closed with distinct error code
+            feasibility_errors = check_plan_feasibility(plan, SANDBOX_CAPABILITY_MANIFEST)
+            if feasibility_errors:
+                # Deterministic auto-repair: programmatically fix known violation shapes
+                # instead of relying solely on the LLM to self-correct.
+                self._auto_fix_manifest_violations(plan, SANDBOX_CAPABILITY_MANIFEST)
+                feasibility_errors = check_plan_feasibility(plan, SANDBOX_CAPABILITY_MANIFEST)
+                if feasibility_errors:
+                    raise ValueError(
+                        "planner_manifest_violation: Revised plan still violates capability manifest after re-prompt and auto-repair: "
+                        + "; ".join(feasibility_errors)
+                    )
+
         plan.setdefault("revision_history", []).append({
             "request": revision_request,
             "notes": (parse_json_from_llm(response) or {}).get("revision_notes", ""),

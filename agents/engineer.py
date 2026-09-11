@@ -90,6 +90,7 @@ class EngineerAgent:
         alternatives = [] if contract_hash else (alternatives or experiment.get("alternatives") or [])
         max_attempts = 4
         approach = experiment
+        original_experiment_name = experiment.get("name")
         decision_log = []
         code = ""
         self._progress("experiment_start", {
@@ -121,7 +122,7 @@ class EngineerAgent:
                 })
                 if attempt >= max_attempts:
                     self.request_plan_revision(reason, approach, detail="code generation returned empty string")
-                    return self._fail(approach, reason, decision_log, code, failure_kind=reason)
+                    return self._fail(approach, reason, decision_log, code, failure_kind=reason, original_name=original_experiment_name)
                 approach = {
                     **approach,
                     "refine_feedback": (
@@ -148,7 +149,7 @@ class EngineerAgent:
                             approach,
                             detail=err,
                         )
-                        return self._fail(approach, err, decision_log, code)
+                        return self._fail(approach, err, decision_log, code, original_name=original_experiment_name)
                     approach = {**approach, "refine_feedback": err}
                     continue
 
@@ -165,6 +166,7 @@ class EngineerAgent:
                             decision_log,
                             code,
                             failure_kind="known_answer_check_failed",
+                            original_name=original_experiment_name,
                         )
                     decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": "known_answer_check_failed"})
                     approach = {
@@ -197,6 +199,7 @@ class EngineerAgent:
                         decision_log,
                         code,
                         failure_kind="code_claim_inconsistency",
+                        original_name=original_experiment_name,
                     )
                 baselines = approach.get("baselines") or approach.get("baseline_comparison") or []
                 components = approach.get("claimed_components") or approach.get("components") or []
@@ -227,6 +230,7 @@ class EngineerAgent:
                 raw_path = self._store_raw(approach["name"], multi)
                 output = {
                     "experiment_name": approach["name"],
+                    "original_experiment_name": original_experiment_name,
                     "code": code,
                     "multi_seed": multi,
                     "aggregate_metrics": multi["aggregate_metrics"],
@@ -286,10 +290,10 @@ class EngineerAgent:
                     approach = alternatives.pop(0)
                 else:
                     self.request_plan_revision("no_alternatives_after_pivot", approach, detail=error)
-                    return self._fail(approach, error, decision_log, code)
+                    return self._fail(approach, error, decision_log, code, original_name=original_experiment_name)
 
         self.request_plan_revision("max_attempts_exhausted", approach, detail="bounded code-only repair attempts exhausted")
-        return self._fail(approach, "max_attempts_exhausted", decision_log, code)
+        return self._fail(approach, "max_attempts_exhausted", decision_log, code, original_name=original_experiment_name)
 
     def run_branching_search(
         self,
@@ -312,30 +316,46 @@ class EngineerAgent:
             # Single seed cheap probe
             probe = execute_sandboxed(code, seed=42)
             score = 0.0
+            probe_ok = False
             if probe.get("success"):
-                metrics = (probe.get("parsed") or {}).get("metrics") or {}
+                parsed = probe.get("parsed") or {}
+                metrics = parsed.get("metrics") or {}
                 nums = [float(v) for v in metrics.values() if isinstance(v, (int, float))]
-                score = sum(nums) / len(nums) if nums else 0.5
-            cheap_scores.append((score, cand, code, probe))
+                if nums:
+                    score = sum(nums) / len(nums)
+                    probe_ok = True
+                else:
+                    # Probe ran but produced no parseable metrics — not a pass
+                    score = 0.0
+                    probe_ok = False
+            cheap_scores.append((score, cand, code, probe, probe_ok))
             tracker = get_tracker()
             if tracker:
-                tracker.scratch("EngineerAgent", "cheap_probe", {"name": cand.get("name"), "score": score})
+                tracker.scratch("EngineerAgent", "cheap_probe", {"name": cand.get("name"), "score": score, "probe_ok": probe_ok})
             self._progress("cheap_probe", {
                 "name": cand.get("name"),
                 "score": score,
                 "success": bool(probe.get("success")),
+                "probe_ok": probe_ok,
                 "error": (probe.get("error") or "")[:200],
             })
 
         if not cheap_scores:
             return {"success": False, "error": "no candidates"}
 
-        cheap_scores.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_cand, _, _ = cheap_scores[0]
-        # Full run on winner
-        full = self.run_experiment(best_cand, alternatives=[c for _, c, _, _ in cheap_scores[1:]], method_description=method_description)
+        # Sort by score descending, but only consider probes that actually
+        # produced parseable metrics.  Probes that errored or produced no
+        # metrics get score 0 and are deprioritized — not promoted.
+        cheap_scores.sort(key=lambda x: (x[4], x[0]), reverse=True)
+        best_score, best_cand, _, _, _ = cheap_scores[0]
+        # Full run on winner, passing remaining candidates as alternatives for PIVOT
+        full = self.run_experiment(
+            best_cand,
+            alternatives=[c for _, c, _, _, _ in cheap_scores[1:]],
+            method_description=method_description,
+        )
         full["branch_search"] = {
-            "probed": [{"name": c.get("name"), "score": s} for s, c, _, _ in cheap_scores],
+            "probed": [{"name": c.get("name"), "score": s, "probe_ok": ok} for s, c, _, _, ok in cheap_scores],
             "winner": best_cand.get("name"),
             "winner_probe_score": best_score,
         }
@@ -408,11 +428,127 @@ class EngineerAgent:
             notes.append("Code contains stubs/NotImplemented")
             score -= 4.0
 
+        # --- Computation verification: detect hardcoded-literal fabricated metrics ---
+        comp_note = self._check_code_has_computation(code)
+        if comp_note:
+            notes.append(comp_note)
+            score -= 5.0
+
         return {
             "consistent": score >= 8.0 and not notes,
             "score": max(0.0, score),
             "notes": notes,
         }
+
+    @staticmethod
+    def _check_code_has_computation(code: str) -> Optional[str]:
+        """Return a note if code appears to contain no real computation before its
+        final ``print(json.dumps(...))`` line, else ``None``.
+
+        Heuristic: parse the AST and look for evidence that the code actually
+        trains a model, runs a numeric pipeline, or calls into sklearn/scipy/numpy
+        *before* producing its output.  Hardcoded literal dicts bypass this gate
+        silently today — this method catches that class of fabrication.
+        """
+        import ast as _ast
+
+        if not (code or "").strip():
+            return None
+
+        try:
+            tree = _ast.parse(code)
+        except SyntaxError:
+            return None  # let the normal syntax-check path handle this
+
+        # Computation evidence markers — calls that imply actual work
+        _FIT_NAMES = {"fit", "fit_transform", "fit_predict", "partial_fit",
+                       "train_test_split", "cross_val_score", "GridSearchCV",
+                       "RandomizedSearchCV", "Pipeline", "StandardScaler",
+                       "MinMaxScaler", "PCA", "select_kbest", "kmeans",
+                       "curve_fit", "minimize", "fsolve", "odeint"}
+        _NUMPY_CALLS = {"array", "linspace", "arange", "random", "randn",
+                         "zeros", "ones", "diag", "dot", "matmul", "einsum",
+                         "mean", "std", "var", "sum", "cumsum", "diff",
+                         "histogram", "percentile", "argsort", "where"}
+        _COMPUTATION_MODULES = {"sklearn", "scipy", "statsmodels", "xgboost",
+                                 "lightgbm", "torch", "tensorflow", "keras"}
+
+        has_fit_call = False
+        has_numpy_call = False
+        has_computation_import = False
+        has_numeric_assignment = False
+
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    if root in _COMPUTATION_MODULES:
+                        has_computation_import = True
+            elif isinstance(node, _ast.ImportFrom):
+                if node.module:
+                    root = node.module.split(".")[0]
+                    if root in _COMPUTATION_MODULES:
+                        has_computation_import = True
+            elif isinstance(node, _ast.Call):
+                func_name = ""
+                if isinstance(node.func, _ast.Attribute):
+                    func_name = node.func.attr
+                elif isinstance(node.func, _ast.Name):
+                    func_name = node.func.id
+                if func_name in _FIT_NAMES:
+                    has_fit_call = True
+                if func_name in _NUMPY_CALLS:
+                    has_numpy_call = True
+            # Detect numeric binary ops on variables (e.g. np.mean(...), scores.mean())
+            elif isinstance(node, _ast.BinOp) and isinstance(node.op, (_ast.Add, _ast.Sub, _ast.Mult, _ast.Div)):
+                has_numeric_assignment = True
+
+        if not (has_fit_call or has_numpy_call or has_computation_import or has_numeric_assignment):
+            return "Code contains no evidence of computation (no model fitting, numpy calls, or numeric operations)"
+
+        # Second check: the final print(json.dumps(...)) — are the metrics all literal constants?
+        # Walk the AST looking for the last Expr(Call(print, ...)) and inspect its arguments.
+        print_calls = [n for n in _ast.walk(tree)
+                       if isinstance(n, _ast.Expr) and isinstance(n.value, _ast.Call)
+                       and isinstance(n.value.func, _ast.Name) and n.value.func.id == "print"]
+        if not print_calls:
+            return None  # no final print — can't检验
+
+        last_print = print_calls[-1]
+        # Check if the argument to print is a dict with all-numeric-literal values
+        arg = last_print.value.args[0] if last_print.value.args else None
+        if arg is None:
+            return None
+
+        def _all_literals_in_dict(node: _ast.AST) -> bool:
+            """True if node is a Dict whose values are all numeric/string literals."""
+            if not isinstance(node, _ast.Dict):
+                return False
+            for val in node.values:
+                if isinstance(val, _ast.Constant) and isinstance(val.value, (int, float, str, bool)):
+                    continue
+                if isinstance(val, _ast.Dict):
+                    if not _all_literals_in_dict(val):
+                        return False
+                elif isinstance(val, _ast.List):
+                    if not all(
+                        isinstance(e, _ast.Constant) and isinstance(e.value, (int, float, str, bool))
+                        for e in val.elts
+                    ):
+                        return False
+                else:
+                    return False
+            return True
+
+        # Unwrap json.dumps(...)
+        if isinstance(arg, _ast.Call) and isinstance(arg.func, _ast.Attribute):
+            if arg.func.attr == "dumps" and arg.args:
+                arg = arg.args[0]
+
+        if _all_literals_in_dict(arg):
+            return "Code outputs hardcoded literal metrics with no computation — likely fabricated"
+
+        return None
 
     @staticmethod
     def _is_plan_level_sandbox_block(error: str) -> bool:
@@ -436,6 +572,13 @@ class EngineerAgent:
         attempt: int,
     ) -> str:
         err_l = (error or "").lower()
+        # No metrics means code ran but produced no useful output - pivot, not refine
+        if "no parseable metrics" in err_l or "no metrics" in err_l:
+            if attempt >= 2 and alternatives:
+                return "PIVOT"
+            if attempt >= 3:
+                return "PIVOT" if alternatives else "REFINE"
+            return "REFINE" if attempt < 3 else ("PIVOT" if alternatives else "REFINE")
         # Bugs → REFINE; conceptual/API failures → PIVOT
         if any(k in err_l for k in ("syntax", "nameerror", "typeerror", "indent", "sandbox rejection")):
             return "REFINE"
@@ -528,7 +671,7 @@ Return ONLY Python. Still print JSON metrics.
             json.dump(multi, f, indent=2, default=str)
         return path
 
-    def _fail(self, experiment, error, decision_log, code="", failure_kind: str = "technical"):
+    def _fail(self, experiment, error, decision_log, code="", failure_kind: str = "technical", original_name: str = None):
         # Give-up guard: require concrete artifact
         artifact = {"error": str(error), "decision_log": decision_log, "code_snippet": (code or "")[:500]}
         if not artifact["error"] or artifact["error"] == "this isn't feasible":
@@ -545,6 +688,7 @@ Return ONLY Python. Still print JSON metrics.
                 failure_kind = "max_attempts_exhausted"
         out = {
             "experiment_name": experiment.get("name"),
+            "original_experiment_name": original_name or experiment.get("name"),
             "error": error_text,
             "success": False,
             "decision_log": decision_log,

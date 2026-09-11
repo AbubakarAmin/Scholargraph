@@ -210,7 +210,7 @@ def test_terminal_run_writes_failure_dossier_without_latex(tmp_path):
 
 def test_discovery_exhaustion_is_a_terminal_failed_run(monkeypatch):
     state = initialize_state()
-    state["iteration"] = 3
+    state["iteration"] = 5
 
     class EmptyTopicHunter:
         def __init__(self, *_args):

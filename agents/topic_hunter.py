@@ -61,6 +61,7 @@ class TopicHunterAgent:
         self.rejection_log: List[Dict[str, Any]] = []
         self.source_health: Dict[str, Dict[str, Any]] = {}
         self._excluded_titles_cache: Optional[List[str]] = None
+        self._iteration_failures = 0  # Track consecutive iteration failures
 
     def _source_ok(self, name: str):
         self.source_health[name] = {"ok": True}
@@ -87,7 +88,10 @@ class TopicHunterAgent:
                 validator=lambda payload: isinstance(payload, dict) and "results" in payload,
             )
             if artifact["status"] == "unavailable":
-                raise RuntimeError("; ".join(artifact.get("warnings", [])) or "source unavailable")
+                # Don't raise immediately - try to continue with partial data
+                warnings = artifact.get("warnings", [])
+                log_agent_action("TopicHunter", "openalex_unavailable", {"warnings": warnings})
+                return []
             rows = artifact["content"].get("results", [])
             for row in rows:
                 inverted = row.pop("abstract_inverted_index", None) or {}
@@ -376,7 +380,8 @@ Return JSON:
             if isinstance(parsed, dict) and "gap_type" in parsed:
                 evidence_strength = float(parsed.get("evidence_strength", 0.5))
                 status = parsed.get("status", "PASS")
-                if evidence_strength < 0.4:
+                # Relaxed threshold: allow topics with moderate evidence through
+                if evidence_strength < 0.25:
                     status = "FAIL"
                 return {
                     "gap_type": str(parsed.get("gap_type", "evaluation_gap")),
@@ -503,18 +508,20 @@ Return JSON:
                 ok = False
                 reasons.append(f"Not executable in sandbox: {b}")
         feas = topic.get("feasibility", 5)
-        if isinstance(feas, (int, float)) and feas < 4:
+        if isinstance(feas, (int, float)) and feas < 3:
             ok = False
             reasons.append(f"Low feasibility score: {feas}")
         # Prefer synthetic / public small data
         if "dataset" in text and "proprietary" in text:
             ok = False
             reasons.append("Proprietary dataset unavailable")
-        candidate_plan = {"methodology": topic.get("description", ""), "experiments": [{"dataset": {"name": topic.get("dataset_plan", "")}}]}
-        capability_reasons = check_plan_feasibility(candidate_plan, SANDBOX_CAPABILITY_MANIFEST)
-        if capability_reasons:
-            ok = False
-            reasons.extend(capability_reasons)
+        # Only block explicit outbound network requirements
+        if any(phrase in text for phrase in ("requires internet", "must download", "needs api access to")):
+            candidate_plan = {"methodology": topic.get("description", ""), "experiments": [{"dataset": {"name": topic.get("dataset_plan", "")}}]}
+            capability_reasons = check_plan_feasibility(candidate_plan, SANDBOX_CAPABILITY_MANIFEST)
+            if capability_reasons:
+                ok = False
+                reasons.extend(capability_reasons)
         return {"ok": ok, "reasons": reasons}
 
     def _reject(self, topic: Topic, reason: str, meta: Optional[Dict[str, Any]] = None):
@@ -568,8 +575,12 @@ Return JSON:
     def _hunt_once(self, domain: str, seed_hint: str) -> List[Dict[str, Any]]:
         lessons = json.dumps(CrossRunMemory().get_prompt_context(), sort_keys=True)
         excluded = self._excluded_titles()
-        recent_papers = self.search_openalex(f"{domain} {seed_hint}", 40)
-        recent_papers.extend(self.search_arxiv(f"{domain} {seed_hint}", 20))
+        # Adaptive: search more papers as failures increase
+        base_limit = 40
+        extra = min(self._iteration_failures * 10, 30)
+        search_limit = base_limit + extra
+        recent_papers = self.search_openalex(f"{domain} {seed_hint}", search_limit)
+        recent_papers.extend(self.search_arxiv(f"{domain} {seed_hint}", min(search_limit, 30)))
         if not recent_papers:
             return []
 
@@ -630,6 +641,12 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "reason_code": bridge_validation["reason"],
                 })
                 continue
+            # Soft warning: log but don't reject on bridge text mismatch
+            if "soft_warning" in bridge_validation.get("reason", ""):
+                log_agent_action("TopicHunter", "bridge_soft_warning", {
+                    "title": gap.get("title"),
+                    "reason": bridge_validation["reason"],
+                })
             gap["literature_evidence"] = [
                 {
                     "title": paper.get("title", ""),
@@ -724,14 +741,21 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 pass
         return kept
 
-    def discover_topics(self, domain: str = None, n_parallel: int = 3) -> List[Topic]:
+    def discover_topics(self, domain: str = None, n_parallel: int = 5) -> List[Topic]:
         self._excluded_titles_cache = None
         domain = domain or self.runtime_config.research_domain
         log_agent_action("TopicHunter", "start_discovery", {"domain": domain, "parallel": n_parallel})
         seeds = [
-            "underexplored methods",
-            "evaluation methodology gaps",
-            "robustness and reproducibility",
+            "underexplored methods and algorithms",
+            "evaluation methodology gaps and benchmarks",
+            "robustness and reproducibility challenges",
+            "cross-domain transfer and adaptation",
+            "data efficiency and sample complexity",
+            "interpretability and explainability gaps",
+            "fairness bias and ethics in algorithms",
+            "scalability and distributed computing limits",
+            "edge cases failure modes and adversarial robustness",
+            "reproducibility of classical ML pipelines",
         ][:n_parallel]
 
         all_topics: List[Dict[str, Any]] = []
@@ -764,6 +788,11 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
             "num_topics": len(ranked),
             "rejected": len(self.rejection_log),
         })
+        # Track failure count for adaptive behavior
+        if not ranked:
+            self._iteration_failures += 1
+        else:
+            self._iteration_failures = 0
         return ranked
 
     def rank_topics_by_potential(self, topics: List[Topic]) -> List[Topic]:

@@ -1,4 +1,5 @@
 # Testing
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Memory retrieval integrity
 

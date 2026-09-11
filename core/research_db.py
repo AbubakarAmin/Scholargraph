@@ -65,7 +65,11 @@ class ResearchDatabase:
 
     def create_run(self, run_id: str, started_at: str):
         with self.lock, self._connect() as con:
-            con.execute("INSERT OR REPLACE INTO research_runs(run_id,started_at,status,summary_json) VALUES(?,?,?,?)", (run_id, started_at, "running", "{}"))
+            existing = con.execute("SELECT summary_json FROM research_runs WHERE run_id=?", (run_id,)).fetchone()
+            if existing:
+                con.execute("UPDATE research_runs SET started_at=?, status=? WHERE run_id=?", (started_at, "running", run_id))
+            else:
+                con.execute("INSERT INTO research_runs(run_id,started_at,status,summary_json) VALUES(?,?,?,?)", (run_id, started_at, "running", "{}"))
 
     def finish_run(self, run_id: str, status: str, phase: str, summary: Dict[str, Any]):
         with self.lock, self._connect() as con:

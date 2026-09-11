@@ -587,7 +587,7 @@ async function renderRuns(){
       <td><span class="tag ${tagFor(r.status)}">${esc(r.status)}</span></td>
       <td>${esc(r.phase||'')}</td>
       <td class="mono">${esc(r.started_at||'')}</td>
-      <td><button data-select-run="${esc(r.run_id)}">Select</button> <button class="danger" data-delete-run="${esc(r.run_id)}">Delete</button></td>
+      <td><button data-select-run="${esc(r.run_id)}">Select</button> <button class="primary" data-rerun-run="${esc(r.run_id)}">Re-run</button> <button class="danger" data-delete-run="${esc(r.run_id)}">Delete</button></td>
     </tr>`).join('')
   }</tbody></table>`;
   document.querySelectorAll('[data-select-run]').forEach(button=>button.onclick=async()=>{
@@ -600,6 +600,15 @@ async function renderRuns(){
       if(selectedRunId===button.dataset.deleteRun)selectedRunId=null;
       await refresh();await renderRuns();
     }catch(e){$('settingsNote').textContent=e.message}
+  });
+  document.querySelectorAll('[data-rerun-run]').forEach(button=>button.onclick=async()=>{
+    const runId=button.dataset.rerunRun;
+    if(!confirm(`Re-run from checkpoint for run ${runId}? This will resume from where it left off.`))return;
+    try{
+      await api(`/api/run/resume/${encodeURIComponent(runId)}`,{method:'POST'});
+      selectedRunId=runId;
+      await refresh();showView('overview');
+    }catch(e){alert(e.message)}
   });
 }
 

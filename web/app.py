@@ -18,6 +18,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from fastapi import Request
+from fastapi.responses import EventSourceResponse
+import asyncio
+import json
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -109,10 +113,10 @@ def _startup():
 
 @app.get("/")
 def index():
-    index_path = STATIC / "admin.html"
+    index_path = STATIC / "admin" / "index.html"
     if index_path.exists():
         return FileResponse(index_path)
-    return HTMLResponse("<h1>ScholarGraph</h1><p>static/index.html missing</p>")
+    return HTMLResponse("<h1>ScholarGraph</h1><p>static/admin/index.html missing</p>")
 
 
 @app.get("/api/health")
@@ -289,7 +293,7 @@ def dashboard(run_id: Optional[str] = None):
         "model": config.resolve_model("default"),
         "domain": config.research_domain,
     }
-    state = _latest_state if tracker and (run_id is None or run_id == tracker.run_id) else {}
+    state = _get_latest_state() if tracker and (run_id is None or run_id == tracker.run_id) else {}
 
     debates = []
     for item in state.get("debate_results", []):
@@ -332,17 +336,17 @@ def dashboard(run_id: Optional[str] = None):
 @app.post("/api/release/approve")
 def approve_release():
     """Record the explicit human checkpoint before a run is publishable."""
-    global _latest_state
-    if not _latest_state or _latest_state.get("terminal_error"):
+    latest_state = _get_latest_state()
+    if not latest_state or latest_state.get("terminal_error"):
         raise HTTPException(status_code=409, detail="No successful run is awaiting approval")
-    _latest_state["human_approved"] = True
-    if _latest_state.get("final_paper"):
-        _latest_state["final_paper"]["publishable"] = True
+    _set_latest_state({**latest_state, "human_approved": True})
+    if latest_state.get("final_paper"):
+        _set_latest_state({**_get_latest_state(), "final_paper": {**latest_state["final_paper"], "publishable": True}})
     tracker = get_tracker()
     if tracker:
         research_db.update_run_summary(tracker.run_id, {"human_approved": True, "publishable": True})
     from core.artifacts import save_results
-    save_results(_latest_state)
+    save_results(_get_latest_state())
     return {"ok": True, "publishable": True}
 
 
@@ -374,10 +378,62 @@ def feedback(limit: int = 20):
     return {"feedback": memory.get_recent_feedback(limit=limit)}
 
 
-@app.get("/api/runs")
-def get_runs(limit: int = 50):
-    return {"runs": research_db.list_runs(limit=limit)}
+@app.get("/api/admin/export/{data_type}")
+def export_data(data_type: str):
+    """Export debates or agents data as CSV.
+    No authentication required as per user request.
+    """
+    dash = dashboard()
+    # Determine payload based on data_type
+    if data_type == "debates":
+        items = dash.get("workspace", {}).get("debates", [])
+        headers = ["round", "topic", "winner", "score"]
+        rows = []
+        for d in items:
+            # Attempt to extract common fields; fall back to raw dict
+            rows.append([
+                d.get("round", ""),
+                d.get("topic", ""),
+                d.get("winner", ""),
+                d.get("score", ""),
+            ])
+    elif data_type == "agents":
+        # Use capabilities manifest as a placeholder for agents info
+        agents = dash.get("capabilities", [])
+        headers = ["name", "role"]
+        rows = []
+        for a in agents:
+            rows.append([a.get("name", ""), a.get("role", "")])
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported export type")
 
+    # Build CSV string
+    import csv, io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    csv_bytes = output.getvalue().encode("utf-8")
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(io.BytesIO(csv_bytes), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename={data_type}_export.csv"})
+
+
+
+@app.get("/api/admin/stream")
+async def admin_stream(request: Request):
+    """Server‑Sent Events stream delivering real‑time admin updates.
+    Sends a JSON payload with a `type` field so the client can dispatch.
+    Currently emits the full dashboard payload every few seconds.
+    """
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+            dash = dashboard()
+            payload = {"type": "dashboard", "payload": dash}
+            yield json.dumps(payload) + "\n\n"
+            await asyncio.sleep(30)  # push updates every half minute
+    return EventSourceResponse(event_generator())
 
 @app.post("/api/data/reset/outputs")
 def reset_outputs(payload: ResetPayload):
@@ -411,8 +467,8 @@ def reset_outputs(payload: ResetPayload):
         else:
             resolved.unlink()
             removed.append(str(resolved))
-    _latest_state = {}
-    _run_error = None
+    _set_latest_state({})
+    _set_run_error(None)
     return {"ok": True, "scope": "outputs", "removed": removed, "history_preserved": True}
 
 
@@ -474,12 +530,86 @@ def _workspace_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
         "evidence_gate": state.get("evidence_gate", {}),
         "terminal_error": state.get("terminal_error"),
         "experiment_contracts": state.get("experiment_contracts", {}),
+        "current_phase": state.get("current_phase"),
+        "iteration": state.get("iteration"),
+        "topics": state.get("topics", []),
+        "selected_topic": state.get("selected_topic"),
+        "run_id": state.get("run_id"),
     }
 
 
-def _run_pipeline(domain: Optional[str] = None):
+def _load_state_from_db(run_id: str) -> Optional[Dict[str, Any]]:
+    """Load historical workspace state from the research database for resume."""
+    runs = research_db.list_runs(limit=100)
+    found = next((r for r in runs if r["run_id"] == run_id), None)
+    if not found:
+        return None
+    try:
+        summary = json.loads(found.get("summary_json") or "{}")
+    except Exception:
+        return None
+    workspace = summary.get("workspace", {})
+    if not workspace:
+        return None
+    state = initialize_state()
+    state["run_id"] = run_id
+    state["plan"] = workspace.get("plan")
+    state["plan_revision_requests"] = workspace.get("plan_revision_requests", [])
+    state["engineer_outputs"] = workspace.get("engineer_outputs", {})
+    state["draft_sections"] = workspace.get("draft_sections", {})
+    state["supervisor_scores"] = workspace.get("supervisor_scores", {})
+    state["supervisor_feedback"] = workspace.get("supervisor_feedback", {})
+    state["results_verification"] = workspace.get("results_verification", {})
+    state["reproducibility"] = workspace.get("reproducibility", {})
+    state["data_artifacts"] = workspace.get("data_artifacts", {})
+    state["data_validation"] = workspace.get("data_validation", {})
+    state["execution_artifacts"] = workspace.get("execution_artifacts", {})
+    state["analysis_reports"] = workspace.get("analysis_reports", {})
+    state["verification_findings"] = workspace.get("verification_findings", [])
+    state["evidence_gate"] = workspace.get("evidence_gate", {})
+    state["terminal_error"] = workspace.get("terminal_error")
+    state["experiment_contracts"] = workspace.get("experiment_contracts", {})
+    state["current_phase"] = workspace.get("current_phase")
+    state["iteration"] = workspace.get("iteration")
+    state["topics"] = workspace.get("topics", [])
+    state["selected_topic"] = workspace.get("selected_topic")
+    if workspace.get("debates"):
+        state["debate_results"] = workspace["debates"]
+    return state
+
+
+def _set_latest_state(state: Dict[str, Any]):
+    """Thread-safe update of _latest_state."""
+    global _latest_state
+    with _run_lock:
+        _latest_state = dict(state)
+
+
+def _get_latest_state() -> Dict[str, Any]:
+    """Thread-safe read of _latest_state."""
+    global _latest_state
+    with _run_lock:
+        return dict(_latest_state)
+
+
+def _set_run_error(error: Optional[str]):
+    """Thread-safe update of _run_error."""
+    global _run_error
+    with _run_lock:
+        _run_error = error
+
+
+def _get_run_error() -> Optional[str]:
+    """Thread-safe read of _run_error."""
+    global _run_error
+    with _run_lock:
+        return _run_error
+
+
+def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = None):
     global _run_error, _latest_state
-    _run_error = None
+    with _run_lock:
+        _run_error = None
     try:
         if domain:
             apply_runtime_keys({"RESEARCH_DOMAIN": domain})
@@ -488,31 +618,38 @@ def _run_pipeline(domain: Optional[str] = None):
         from core.context import create_run_context
         from core.pipeline import ResearchPipeline
 
-        tracker = start_run()
+        if resume_run_id:
+            tracker = start_run(resume_run_id)
+            existing_state = _load_state_from_db(resume_run_id)
+        else:
+            tracker = start_run()
+            existing_state = None
         pipeline = ResearchPipeline(
             create_research_graph,
             create_checkpointer,
             context=create_run_context(tracker),
         )
-        state = initialize_state()
+        if resume_run_id and existing_state:
+            state = existing_state
+        else:
+            state = initialize_state()
         state["run_id"] = tracker.run_id
-        _latest_state = state
+        _set_latest_state(state)
         def on_node(node_name, node_output):
-            nonlocal state
-            global _latest_state
-            state = node_output
-            _latest_state = node_output
+            current = _get_latest_state()
+            current.update(node_output)
+            _set_latest_state(current)
             tracker.message(f"{node_name} -> {node_output.get('current_phase')}")
 
-        result = pipeline.run(state, tracker.run_id, on_node=on_node, finalize=save_results)
+        result = pipeline.run(state, tracker.run_id, resume=bool(resume_run_id), on_node=on_node, finalize=save_results)
         last = result.state
         research_db.update_run_summary(tracker.run_id, {"workspace": _workspace_snapshot(last)})
         terminal_error = last.get("terminal_error")
-        _run_error = terminal_error
+        _set_run_error(terminal_error)
         if terminal_error:
             tracker.message(terminal_error, level="error")
     except Exception as e:
-        _run_error = str(e)
+        _set_run_error(str(e))
         tracker = get_tracker()
         if tracker:
             tracker.message(f"ERROR: {e}", level="error")
@@ -529,10 +666,24 @@ def start_research(payload: RunPayload = RunPayload()):
             apply_runtime_keys({"LLM_PROVIDER": payload.provider})
             reset_llm_client()
         _run_thread = threading.Thread(
-            target=_run_pipeline, args=(payload.domain,), daemon=True
+            target=_run_pipeline, args=(payload.domain, None), daemon=True
         )
         _run_thread.start()
     return {"ok": True, "message": "Research run started"}
+
+
+@app.post("/api/run/resume/{run_id}")
+def resume_run(run_id: str):
+    """Resume a previous run from where it left off using checkpoint data."""
+    global _run_thread
+    with _run_lock:
+        if _run_thread and _run_thread.is_alive():
+            raise HTTPException(status_code=409, detail="A run is already in progress")
+        _run_thread = threading.Thread(
+            target=_run_pipeline, args=(None, run_id), daemon=True
+        )
+        _run_thread.start()
+    return {"ok": True, "message": f"Resuming run {run_id} from checkpoint"}
 
 
 @app.get("/api/run/status")
@@ -541,9 +692,16 @@ def run_status():
     tracker = get_tracker()
     return {
         "running": alive,
-        "error": _run_error,
+        "error": _get_run_error(),
         "tracker": tracker.dashboard() if tracker else None,
     }
+
+
+@app.get("/api/runs")
+def list_runs(limit: int = 50):
+    """List all recorded runs for the admin panel to select from."""
+    runs = research_db.list_runs(limit=limit)
+    return {"runs": runs}
 
 
 if STATIC.exists():

@@ -48,7 +48,7 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
             state["topics"] = topics
             state["current_phase"] = "hypothesis_debate"
             log_agent_action("Orchestrator", "topics_discovered", {"count": len(topics), "iteration": state["iteration"], "topics": [topic["title"] for topic in topics[:3]]})
-        elif state["iteration"] >= 3:
+        elif state["iteration"] >= 5:
             # Exhausting discovery is a failed research run, not a successful
             # completion.  Preserve that distinction so the artifact layer
             # writes a failure dossier rather than an empty normal summary.
@@ -86,7 +86,7 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
         return state
     except Exception as exc:
         logger.error(f"Topic discovery failed: {exc}")
-        if state["iteration"] >= 3:
+        if state["iteration"] >= 5:
             state["current_phase"] = "complete"
             state["meta_feedback"].append(f"Topic discovery failed after multiple attempts: {exc}")
         else:

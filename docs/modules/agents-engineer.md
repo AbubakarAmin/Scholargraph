@@ -1,4 +1,10 @@
+## Module Overview
+
+EngineerAgent — verifiable, self-healing experiment runner.
+Sandbox lockdown, multi-seed, PIVOT/REFINE, ablations, code-claim checks.
+
 # `agents/engineer.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

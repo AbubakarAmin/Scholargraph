@@ -1,4 +1,14 @@
+## Module Overview
+
+Memory module for the multi-agent research system.
+Handles vector database operations and persistent knowledge storage.
+
+Prompt retrieval is fail-closed: only structured_signal entries that are
+explicitly retrieval_eligible may enter prompts, and only via get_prompt_context().
+Raw narrative stays on disk for audit.
+
 # `core/memory.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

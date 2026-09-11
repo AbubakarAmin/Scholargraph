@@ -1,4 +1,10 @@
+## Module Overview
+
+PlannerAgent — falsifiable, revisable experiment designer.
+Bidirectional Engineer → Planner revision path; baselines required.
+
 # `agents/planner.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

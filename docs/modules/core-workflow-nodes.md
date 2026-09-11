@@ -1,4 +1,5 @@
 # `core/workflow_nodes.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 This module contains the phase implementations used by the LangGraph research workflow. Each node receives and mutates a `ResearchState`, uses the active `RunContext` when constructing agents, and returns the updated state.
 

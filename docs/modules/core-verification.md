@@ -1,4 +1,10 @@
+## Module Overview
+
+Hard verification checks: citation resolution + statistical validity.
+These are deterministic — not LLM vibe scores.
+
 # `core/verification.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

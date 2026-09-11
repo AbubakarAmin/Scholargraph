@@ -522,8 +522,8 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
 
 This paper presents research on {topic['title']}. We address the problem of {topic['description']} 
 and propose a novel approach that {topic.get('impact', 'provides significant improvements')}. 
-Our contributions include {', '.join(plan.get('expected_contributions', ['novel methodology', 'comprehensive evaluation']))}. 
-No verified experimental results are available for this draft. Do not make empirical claims.
+        Our contributions include {', '.join(str(c.get('claim', c)) if isinstance(c, dict) else str(c) for c in plan.get('expected_contributions', ['novel methodology', 'comprehensive evaluation']))}. 
+        No verified experimental results are available for this draft. Do not make empirical claims.
 """
     
     def _create_fallback_introduction(self, topic: Dict[str, Any], plan: Dict[str, Any]) -> str:
@@ -535,7 +535,7 @@ Current approaches have limitations in {topic.get('rationale', 'scalability and 
 This work addresses these challenges by {topic.get('impact', 'introducing novel methods')}.
 
 Our main contributions are:
-{chr(10).join([f"- {contribution}" for contribution in plan.get('expected_contributions', ['Novel approach', 'Comprehensive evaluation', 'Practical insights'])])}
+{chr(10).join([f"- {c.get('claim', c) if isinstance(c, dict) else c}" for c in plan.get('expected_contributions', ['Novel approach', 'Comprehensive evaluation', 'Practical insights'])])}
 
 The remainder of this paper is organized as follows: Section 2 reviews related work, 
 Section 3 describes our methodology, Section 4 presents experimental results, 
@@ -591,7 +591,7 @@ and provides guidance for future research directions.
 # Conclusion
 
 This paper presented research on {topic['title']}, addressing key challenges in {self.runtime_config.research_domain}. 
-Our main contributions include {', '.join(plan.get('expected_contributions', ['novel methodology', 'comprehensive evaluation']))}.
+Our main contributions include {', '.join(str(c.get('claim', c)) if isinstance(c, dict) else str(c) for c in plan.get('expected_contributions', ['novel methodology', 'comprehensive evaluation']))}.
 
 Future work will explore extensions to other domains and applications, building upon 
 the foundation established in this research.

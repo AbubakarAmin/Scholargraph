@@ -1,4 +1,10 @@
+## Module Overview
+
+Shared utilities and common operations.
+Use core.llm for LLM provider access and compatibility aliases.
+
 # `core/utils.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

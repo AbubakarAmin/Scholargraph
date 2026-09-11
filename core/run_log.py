@@ -131,16 +131,42 @@ class RunTracker:
 
 
 _active_tracker: Optional[RunTracker] = None
+_tracker_lock = threading.Lock()
 
 
 def get_tracker() -> Optional[RunTracker]:
-    return _active_tracker
+    with _tracker_lock:
+        return _active_tracker
 
 
 def start_run(run_id: Optional[str] = None) -> RunTracker:
+    """Start a new run or resume an existing one.
+
+    When *run_id* is provided and matches a prior run in the research ledger,
+    cumulative statistics (llm_calls, debate_rounds, pivots, etc.) are restored
+    so that resumed runs continue counting from where they left off instead of
+    resetting to zero.
+    """
     global _active_tracker
-    _active_tracker = RunTracker(run_id=run_id)
+    with _tracker_lock:
+        _active_tracker = RunTracker(run_id=run_id)
+        # On resume, restore cumulative stats from the prior run so accounting
+        # (llm_calls, debate_rounds, pivots, etc.) continues correctly.
+        if run_id:
+            prior_run = research_db.list_runs(1000)
+            match = next((r for r in prior_run if r.get("run_id") == run_id), None)
+            if match:
+                prior_stats = match.get("stats") or {}
+                for key in _active_tracker.stats:
+                    if key in prior_stats:
+                        _active_tracker.stats[key] = prior_stats[key]
     return _active_tracker
+
+
+def set_tracker(tracker: Optional[RunTracker]) -> None:
+    global _active_tracker
+    with _tracker_lock:
+        _active_tracker = tracker
 
 
 def emit_event(
@@ -157,6 +183,12 @@ def emit_event(
             run_id = active_context.run_id or (
                 active_context.tracker.run_id if active_context.tracker else None
             )
+    # Guard: never write events without a run_id to the production log.
+    # Test code that doesn't set up a tracker will have run_id=None; writing
+    # those events into the shared JSONL pollutes forensics and historical
+    # report reconstruction.
+    if run_id is None:
+        return
     record = {
         "ts": _now(),
         "type": event_type,
@@ -240,9 +272,13 @@ def build_run_summary(
         })
     phase = state.get("current_phase") or (tracker.phase if tracker else "idle")
     terminal = error or state.get("terminal_error")
+    last_feedback = (state.get("meta_feedback") or [None])[-1]
+    if isinstance(last_feedback, dict):
+        import json as _json
+        last_feedback = _json.dumps(last_feedback, default=str)
     stopped_because = (
         terminal
-        or (state.get("meta_feedback") or [None])[-1]
+        or last_feedback
         or ("completed with paper" if state.get("latex_output") else None)
         or "run ended"
     )
@@ -293,7 +329,7 @@ def build_run_summary(
             {"agent": s.get("agent"), "kind": s.get("kind"), "content": s.get("content")}
             for s in scratch[-10:]
         ],
-        "meta_feedback": state.get("meta_feedback") or [],
+        "meta_feedback": [str(item) for item in (state.get("meta_feedback") or [])],
         "error": terminal,
     }
     # Human paragraph for chat / notice banner
@@ -323,9 +359,14 @@ def build_run_summary(
 class CrossRunMemory:
     """Persists failures/rejections across runs for Topic Hunter / Planner."""
 
+    _instance: Optional["CrossRunMemory"] = None
+    _init_lock = threading.Lock()
+
     def __init__(self, path: Optional[str] = None):
-        self.path = Path(path or config.cross_run_memory_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with CrossRunMemory._init_lock:
+            self.path = Path(path or config.cross_run_memory_path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_lock = threading.Lock()
 
     def record(self, category: str, payload: Dict[str, Any]):
         entry = {
@@ -333,7 +374,8 @@ class CrossRunMemory:
             "category": category,
             **payload,
         }
-        _append_jsonl(str(self.path), entry)
+        with self._write_lock:
+            _append_jsonl(str(self.path), entry)
 
     def record_rejection(self, kind: str, item: str, reason: str, meta: Optional[Dict] = None):
         self.record(

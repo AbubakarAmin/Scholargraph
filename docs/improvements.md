@@ -1,4 +1,5 @@
 # ScholarGraph Hardening — Diagnostic Brief & Agent Implementation Prompt
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 This document is meant to be handed directly to your coding agent (Cursor or
 equivalent). Section 1 is the diagnosis. Section 2 is the prioritized fix

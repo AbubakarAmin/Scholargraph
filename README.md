@@ -1,4 +1,5 @@
 # ScholarGraph — Research-Grade Autonomous Multi-Agent Research System
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 <p align="left">
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />

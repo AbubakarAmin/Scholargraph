@@ -1,4 +1,9 @@
+## Module Overview
+
+Filesystem artifact serialization for completed research runs.
+
 # `core/artifacts.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

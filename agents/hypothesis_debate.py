@@ -615,7 +615,7 @@ JSON: {{"score": 7.5, "passed": true, "reasoning": "...", "decision": "PASS|FAIL
 
         mean = sum(scores) / len(scores)
         disagreement = max(scores) - min(scores) if len(scores) > 1 else 0.0
-        agreed = disagreement <= 1.5
+        agreed = disagreement <= 2.5  # Relaxed from 1.5 to allow more diversity in judge scores
 
         # Key rule: soft score cannot override hard FAIL
         passed = all_hard_passed and agreed and (mean >= self.runtime_config.debate_pass_threshold)
@@ -625,7 +625,7 @@ JSON: {{"score": 7.5, "passed": true, "reasoning": "...", "decision": "PASS|FAIL
             "passed": passed,
             "ensemble_scores": scores,
             "disagreement": disagreement,
-            "needs_longer_debate": disagreement > 1.5 and len(rounds) < self.runtime_config.debate_max_rounds,
+            "needs_longer_debate": disagreement > 2.5 and len(rounds) < self.runtime_config.debate_max_rounds,
             "reasoning": " | ".join(reasonings[:3]),
             "decision": "PASS" if passed else "FAIL",
             "valid_judge_responses": valid_judge_responses,

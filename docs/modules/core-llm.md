@@ -1,4 +1,10 @@
+## Module Overview
+
+Multi-provider LLM client: Gemini, OpenAI, and any OpenAI-compatible endpoint.
+Agents should use call_llm / generate_embedding / get_llm_client — not provider SDKs directly.
+
 # `core/llm.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

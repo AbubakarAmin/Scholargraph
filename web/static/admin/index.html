@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScholarGraph Control Deck</title>
+<link rel="stylesheet" href="/static/admin/admin.css">
+</head>
+<body>
+<div class="shell">
+<aside class="rail">
+  <div class="mark">ScholarGraph<span>research operations</span></div>
+  <div class="rail-label">Workspace</div>
+  <nav class="nav">
+    <button class="active" data-view="overview">Overview</button>
+    <button data-view="experiments">Experiments</button>
+    <button data-view="evidence">Evidence</button>
+    <button data-view="agents">Agents</button>
+    <button data-view="paper">Manuscript</button>
+  </nav>
+  <div class="rail-label">System</div>
+  <nav class="nav">
+    <button data-view="activity">Activity</button>
+    <button data-view="runs">Run history</button>
+    <button data-view="settings">Settings</button>
+  </nav>
+  <div class="rail-foot">Local control plane<br><span id="dbPath">Connecting...</span></div>
+</aside>
+
+<main class="main">
+<header class="topbar">
+  <h1 id="viewTitle">Run overview</h1>
+  <div class="run-state"><i id="pulse" class="pulse"></i><span id="runStatus">Idle</span><span id="runId"></span><button class="ghost" id="copyRunId" title="Copy run id" style="display:none">copy</button></div>
+  <button class="primary" id="startButton">Start run</button>
+</header>
+
+<div class="content">
+
+<section id="overview" class="view active">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">Control room</div>
+      <h2>Research run overview</h2>
+      <p class="sub" id="topicLine">No active research run.</p>
+    </div>
+    <div class="actions">
+      <button id="refreshButton">Refresh</button>
+      <button class="danger" id="resetOutputsButton">Reset outputs</button>
+      <button class="danger" id="resetCatalogButton">Reset dataset catalog</button>
+    </div>
+  </div>
+  <div class="grid">
+    <article class="card span-3"><div class="metric-label">Release readiness</div><div id="readiness" class="metric-value">Pending</div><div class="note" id="readinessNote">Waiting for evidence</div></article>
+    <article class="card span-3"><div class="metric-label">Current phase</div><div id="phaseMetric" class="metric-value">Idle</div><div class="note" id="phaseNote">No run selected</div></article>
+    <article class="card span-3"><div class="metric-label">Experiments</div><div id="experimentMetric" class="metric-value">0 / 0</div><div class="note" id="experimentNote">None planned</div></article>
+    <article class="card span-3"><div class="metric-label">Blocking findings</div><div id="findingMetric" class="metric-value">0</div><div class="note">Independent verifier</div></article>
+    <article class="card span-12">
+      <div class="card-head"><h3>Pipeline state</h3><span id="phaseTag" class="tag">idle</span></div>
+      <div id="phaseList" class="phase-list"></div>
+    </article>
+    <article class="card span-7">
+      <div class="card-head"><h3>Release gate</h3><span id="gateTag" class="tag warn">Incomplete</span></div>
+      <div id="gateRows"></div>
+    </article>
+    <article class="card span-5">
+      <div class="card-head"><h3>Experiment progress</h3><span class="tag">planned → ran</span></div>
+      <div id="expProgress" class="progress"></div>
+      <div id="expOverviewList" style="margin-top:14px"></div>
+    </article>
+    <article class="card span-7">
+      <div class="card-head"><h3>Latest activity</h3><span class="tag">live feed</span></div>
+      <div id="activity" class="scroll"></div>
+    </article>
+    <article class="card span-5">
+      <div class="card-head"><h3>Run snapshot</h3><span class="tag">signals</span></div>
+      <div id="snapshotRows"></div>
+    </article>
+  </div>
+</section>
+
+<section id="experiments" class="view">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">Execution</div>
+      <h2>Experiments</h2>
+      <p class="sub">What the plan listed, what executed, and what analysis recorded.</p>
+    </div>
+    <div class="actions"><button id="copyExpSummary">Copy summary</button></div>
+  </div>
+  <div class="grid">
+    <article class="card span-12">
+      <div class="card-head"><h3>Status board</h3><span id="expBoardTag" class="tag">0 listed</span></div>
+      <div id="expBoardHead" class="exp-head"><span>Experiment</span><span>Planned</span><span>Executed</span><span>Analyzed</span><span>Artifact</span></div>
+      <div id="expBoard" class="exp-board"></div>
+    </article>
+    <div id="expDetailGrid" class="span-12 grid" style="padding:0"></div>
+  </div>
+</section>
+
+<section id="evidence" class="view">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">Provenance</div>
+      <h2>Evidence and lineage</h2>
+      <p class="sub">Every conclusion should point back to immutable inputs.</p>
+    </div>
+  </div>
+  <div class="grid">
+    <article class="card span-8">
+      <div class="card-head"><h3>Claim lineage</h3><span class="tag">run scoped</span></div>
+      <div class="lineage"><b>Hypothesis</b><span>-></span><b>Dataset</b><span>-></span><b>Code</b><span>-></span><b>Execution</b><span>-></span><b>Analysis</b><span>-></span><b>Verification</b></div>
+      <div id="artifactTable" style="margin-top:18px"></div>
+    </article>
+    <article class="card span-4">
+      <div class="card-head"><h3>Verification findings</h3><span id="findingTag" class="tag">0</span></div>
+      <div id="findings"></div>
+    </article>
+    <article class="card span-6">
+      <div class="card-head"><h3>Dataset artifacts</h3><span class="tag">inputs</span></div>
+      <div id="datasetCards"></div>
+    </article>
+    <article class="card span-6">
+      <div class="card-head"><h3>Execution artifacts</h3><span class="tag">outputs</span></div>
+      <div id="execCards"></div>
+    </article>
+    <article class="card span-12">
+      <div class="card-head"><h3>Evidence trace</h3><span class="tag">durable ledger</span></div>
+      <div id="claims"></div>
+    </article>
+  </div>
+</section>
+
+<section id="agents" class="view">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">Permissions</div>
+      <h2>Agent registry</h2>
+      <p class="sub">Inspect what each role can access and mutate.</p>
+    </div>
+  </div>
+  <div id="agentGrid" class="grid"></div>
+</section>
+
+<section id="paper" class="view">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">Output</div>
+      <h2>Manuscript workspace</h2>
+      <p class="sub">Writing is downstream of evidence, not a substitute for it.</p>
+    </div>
+    <div class="actions"><button id="copyPaperBtn">Copy manuscript</button></div>
+  </div>
+  <div id="paperScores" class="progress" style="margin-bottom:16px"></div>
+  <div id="paperContent" class="paper"></div>
+</section>
+
+<section id="activity" class="view">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">Telemetry</div>
+      <h2>Activity and scratchpad</h2>
+      <p class="sub">Recent events and agent notes for the selected run.</p>
+    </div>
+  </div>
+  <div class="grid">
+    <article class="card span-7">
+      <div class="card-head"><h3>Event stream</h3><span class="tag">tail</span></div>
+      <div id="eventStream" class="scroll-lg"></div>
+    </article>
+    <article class="card span-5">
+      <div class="card-head"><h3>Scratchpad</h3><span class="tag">notes</span></div>
+      <div id="scratchpad" class="scroll-lg mono"></div>
+    </article>
+    <article class="card span-6">
+      <div class="card-head"><h3>Cross-run lessons</h3><span class="tag">memory</span></div>
+      <div id="crossRun"></div>
+    </article>
+    <article class="card span-6">
+      <div class="card-head"><h3>Debate / supervisor</h3><span class="tag">signals</span></div>
+      <div id="debateSnap"></div>
+    </article>
+  </div>
+</section>
+
+<section id="runs" class="view">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">History</div>
+      <h2>Run history</h2>
+      <p class="sub">Durable runs stored in the research ledger.</p>
+    </div>
+  </div>
+  <article class="card"><div id="runTable"></div></article>
+</section>
+
+<section id="settings" class="view">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">Runtime</div>
+      <h2>System settings</h2>
+      <p class="sub">All runtime fields are editable. Saving updates the live process, local keys store, and project .env.</p>
+    </div>
+  </div>
+  <div id="settingsTabs" class="actions" style="margin-bottom:16px"></div>
+  <article class="card">
+    <div id="settingsForm" class="form-grid"></div>
+    <div class="actions" style="margin-top:18px">
+      <button class="primary" id="saveSettings">Save settings</button>
+      <button id="testProvider">Test provider</button>
+      <span id="providerStatus" class="tag">Not tested</span>
+    </div>
+    <p class="note" id="settingsNote"></p>
+  </article>
+</section>
+
+</div>
+</main>
+</div>
+<div id="toast" class="toast"></div>
+
+<script src="/static/admin/admin.js"></script>
+</body>
+</html>

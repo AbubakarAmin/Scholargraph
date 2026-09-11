@@ -1,4 +1,10 @@
+## Module Overview
+
+SupervisorAgent — hard deterministic checks first, LLM soft review last.
+Citation grounding + statistical validity gate soft scores.
+
 # `agents/supervisor.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

@@ -1,4 +1,12 @@
+## Module Overview
+
+LangGraph graph construction for the ScholarGraph workflow.
+
+Node implementations remain injectable so the composition root can migrate
+without changing the state-machine behavior or public entry points.
+
 # `core/workflow.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

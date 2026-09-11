@@ -1,4 +1,10 @@
+## Module Overview
+
+Configuration module for the multi-agent research system.
+Handles environment variables, API keys, and system settings.
+
 # `core/config.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

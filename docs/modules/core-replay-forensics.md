@@ -1,4 +1,5 @@
 # Replay and Forensics
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 `core/replay.py` replays companion experiments in the sandbox or in a newly created clean virtual environment. The clean mode is invoked with `python replay_run.py PATH --clean-env`.
 

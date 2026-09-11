@@ -1,4 +1,5 @@
 # ScholarGraph Documentation
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 This folder documents the current codebase module by module. The project is a local, multi-agent research workflow that discovers topics, debates hypotheses, plans experiments, executes sandboxed code, verifies claims, and assembles a LaTeX paper.
 

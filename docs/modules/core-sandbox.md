@@ -1,4 +1,11 @@
+## Module Overview
+
+Restricted Python sandbox for Engineer experiments.
+Blocks exit(), subprocess, os.system, and other dangerous calls.
+Does NOT rely on the model behaving — AST + builtins lockdown.
+
 # `core/sandbox.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

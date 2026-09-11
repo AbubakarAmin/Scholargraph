@@ -42,7 +42,7 @@ class SandboxCapabilityManifest:
     """Shared execution limits used by planning, debate, and engineering."""
 
     max_wall_clock_seconds: int = 120
-    available_libraries: tuple[str, ...] = ("numpy", "scipy", "pandas", "sklearn")
+    available_libraries: tuple[str, ...] = ("numpy", "scipy", "pandas", "sklearn", "statsmodels")
     gpu_available: bool = False
     outbound_network: bool = False
     dataset_downloads: bool = False
@@ -69,7 +69,10 @@ SANDBOX_CAPABILITY_MANIFEST = SandboxCapabilityManifest()
 def check_plan_feasibility(plan: Mapping[str, Any], manifest: SandboxCapabilityManifest = SANDBOX_CAPABILITY_MANIFEST) -> List[str]:
     """Return blocking reasons before an experiment contract is committed."""
     errors: List[str] = []
-    plan_text = str(plan).lower()
+    # Exclude capability_manifest from the text scan — its own key names
+    # (e.g. "outbound_network") would false-positive on substring matching.
+    plan_for_text = {k: v for k, v in plan.items() if k != "capability_manifest"}
+    plan_text = str(plan_for_text).lower()
     if not manifest.dataset_downloads and any(token in plan_text for token in ("download", "internet", "outbound", "yahoo finance", "wikipedia traffic", "uci")):
         errors.append("plan requires outbound dataset access, which the sandbox forbids")
     if not manifest.gpu_available and any(token in plan_text for token in ("gpu", "cuda", "large language model fine-tune", "deep neural network")):

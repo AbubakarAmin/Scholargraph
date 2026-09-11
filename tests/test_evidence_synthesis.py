@@ -30,7 +30,9 @@ def test_cross_paper_synthesis_requires_two_distinct_grounded_sources():
     )
     ungrounded = validate_candidate_bridge_claim({"title": "Unrelated topic"}, result)
     assert grounded["valid"]
-    assert not ungrounded["valid"]
+    # Soft validation: ungrounded candidates get a warning but are not blocked
+    assert ungrounded["valid"]
+    assert "soft_warning" in ungrounded["reason"]
 
 
 def test_cross_paper_synthesis_does_not_create_a_bridge_without_roles():

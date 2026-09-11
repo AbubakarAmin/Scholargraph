@@ -1,4 +1,9 @@
+## Module Overview
+
+Shared execution service for CLI and web research runs.
+
 # `core/pipeline.py`
+![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
 
 ## Responsibility
 

@@ -1,19 +1,19 @@
 {
   "graph": {
-    "rating": 1480.6072624633398,
-    "raw_rating": 1461.2145249266798,
-    "observations": 8,
+    "rating": 1446.0715754538335,
+    "raw_rating": 1417.3097490292112,
+    "observations": 15,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-07T22:05:43.705970"
+    "updated_at": "2026-09-11T07:03:14.628916"
   },
   "general": {
-    "rating": 1349.8672774044198,
-    "raw_rating": 1336.061969579539,
-    "observations": 87,
+    "rating": 1212.060486495684,
+    "raw_rating": 1200.5429059555115,
+    "observations": 200,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-07T22:19:19.391437"
+    "updated_at": "2026-09-11T07:50:01.697770"
   },
   "vision": {
     "rating": 1500.0,
@@ -24,19 +24,19 @@
     "updated_at": null
   },
   "federated": {
-    "rating": 1500.0,
-    "raw_rating": 1500.0,
-    "observations": 1,
+    "rating": 1495.8371745800514,
+    "raw_rating": 1484.736306793522,
+    "observations": 3,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-07T16:36:20.407404"
+    "updated_at": "2026-09-11T06:19:11.020690"
   },
   "llm": {
-    "rating": 1498.2222222222222,
-    "raw_rating": 1484.0,
-    "observations": 1,
+    "rating": 1491.665120172558,
+    "raw_rating": 1469.4387739660467,
+    "observations": 3,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-07T22:04:59.602954"
+    "updated_at": "2026-09-10T21:26:24.378541"
   }
 }

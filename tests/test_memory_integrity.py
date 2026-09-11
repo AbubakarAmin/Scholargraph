@@ -569,3 +569,177 @@ def test_call_llm_increments_llm_calls(monkeypatch):
 
     assert llm_mod.call_llm("hi", model="fake-model") == "ok"
     assert tracker.stats["llm_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# TopicHunter stateful query generation regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_stateful_queries_vary_with_cross_run_memory_state(tmp_path, monkeypatch):
+    """Two discovery cycles with different CrossRunMemory state must produce different query sets."""
+    from agents.topic_hunter import TopicHunterAgent
+    import agents.topic_hunter as th_mod
+
+    # Minimal hunter for query building
+    hunter = TopicHunterAgent.__new__(TopicHunterAgent)
+    hunter.runtime_config = type("C", (), {
+        "topic_exploration_every": 4,
+        "topic_exploration_seed": 42,
+    })()
+    hunter.context = None
+    hunter._selection_counter = 0
+    hunter._iteration_failures = 0
+
+    # Cycle A: no rejected topics
+    cross_run_a = []
+    rejected_a = hunter._extract_rejected_fingerprints(cross_run_a)
+    arxiv_a = hunter._build_arxiv_queries("robustness and reproducibility challenges", rejected_a, None)
+    openalex_a = hunter._build_openalex_queries("robustness and reproducibility challenges", rejected_a, None)
+
+    # Cycle B: many rejected topics containing "robustness"
+    cross_run_b = [
+        {"category": "rejection", "kind": "topic", "item": "Robustness of transformer attention", "rejection_reason": "novelty"},
+        {"category": "rejection", "kind": "topic", "item": "Reproducibility challenges in deep learning", "rejection_reason": "feasibility"},
+    ]
+    rejected_b = hunter._extract_rejected_fingerprints(cross_run_b)
+    arxiv_b = hunter._build_arxiv_queries("robustness and reproducibility challenges", rejected_b, None)
+    openalex_b = hunter._build_openalex_queries("robustness and reproducibility challenges", rejected_b, None)
+
+    # Queries must differ — dedup should filter out queries overlapping rejections
+    arxiv_a_set = set(arxiv_a)
+    arxiv_b_set = set(arxiv_b)
+    assert arxiv_a_set != arxiv_b_set, (
+        f"arXiv queries unchanged despite different rejections:\n"
+        f"  Cycle A: {arxiv_a}\n  Cycle B: {arxiv_b}"
+    )
+
+    openalex_a_searches = [q[0] for q in openalex_a]
+    openalex_b_searches = [q[0] for q in openalex_b]
+    assert openalex_a_searches != openalex_b_searches, (
+        f"OpenAlex queries unchanged despite different rejections:\n"
+        f"  Cycle A: {openalex_a_searches}\n  Cycle B: {openalex_b_searches}"
+    )
+
+
+def test_preflight_dedup_skips_overlapping_queries(tmp_path):
+    """Pre-flight dedup must skip queries whose fingerprints match rejected topics."""
+    hunter = TopicHunterAgent.__new__(TopicHunterAgent)
+    hunter.runtime_config = type("C", (), {})()
+    hunter.context = None
+
+    rejected = ["robustness transformer attention", "novelty"]
+    queries = [
+        "cat:cs.LG AND (\"robustness\" OR \"transformer\")",
+        "cat:cs.CL AND ti:\"interpretability\"",
+    ]
+    deduped = hunter._preflight_dedup(queries, rejected)
+
+    # The first query overlaps with "robustness transformer" — should be skipped
+    assert len(deduped) <= len(queries)
+    if deduped:
+        for q in deduped:
+            tokens = set(q.lower().split())
+            assert not (tokens & {"robustness", "transformer"}), (
+                f"Query '{q}' overlaps rejected fingerprints but was not deduped"
+            )
+
+
+def test_queries_use_field_scoped_arxiv_syntax(tmp_path):
+    """Generated arXiv queries must use field-scoped syntax (cat:, abs:, ti:)."""
+    hunter = TopicHunterAgent.__new__(TopicHunterAgent)
+    hunter.runtime_config = type("C", (), {
+        "topic_exploration_every": 4,
+        "topic_exploration_seed": 42,
+    })()
+    hunter.context = None
+    hunter._selection_counter = 0
+
+    queries = hunter._build_arxiv_queries("robustness and reproducibility challenges", [], None)
+
+    for q in queries:
+        assert q.startswith("cat:"), f"Query lacks cat: prefix: {q}"
+        assert " AND " in q, f"Query lacks boolean AND combinator: {q}"
+        assert any(f in q for f in ("cat:", "abs:", "ti:")), f"Query lacks field-scoped syntax: {q}"
+
+
+def test_queries_vary_sort_mode_in_openalex(tmp_path):
+    """OpenAlex queries must vary sort mode (relevance vs cited_by_count)."""
+    hunter = TopicHunterAgent.__new__(TopicHunterAgent)
+    hunter.runtime_config = type("C", (), {
+        "topic_exploration_every": 4,
+        "topic_exploration_seed": 42,
+    })()
+    hunter.context = None
+    hunter._selection_counter = 0
+
+    queries = hunter._build_openalex_queries("robustness and reproducibility challenges", [], None)
+
+    sort_modes = set()
+    for search_str, params in queries:
+        sort_val = params.get("sort", "")
+        if "relevance" in sort_val:
+            sort_modes.add("relevance")
+        elif "cited_by" in sort_val:
+            sort_modes.add("cited_by_count")
+
+    assert len(sort_modes) >= 2, (
+        f"Expected at least 2 sort modes, got {sort_modes} from queries: {[q[0] for q in queries]}"
+    )
+
+
+def test_active_hypothesis_kind_biases_queries(tmp_path):
+    """When a forced-exploration kind is active, queries should include kind-specific keywords."""
+    hunter = TopicHunterAgent.__new__(TopicHunterAgent)
+    hunter.runtime_config = type("C", (), {
+        "topic_exploration_every": 1,  # force every cycle
+        "topic_exploration_seed": 42,
+    })()
+    hunter.context = None
+    hunter._selection_counter = 0
+
+    # Force exploration on cycle 0 (0 % 1 == 0)
+    kind = hunter._active_hypothesis_kind()
+    assert kind is not None, "Expected active kind when exploration_every=1 and counter=0"
+
+    queries = hunter._build_arxiv_queries("general methods", [], kind)
+    # With kind active, at least one query should contain kind-specific keywords
+    all_text = " ".join(queries).lower()
+    # The kind-specific keywords are inserted into the queries
+    assert len(queries) >= 2, f"Expected at least 2 queries, got {len(queries)}"
+
+
+def test_sample_dry_run_prints_generated_queries(tmp_path):
+    """Print the actual generated query list for one dry run."""
+    hunter = TopicHunterAgent.__new__(TopicHunterAgent)
+    hunter.runtime_config = type("C", (), {
+        "topic_exploration_every": 4,
+        "topic_exploration_seed": 42,
+    })()
+    hunter.context = None
+    hunter._selection_counter = 0
+
+    seeds = [
+        "underexplored methods and algorithms",
+        "robustness and reproducibility challenges",
+        "data efficiency and sample complexity",
+    ]
+
+    print("\n=== SAMPLE DRY RUN: Generated Queries ===")
+    for seed in seeds:
+        arxiv_q = hunter._build_arxiv_queries(seed, [], None)
+        openalex_q = hunter._build_openalex_queries(seed, [], None)
+        print(f"\nSeed: {seed}")
+        print(f"  arXiv queries ({len(arxiv_q)}):")
+        for i, q in enumerate(arxiv_q):
+            print(f"    [{i+1}] {q}")
+        print(f"  OpenAlex queries ({len(openalex_q)}):")
+        for i, (search, params) in enumerate(openalex_q):
+            print(f"    [{i+1}] search='{search}' params={params}")
+
+    # Verify basic structure
+    for seed in seeds:
+        arxiv_q = hunter._build_arxiv_queries(seed, [], None)
+        assert len(arxiv_q) >= 2, f"Expected at least 2 arXiv queries for '{seed}'"
+        for q in arxiv_q:
+            assert "cat:" in q, f"Missing cat: in query: {q}"

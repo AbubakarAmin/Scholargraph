@@ -4,12 +4,14 @@ TopicHunterAgent — citation-graph gap analysis, novelty filter, parallel hunts
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import arxiv
 import numpy as np
@@ -30,6 +32,47 @@ from core.evidence_synthesis import build_cross_paper_evidence_map, validate_can
 
 
 _FAILED_TOPIC_OVERLAP_THRESHOLD = 0.55
+
+_ARXIV_CATEGORIES = {
+    "machine_learning": ["cs.LG", "stat.ML"],
+    "natural_language_processing": ["cs.CL", "cs.AI"],
+    "computer_vision": ["cs.CV", "cs.AI"],
+    "reinforcement_learning": ["cs.LG", "cs.AI"],
+    "graph_neural_networks": ["cs.LG", "cs.SI"],
+    "fairness": ["cs.LG", "cs.CY"],
+    "federated_learning": ["cs.LG", "cs.DC"],
+    "optimization": ["math.OC", "cs.LG"],
+    "general": ["cs.LG", "cs.AI", "cs.CL", "cs.CV", "stat.ML"],
+}
+
+_TOPICS_TO_SUBCATEGORY = {
+    "attention": "machine_learning",
+    "graph": "graph_neural_networks",
+    "diffusion": "machine_learning",
+    "reinforcement": "reinforcement_learning",
+    "federated": "federated_learning",
+    "llm": "natural_language_processing",
+    "vision": "computer_vision",
+    "nlp": "natural_language_processing",
+    "general": "general",
+}
+
+_QUERY_STOPWORDS = frozenset({
+    "and", "for", "the", "are", "but", "not", "with", "this", "that", "from",
+    "have", "has", "was", "were", "been", "being", "can", "may", "its", "our",
+})
+
+_EXPLORATION_KIND_BIASES = {
+    "attention": {"method": ["transformer", "self-attention", "multi-head"], "evaluation": ["efficiency", "scaling", "long-context"]},
+    "graph": {"method": ["graph neural", "message passing", "spectral"], "evaluation": ["inductive", "scalability", "heterogeneous"]},
+    "diffusion": {"method": ["diffusion model", "score-based", "denoising"], "evaluation": ["sample quality", "convergence", "likelihood"]},
+    "reinforcement": {"method": ["reinforcement learning", "policy gradient", "temporal difference"], "evaluation": ["sample efficiency", "exploration", "stability"]},
+    "federated": {"method": ["federated", "distributed optimization", "privacy"], "evaluation": ["communication efficiency", "convergence", "non-IID"]},
+    "llm": {"method": ["language model", "fine-tuning", "prompt"], "evaluation": ["zero-shot", "reasoning", "alignment"]},
+    "vision": {"method": ["visual", "image", "spatial"], "evaluation": ["detection", "segmentation", "recognition"]},
+    "nlp": {"method": ["text", "sequence", "tokeniz"], "evaluation": ["classification", "generation", "extraction"]},
+    "general": {"method": ["learning", "optimization", "generalization"], "evaluation": ["accuracy", "robustness", "scalability"]},
+}
 
 
 class ResearchSourceUnavailable(RuntimeError):
@@ -69,7 +112,7 @@ class TopicHunterAgent:
     def _source_failed(self, name: str, error: Exception):
         self.source_health[name] = {"ok": False, "error": str(error)}
 
-    def search_openalex(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def search_openalex(self, query: str, limit: int = 50, extra_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         try:
             url = f"{self.base_urls['openalex']}/works"
             params = {
@@ -80,6 +123,8 @@ class TopicHunterAgent:
                 "select": "id,title,abstract_inverted_index,publication_year,cited_by_count,concepts,type,doi",
                 "mailto": self.runtime_config.openalex_email,
             }
+            if extra_params:
+                params.update(extra_params)
             artifact = self.source_client.fetch_json(
                 "openalex",
                 url,
@@ -129,6 +174,276 @@ class TopicHunterAgent:
             self._source_failed("arxiv", e)
             log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e)})
             return []
+
+    def search_openalex_multi(self, queries: List[Tuple[str, Dict[str, Any]]], limit: int = 30) -> List[Dict[str, Any]]:
+        """Run multiple OpenAlex queries with optional extra params and merge results."""
+        all_results = []
+        for query, params in queries:
+            all_results.extend(self.search_openalex(query, limit, extra_params=params))
+        return all_results
+
+    def search_arxiv_multi(self, queries: List[str], max_results: int = 30) -> List[Dict[str, Any]]:
+        """Run multiple arXiv queries and merge results."""
+        all_results = []
+        for query in queries:
+            all_results.extend(self.search_arxiv(query, max_results))
+        return all_results
+
+    def _extract_rejected_fingerprints(self, cross_run_context: List[Dict[str, Any]]) -> List[str]:
+        """Extract keyword fingerprints from rejected-topic items in CrossRunMemory.
+
+        Only uses structured tags (rejection_reason, item title) — never raw
+        free-text rejection reasons, consistent with the fail-closed memory policy.
+        """
+        fingerprints = []
+        for entry in cross_run_context:
+            item = str(entry.get("item") or "").strip()
+            tag = str(entry.get("rejection_reason") or "").strip()
+            if item:
+                words = re.findall(r"[a-z][a-z0-9_-]{2,}", item.lower())
+                fingerprints.append(" ".join(words[:5]))
+            if tag and tag not in ("other",):
+                fingerprints.append(tag)
+        return fingerprints
+
+    def _active_hypothesis_kind(self) -> Optional[str]:
+        """Return the forced-exploration hypothesis kind if one is active this cycle, else None."""
+        cfg = getattr(self, "runtime_config", None)
+        every = max(1, int(getattr(cfg, "topic_exploration_every", 4) if cfg is not None else 4))
+        if hasattr(self, "_selection_counter") and (self._selection_counter % every) == 0:
+            try:
+                elo = EloStore(context=getattr(self, "context", None))
+                all_kinds = list(_TOPICS_TO_SUBCATEGORY.keys())
+                under = elo.under_observed_kinds(all_kinds)
+                if under:
+                    return random.choice(under)
+            except Exception:
+                pass
+        return None
+
+    def _generate_dynamic_seeds(
+        self,
+        n_seeds: int = 5,
+        cross_run_context: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[str]:
+        """Generate fresh seed phrases from current state instead of a static bank.
+
+        Uses structured CrossRunMemory tags (fail-closed) to:
+        - Pivot away from rejected topic areas
+        - Bias toward underexplored hypothesis kinds
+        - Combine method + evaluation signals from the kind bias tables
+        """
+        if cross_run_context is None:
+            cross_run_context = CrossRunMemory().get_prompt_context()
+        # Cap to last 20 rejections to prevent seed starvation from full history
+        if len(cross_run_context) > 20:
+            cross_run_context = cross_run_context[-20:]
+
+        rejected_tokens: set = set()
+        for entry in cross_run_context:
+            item = str(entry.get("item") or "").lower()
+            tag = str(entry.get("rejection_reason") or "")
+            if item:
+                rejected_tokens.update(w for w in re.findall(r"[a-z][a-z0-9_-]{2,}", item) if len(w) > 3)
+            if tag and tag not in ("other",):
+                rejected_tokens.add(tag)
+
+        active_kind = self._active_hypothesis_kind()
+
+        seeds: List[str] = []
+
+        # 1. Seeds from underexplored hypothesis kinds (avoid rejected areas)
+        for kind, biases in _EXPLORATION_KIND_BIASES.items():
+            method_terms = biases.get("method", [])
+            eval_terms = biases.get("evaluation", [])
+            if not method_terms or not eval_terms:
+                continue
+            method = method_terms[0]
+            evaluation = eval_terms[0]
+            kind_words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", f"{method} {evaluation}"))
+            if kind_words & rejected_tokens:
+                continue
+            seeds.append(f"{method} {evaluation} open problems")
+
+        # 2. Extra seeds biased toward the active exploration kind
+        if active_kind and active_kind in _EXPLORATION_KIND_BIASES:
+            biases = _EXPLORATION_KIND_BIASES[active_kind]
+            for method_term in biases.get("method", [])[:2]:
+                for eval_term in biases.get("evaluation", [])[:1]:
+                    candidate = f"{method_term} {eval_term} underexplored challenges"
+                    candidate_words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", candidate))
+                    if not (candidate_words & rejected_tokens):
+                        seeds.append(candidate)
+
+        # 3. Generic fallback seeds that avoid rejected keyword areas
+        generic_seeds = [
+            "methodological gaps in evaluation",
+            "cross-domain transfer limitations",
+            "sample efficiency and data requirements",
+            "robustness under distribution shift",
+            "reproducibility and reporting standards",
+            "interpretability for decision support",
+            "scalability and computational limits",
+            "edge cases and failure mode analysis",
+        ]
+        for s in generic_seeds:
+            s_words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", s.lower()))
+            if not (s_words & rejected_tokens):
+                seeds.append(s)
+
+        # Deduplicate preserving order
+        seen: set = set()
+        unique: List[str] = []
+        for s in seeds:
+            if s not in seen:
+                seen.add(s)
+                unique.append(s)
+
+        return unique[:n_seeds]
+
+    def _build_arxiv_queries(
+        self,
+        seed_hint: str,
+        rejected_fingerprints: List[str],
+        active_kind: Optional[str] = None,
+    ) -> List[str]:
+        """Build 2-4 field-scoped arXiv boolean queries.
+
+        Uses cat:, abs:, ti: combinators instead of prose strings.
+        Varies subcategory and sort mode.  Biases toward underexplored
+        hypothesis kinds when one is active for this cycle.  Excludes
+        keywords matching recently rejected fingerprints.
+        """
+        seed_lower = seed_hint.lower()
+        keywords = [w for w in re.findall(r"[a-z][a-z0-9_-]{2,}", seed_lower) if len(w) > 2 and w not in _QUERY_STOPWORDS][:3]
+
+        # De-prioritize keywords that match rejected fingerprints
+        if rejected_fingerprints:
+            rejected_tokens = set()
+            for fp in rejected_fingerprints:
+                rejected_tokens.update(re.findall(r"[a-z][a-z0-9_-]{2,}", fp.lower()))
+            keywords = [kw for kw in keywords if kw not in rejected_tokens]
+            if not keywords:
+                # Anchor terms always survive: drop rejected_tokens filter to prevent starvation
+                all_seed_words = [w for w in re.findall(r"[a-z][a-z0-9_-]{2,}", seed_lower)
+                                  if w not in _QUERY_STOPWORDS and len(w) > 2]
+                keywords = all_seed_words[:2]
+        keywords = keywords[:3]
+
+        if active_kind and active_kind in _TOPICS_TO_SUBCATEGORY:
+            subcat_label = _TOPICS_TO_SUBCATEGORY[active_kind]
+        else:
+            subcat_label = "general"
+        categories = _ARXIV_CATEGORIES.get(subcat_label, _ARXIV_CATEGORIES["general"])
+
+        queries = []
+        for cat in categories[:2]:
+            if len(keywords) >= 2:
+                kw_str = " OR ".join(f'"{kw}"' for kw in keywords[:2])
+                queries.append(f"cat:{cat} AND ({kw_str})")
+            if len(keywords) >= 1:
+                queries.append(f"cat:{cat} AND ti:{keywords[0]}")
+        if not queries and keywords:
+            queries.append(f"cat:{categories[0]} AND abs:{keywords[0]}")
+
+        # When an exploration kind is active, add one cross-pollination query
+        # that pairs the kind's primary method term with the seed's first keyword.
+        # This does NOT overwrite the seed's own keywords — it adds diversity.
+        if active_kind and active_kind in _EXPLORATION_KIND_BIASES and keywords:
+            biases = _EXPLORATION_KIND_BIASES[active_kind]
+            kind_method = biases.get("method", [""])[0]
+            seed_anchor = keywords[0]
+            if kind_method and kind_method != seed_anchor:
+                cross_q = f"cat:{categories[0]} AND abs:{kind_method} AND abs:{seed_anchor}"
+                if cross_q not in queries:
+                    queries.append(cross_q)
+
+        return queries[:4]
+
+    def _build_openalex_queries(
+        self,
+        seed_hint: str,
+        rejected_fingerprints: List[str],
+        active_kind: Optional[str] = None,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Build 2-4 OpenAlex structured queries with filter params.
+
+        Returns list of (search_query_string, extra_filter_params) tuples.
+        Varies sort mode (relevance vs recency).  Biases toward underexplored
+        hypothesis kinds when one is active.  Excludes keywords matching
+        recently rejected fingerprints.
+        """
+        seed_lower = seed_hint.lower()
+        keywords = [w for w in re.findall(r"[a-z][a-z0-9_-]{2,}", seed_lower) if len(w) > 2 and w not in _QUERY_STOPWORDS][:3]
+
+        # De-prioritize keywords that match rejected fingerprints
+        if rejected_fingerprints:
+            rejected_tokens = set()
+            for fp in rejected_fingerprints:
+                rejected_tokens.update(re.findall(r"[a-z][a-z0-9_-]{2,}", fp.lower()))
+            keywords = [kw for kw in keywords if kw not in rejected_tokens]
+            if not keywords:
+                # Anchor terms always survive: drop rejected_tokens filter to prevent starvation
+                all_seed_words = [w for w in re.findall(r"[a-z][a-z0-9_-]{2,}", seed_lower)
+                                  if w not in _QUERY_STOPWORDS and len(w) > 2]
+                keywords = all_seed_words[:2]
+        keywords = keywords[:3]
+
+        queries = []
+        if keywords:
+            search_str = " ".join(keywords[:3])
+            queries.append((search_str, {"sort": "relevance_score:desc"}))
+            recent_year = max(2020, datetime.now().year - 2)
+            queries.append((search_str, {"filter": f"publication_year:>{recent_year}", "sort": "cited_by_count:desc"}))
+            if len(keywords) >= 2:
+                alt_str = " ".join(keywords[:2])
+                queries.append((alt_str, {"sort": "relevance_score:desc"}))
+            # Cross-pollination: one query pairing the kind's method term with the seed's anchor
+            if active_kind and active_kind in _EXPLORATION_KIND_BIASES:
+                kind_biases = _EXPLORATION_KIND_BIASES.get(active_kind, {})
+                kind_method = kind_biases.get("method", [""])[0]
+                seed_anchor = keywords[0]
+                if kind_method and kind_method != seed_anchor:
+                    cross_search = f"{kind_method} {seed_anchor}"
+                    queries.append((cross_search, {"sort": "relevance_score:desc"}))
+
+        return queries[:4]
+
+    def _preflight_dedup(
+        self,
+        queries: List[str],
+        rejected_fingerprints: List[str],
+    ) -> List[str]:
+        """Skip or mutate queries whose keyword/category signature overlaps recent rejections.
+
+        Uses structured fingerprints (keyword n-grams from rejected titles and
+        rejection_reason tags) — never raw free-text rejection prose.
+        Returns the filtered list and logs skipped queries.
+        """
+        if not rejected_fingerprints:
+            return queries
+
+        def _extract_fingerprint(query: str) -> set:
+            words = re.findall(r"[a-z][a-z0-9_-]{2,}", query.lower())
+            return set(w for w in words if w not in {"cat", "abs", "ti", "cs", "stat"})
+
+        rejected_tokens = set()
+        for fp in rejected_fingerprints:
+            rejected_tokens.update(_extract_fingerprint(fp))
+
+        deduped = []
+        for q in queries:
+            q_tokens = _extract_fingerprint(q)
+            overlap = q_tokens & rejected_tokens
+            if len(overlap) >= 2 and len(overlap) / max(len(q_tokens), 1) > 0.6:
+                log_agent_action("TopicHunter", "preflight_dedup_skip", {
+                    "query": q,
+                    "overlap_tokens": sorted(overlap),
+                    "reason": "query_fingerprint_matches_rejected_topic",
+                })
+                continue
+            deduped.append(q)
+        return deduped
 
     def fetch_citation_graph(self, paper_id: str) -> Dict[str, Any]:
         """
@@ -194,6 +509,7 @@ class TopicHunterAgent:
         nearest = None
         high_overlap_papers = []
 
+        comparison_trigger = min(0.70, self.runtime_config.novelty_similarity_reject - 0.05)
         for paper in abstracts[:30]:
             abs_text = paper.get("abstract") if isinstance(paper, dict) else str(paper)
             if not abs_text:
@@ -206,7 +522,7 @@ class TopicHunterAgent:
             if sim > best_sim:
                 best_sim = sim
                 nearest = abs_text[:200]
-            if sim >= 0.70:
+            if sim >= comparison_trigger:
                 high_overlap_papers.append({
                     "paper": paper if isinstance(paper, dict) else {"title": "Prior Paper", "abstract": abs_text},
                     "similarity": sim,
@@ -275,7 +591,8 @@ Return JSON:
                         is_duplicate = True
                     break
 
-        reject = is_duplicate or (best_sim >= self.runtime_config.novelty_similarity_reject and not comparisons)
+        reject_threshold = max(self.runtime_config.novelty_similarity_reject, comparison_trigger)
+        reject = is_duplicate or (best_sim >= reject_threshold and not comparisons)
         return {
             "max_similarity": best_sim,
             "reject": reject,
@@ -418,8 +735,12 @@ Return JSON:
         gap_report: Dict[str, Any],
         novelty_report: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """Hypothesis Formalizer: converts candidate into a machine-checkable StructuredHypothesis."""
-        prompt = f"""
+        """Hypothesis Formalizer: converts candidate into a machine-checkable StructuredHypothesis.
+
+        Uses up to 3 attempts: the first generates from scratch, subsequent attempts
+        repair specific missing fields from the previous partial response.
+        """
+        base_prompt = f"""
 Formalize this candidate research question into a precise, machine-checkable scientific hypothesis contract.
 
 Candidate:
@@ -473,16 +794,36 @@ Return JSON:
   }}
 }}
 """
-        for attempt in range(2):
-            raw = call_llm(prompt, temperature=0.3, tier="strong")
+        required_fields = ["hypothesis", "falsification_condition", "dependent_variables", "research_question"]
+        previous_response = None
+        missing_fields = None
+
+        for attempt in range(3):
+            if attempt == 0:
+                raw = call_llm(base_prompt, temperature=0.3, tier="strong")
+            else:
+                repair_prompt = f"""Your previous hypothesis formalization was incomplete.
+Previous response:
+{json.dumps(previous_response, indent=2, default=str)[:3000]}
+
+Missing or invalid fields: {', '.join(missing_fields or required_fields)}
+
+Fix ONLY the missing/invalid fields. Return the complete JSON with all fields populated.
+Requirements:
+- hypothesis: a clear testable statement
+- falsification_condition: what observation would reject the claim
+- dependent_variables: list of measurable metrics
+- research_question: the precise question being answered
+"""
+                raw = call_llm(repair_prompt, temperature=0.2, tier="strong")
+
             parsed = parse_json_from_llm(raw) or {}
-            if isinstance(parsed, dict) and parsed.get("hypothesis") and parsed.get("falsification_condition"):
-                # Validate mandatory fields
-                if (
-                    parsed.get("dependent_variables")
-                    and parsed.get("falsification_condition")
-                    and parsed.get("research_question")
-                ):
+            previous_response = parsed
+
+            if isinstance(parsed, dict):
+                missing_fields = [f for f in required_fields if not parsed.get(f)]
+                has_mve = isinstance(parsed.get("minimum_viable_experiment"), dict)
+                if not missing_fields and has_mve:
                     parsed["gap_report"] = gap_report
                     parsed["novelty_report"] = novelty_report
                     return parsed
@@ -503,10 +844,19 @@ Return JSON:
             "robot hardware",
             "million parameter training from scratch",
         ]
+        negation_re = re.compile(
+            r"(?:not|no|without|does not (?:require|need)|avoids?|never)(?:\s|$)", re.IGNORECASE
+        )
         for b in blocked:
-            if b in text:
+            idx = text.find(b)
+            while idx != -1:
+                window = text[max(0, idx - 50):idx]
+                if negation_re.search(window):
+                    idx = text.find(b, idx + 1)
+                    continue
                 ok = False
                 reasons.append(f"Not executable in sandbox: {b}")
+                break
         feas = topic.get("feasibility", 5)
         if isinstance(feas, (int, float)) and feas < 3:
             ok = False
@@ -573,14 +923,36 @@ Return JSON:
         return None
 
     def _hunt_once(self, domain: str, seed_hint: str) -> List[Dict[str, Any]]:
-        lessons = json.dumps(CrossRunMemory().get_prompt_context(), sort_keys=True)
+        cross_run_context = CrossRunMemory().get_prompt_context()
         excluded = self._excluded_titles()
-        # Adaptive: search more papers as failures increase
+        rejected_fingerprints = self._extract_rejected_fingerprints(cross_run_context)
+        active_kind = self._active_hypothesis_kind()
+
+        arxiv_queries = self._build_arxiv_queries(seed_hint, rejected_fingerprints, active_kind)
+        openalex_queries = self._build_openalex_queries(seed_hint, rejected_fingerprints, active_kind)
+        openalex_searches = [q[0] for q in openalex_queries]
+        openalex_extra_params = [q[1] for q in openalex_queries]
+
+        arxiv_queries = self._preflight_dedup(arxiv_queries, rejected_fingerprints)
+        openalex_searches = self._preflight_dedup(openalex_searches, rejected_fingerprints)
+
+        if not arxiv_queries and not openalex_searches:
+            log_agent_action("TopicHunter", "seed_skipped_no_queries", {
+                "seed": seed_hint,
+                "reason": "all_keywords_filtered_by_rejected_fingerprints",
+                "rejected_fingerprints_count": len(rejected_fingerprints),
+            })
+            return []
+
         base_limit = 40
         extra = min(self._iteration_failures * 10, 30)
         search_limit = base_limit + extra
-        recent_papers = self.search_openalex(f"{domain} {seed_hint}", search_limit)
-        recent_papers.extend(self.search_arxiv(f"{domain} {seed_hint}", min(search_limit, 30)))
+
+        recent_papers = []
+        for i, query in enumerate(openalex_searches):
+            extra_params = openalex_extra_params[i] if i < len(openalex_extra_params) else {}
+            recent_papers.extend(self.search_openalex(query, search_limit, extra_params=extra_params))
+        recent_papers.extend(self.search_arxiv_multi(arxiv_queries, min(search_limit, 30)))
         if not recent_papers:
             return []
 
@@ -602,7 +974,7 @@ Return JSON:
 Find research GAPS (not trendy saturated topics) in {domain}.
 Seed angle: {seed_hint}
 Prior-run lessons (avoid repeats):
-{lessons}
+{json.dumps(cross_run_context, sort_keys=True)}
 
 Topics already rejected or that FAILED hypothesis debate (do NOT propose these or near-duplicates):
 {json.dumps(excluded[-25:], indent=2)}
@@ -619,7 +991,7 @@ Sample recent titles:
 {[p.get('title', '')[:100] for p in recent_papers[:8]]}
 
 A real gap: foundational work is cited but rarely extended lately.
-Propose 3 topics executable with CPU sklearn/numpy synthetic or small public data.
+Propose 5-6 topics executable with CPU sklearn/numpy synthetic or small public data.
 For each topic include an explicit "contribution" sentence for novelty checking.
 
 For every proposed topic, include `evidence_bridge_ids` containing the bridge IDs
@@ -630,6 +1002,26 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
 """
         parsed = parse_json_from_llm(call_llm(prompt, temperature=0.8, tier="cheap")) or {}
         gaps = parsed.get("gaps") or []
+
+        # Cheap pre-filter: reject candidates with no textual overlap with retrieved literature
+        literature_text = " ".join(
+            (p.get("title", "") + " " + p.get("abstract", "")[:500]).lower()
+            for p in recent_papers[:15]
+        )
+        pre_filtered = []
+        for gap in gaps:
+            gap_text = f"{gap.get('title', '')} {gap.get('description', '')}".lower()
+            gap_words = set(re.findall(r"[a-z][a-z0-9_-]{3,}", gap_text))
+            lit_words = set(re.findall(r"[a-z][a-z0-9_-]{3,}", literature_text))
+            overlap = gap_words & lit_words
+            if len(overlap) >= 2:
+                pre_filtered.append(gap)
+            else:
+                self._reject(gap, "no_literature_grounding", {
+                    "lesson_type": "pre_filter_rejection",
+                    "reason_code": "zero_literature_overlap",
+                })
+        gaps = pre_filtered
 
         kept = []
         for gap in gaps:
@@ -745,18 +1137,8 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
         self._excluded_titles_cache = None
         domain = domain or self.runtime_config.research_domain
         log_agent_action("TopicHunter", "start_discovery", {"domain": domain, "parallel": n_parallel})
-        seeds = [
-            "underexplored methods and algorithms",
-            "evaluation methodology gaps and benchmarks",
-            "robustness and reproducibility challenges",
-            "cross-domain transfer and adaptation",
-            "data efficiency and sample complexity",
-            "interpretability and explainability gaps",
-            "fairness bias and ethics in algorithms",
-            "scalability and distributed computing limits",
-            "edge cases failure modes and adversarial robustness",
-            "reproducibility of classical ML pipelines",
-        ][:n_parallel]
+        cross_run_context = CrossRunMemory().get_prompt_context()
+        seeds = self._generate_dynamic_seeds(n_parallel, cross_run_context)
 
         all_topics: List[Dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=n_parallel) as pool:
@@ -774,7 +1156,6 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 "Check network access and OPENALEX_EMAIL, then try again. Details: " + details
             )
 
-        # Deduplicate by title
         seen = set()
         unique = []
         for t in all_topics:
@@ -783,17 +1164,122 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 seen.add(title)
                 unique.append(t)
 
+        # Second-pass targeted retrieval from top bridge candidates
+        if unique:
+            evidence_map = build_cross_paper_evidence_map(unique)
+            bridges = evidence_map.get("bridges", [])
+            top_bridges = [b for b in bridges if b.get("method_signal") and b.get("target_setting_signal")][:3]
+            if top_bridges:
+                second_pass_topics = self._execute_second_pass(top_bridges, domain)
+                for t in second_pass_topics:
+                    title = (t.get("title") or "").lower().strip()
+                    if title and title not in seen:
+                        seen.add(title)
+                        unique.append(t)
+
+        # Rejection funnel instrumentation: aggregate by reason code
+        funnel = {}
+        for entry in self.rejection_log:
+            reason = entry.get("reason", "unknown")
+            funnel[reason] = funnel.get(reason, 0) + 1
+        log_agent_action("TopicHunter", "rejection_funnel", {
+            "funnel": funnel,
+            "total_rejected": len(self.rejection_log),
+            "total_kept": len(unique),
+            "pass_rate": round(len(unique) / max(len(unique) + len(self.rejection_log), 1), 3),
+        })
+
         ranked = self.rank_topics_by_potential(unique)
         log_agent_action("TopicHunter", "discovery_complete", {
             "num_topics": len(ranked),
             "rejected": len(self.rejection_log),
         })
-        # Track failure count for adaptive behavior
         if not ranked:
             self._iteration_failures += 1
         else:
             self._iteration_failures = 0
         return ranked
+
+    def _execute_second_pass(self, top_bridges: List[Dict[str, Any]], domain: str) -> List[Topic]:
+        """Execute a narrower second-pass retrieval seeded from top bridge candidates.
+
+        Uses bridge method/setting signals to build targeted queries before
+        final novelty/feasibility scoring.
+        """
+        second_pass_queries = []
+        for bridge in top_bridges:
+            method_signal = str(bridge.get("method_signal", "")).strip()
+            setting_signal = str(bridge.get("target_setting_signal", "")).strip()
+            if method_signal:
+                second_pass_queries.append(f"cat:cs.LG AND abs:{method_signal}")
+            if setting_signal and method_signal:
+                second_pass_queries.append(f"cat:cs.LG AND abs:{method_signal} AND abs:{setting_signal}")
+
+        if not second_pass_queries:
+            return []
+
+        second_pass_papers = self.search_arxiv_multi(second_pass_queries[:4], 20)
+        if not second_pass_papers:
+            return []
+
+        second_pass_papers = [p for p in second_pass_papers if p.get("title") and p.get("abstract")][:15]
+        if not second_pass_papers:
+            return []
+
+        prompt = f"""
+Given these bridge candidates from a cross-paper evidence map, propose 1-2 research gaps
+that synthesize across the method/setting signals. Be specific and grounded in the paper evidence.
+
+Bridge candidates:
+{json.dumps([{
+    'method_signal': b.get('method_signal'),
+    'target_setting_signal': b.get('target_setting_signal'),
+    'evidence': b.get('evidence', [])[:2],
+} for b in top_bridges[:3]], indent=2)[:4000]}
+
+Sample titles from targeted retrieval:
+{[p.get('title', '')[:100] for p in second_pass_papers[:8]]}
+
+For each topic include an explicit "contribution" sentence for novelty checking.
+JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "impact": "...",
+"feasibility": 7, "keywords": [], "anchor_paper": "...", "dataset_plan": "synthetic|public",
+"evidence_bridge_ids": []}}]}}
+"""
+        parsed = parse_json_from_llm(call_llm(prompt, temperature=0.7, tier="cheap")) or {}
+        gaps = parsed.get("gaps") or []
+
+        kept = []
+        for gap in gaps[:2]:
+            gap["literature_evidence"] = [
+                {"title": p.get("title", ""), "abstract": p.get("abstract", "")[:3000],
+                 "doi": p.get("doi"), "arxiv_id": p.get("arxiv_id")}
+                for p in second_pass_papers[:6]
+                if p.get("title") and p.get("abstract")
+            ]
+            prior = self._matches_excluded_topic(gap.get("title", ""))
+            if prior:
+                self._reject(gap, "previously_failed_or_rejected", {"matched": prior})
+                continue
+            novelty_eval = self.evaluate_layered_novelty(gap, gap.get("literature_evidence", []))
+            gap["novelty"] = novelty_eval
+            if novelty_eval.get("reject"):
+                self._reject(gap, "novelty_too_low", {
+                    "lesson_type": "novelty_failure",
+                    "reason_code": "existing_contribution_overlap",
+                    "verdict": novelty_eval.get("verdict", "LIKELY_DUPLICATE"),
+                })
+                continue
+            feas = self.feasibility_filter(gap)
+            gap["feasibility_check"] = feas
+            if not feas["ok"]:
+                self._reject(gap, "infeasible_for_engineer", {
+                    "lesson_type": "feasibility_failure",
+                    "reason_code": "sandbox_capability_violation",
+                    "reasons": feas.get("reasons", []),
+                })
+                continue
+            kept.append(gap)
+        return kept
 
     def rank_topics_by_potential(self, topics: List[Topic]) -> List[Topic]:
         if not topics:

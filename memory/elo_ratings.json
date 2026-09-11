@@ -1,19 +1,19 @@
 {
   "graph": {
-    "rating": 1446.0715754538335,
-    "raw_rating": 1417.3097490292112,
-    "observations": 15,
+    "rating": 1428.9681097769285,
+    "raw_rating": 1397.3983807888967,
+    "observations": 18,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-11T07:03:14.628916"
+    "updated_at": "2026-09-11T17:23:25.058417"
   },
   "general": {
-    "rating": 1212.060486495684,
-    "raw_rating": 1200.5429059555115,
-    "observations": 200,
+    "rating": 1220.8416435540023,
+    "raw_rating": 1212.2189916174464,
+    "observations": 259,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-11T07:50:01.697770"
+    "updated_at": "2026-09-11T20:18:05.671664"
   },
   "vision": {
     "rating": 1500.0,
@@ -24,19 +24,43 @@
     "updated_at": null
   },
   "federated": {
-    "rating": 1495.8371745800514,
-    "raw_rating": 1484.736306793522,
-    "observations": 3,
+    "rating": 1416.3092944821371,
+    "raw_rating": 1379.1134253630871,
+    "observations": 18,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-11T06:19:11.020690"
+    "updated_at": "2026-09-11T20:12:47.720209"
   },
   "llm": {
-    "rating": 1491.665120172558,
-    "raw_rating": 1469.4387739660467,
-    "observations": 3,
+    "rating": 1484.9475172631119,
+    "raw_rating": 1454.8425517893359,
+    "observations": 4,
     "prior": 1500.0,
     "shrinkage_k": 8.0,
-    "updated_at": "2026-09-10T21:26:24.378541"
+    "updated_at": "2026-09-11T11:12:58.772884"
+  },
+  "diffusion": {
+    "rating": 1490.0363169547413,
+    "raw_rating": 1470.108950864224,
+    "observations": 4,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-11T18:59:17.057258"
+  },
+  "reinforcement": {
+    "rating": 1498.2222222222222,
+    "raw_rating": 1484.0,
+    "observations": 1,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-11T13:35:58.646952"
+  },
+  "attention": {
+    "rating": 1460.5677397060351,
+    "raw_rating": 1415.5022993700754,
+    "observations": 7,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-11T20:22:35.952429"
   }
 }

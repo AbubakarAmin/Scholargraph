@@ -64,6 +64,8 @@ def _make_agent(tmp_path=None) -> TopicHunterAgent:
     agent._iteration_failures = 0
     agent._run_query_cache = {}
     agent._run_query_cache_lock = threading.Lock()
+    agent._arxiv_client = MagicMock()
+    agent._arxiv_lock = threading.Lock()
     return agent
 
 

@@ -52,9 +52,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import random
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +82,8 @@ from core.structural_gaps import find_coupling_gaps
 from core.sparsity_matrix import find_sparse_cells
 from core.contradiction_mining import find_contradictions
 
+
+logger = logging.getLogger(__name__)
 
 _FAILED_TOPIC_OVERLAP_THRESHOLD = 0.55
 
@@ -213,6 +217,12 @@ class TopicHunterAgent:
         self._run_query_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._run_query_cache_lock = threading.Lock()
         self._dataset_catalog_cache: Optional[List[Dict[str, Any]]] = None
+        self._arxiv_client = arxiv.Client(
+            page_size=100,
+            delay_seconds=3.0,
+            num_retries=3,
+        )
+        self._arxiv_lock = threading.Lock()
 
     def _source_ok(self, name: str):
         self.source_health[name] = {"ok": True}
@@ -266,21 +276,22 @@ class TopicHunterAgent:
                 sort_by=arxiv.SortCriterion.SubmittedDate,
             )
             results = []
-            # arxiv.py 4 removed Search.results(); the Client owns iteration.
-            for result in arxiv.Client(page_size=min(max_results, 100), delay_seconds=1).results(search):
-                results.append({
-                    "title": result.title,
-                    "abstract": result.summary,
-                    "year": result.published.year,
-                    "authors": [a.name for a in result.authors],
-                    "arxiv_id": result.entry_id,
-                    "categories": result.categories,
-                })
+            with self._arxiv_lock:
+                for result in self._arxiv_client.results(search):
+                    results.append({
+                        "title": result.title,
+                        "abstract": result.summary,
+                        "year": result.published.year,
+                        "authors": [a.name for a in result.authors],
+                        "arxiv_id": result.entry_id,
+                        "categories": result.categories,
+                    })
             self._source_ok("arxiv")
             return results
         except Exception as e:
             self._source_failed("arxiv", e)
-            log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e)})
+            logger.warning(f"arxiv search failed for query={query!r}: {e}")
+            log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e), "query": query})
             return []
 
     def search_openalex_multi(self, queries: List[Tuple[str, Dict[str, Any]]], limit: int = 30) -> List[Dict[str, Any]]:
@@ -293,7 +304,9 @@ class TopicHunterAgent:
     def search_arxiv_multi(self, queries: List[str], max_results: int = 30) -> List[Dict[str, Any]]:
         """Run multiple arXiv queries and merge results."""
         all_results = []
-        for query in queries:
+        for i, query in enumerate(queries):
+            if i > 0:
+                time.sleep(3)
             all_results.extend(self.search_arxiv(query, max_results))
         return all_results
 

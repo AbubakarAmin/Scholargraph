@@ -556,9 +556,10 @@ def test_topic_hunter_uses_current_arxiv_client_api(monkeypatch):
     class Client:
         def __init__(self, **_kwargs): pass
         def results(self, _search): return iter([Result()])
-    monkeypatch.setattr("agents.topic_hunter.arxiv.Client", Client)
     hunter = TopicHunterAgent.__new__(TopicHunterAgent)
     hunter.source_health = {}
+    hunter._arxiv_lock = __import__("threading").Lock()
+    hunter._arxiv_client = Client(page_size=100, delay_seconds=3.0, num_retries=3)
     assert hunter.search_arxiv("test", 1)[0]["title"] == "A"
     assert hunter.source_health["arxiv"]["ok"]
 

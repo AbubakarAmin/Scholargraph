@@ -11,7 +11,7 @@ from core.context import RunContext, activate_context, get_active_context, reset
 from core.pipeline import ResearchPipeline
 from core.state import initialize_state
 from core.workflow import create_research_graph
-from core.workflow_nodes import should_continue, should_reset
+from core.workflow_nodes import should_continue, should_reset, is_valid_plan
 from core.workflow_nodes import independent_validation_node
 
 
@@ -138,9 +138,10 @@ def test_pipeline_marks_tracker_failed_when_execution_raises():
 
 def test_workflow_graph_compiles_with_injected_nodes():
     node_names = {
-        "topic_discovery", "hypothesis_debate", "planning", "data_validation", "writing_narrative",
+        "topic_discovery", "hypothesis_debate", "planning", "terminal_planning_failure",
+        "data_validation", "writing_narrative",
         "engineering", "independent_validation", "writing_results", "supervision", "meta_evaluation",
-        "editing", "reset", "should_reset", "should_continue",
+        "editing", "reset", "should_reset", "should_continue", "is_valid_plan",
     }
     nodes = {name: (lambda state: state) for name in node_names}
     graph = create_research_graph(nodes)
@@ -166,10 +167,23 @@ def test_offline_workflow_runs_every_phase_to_a_release_candidate():
             return state
         return run
 
+    def planning_node_with_plan(state):
+        observed.append("planning")
+        state["current_phase"] = "data_validation"
+        state["plan"] = {
+            "experiments": [{
+                "name": "test_exp",
+                "evaluation_metrics": ["accuracy"],
+                "baselines": ["baseline"],
+            }]
+        }
+        return state
+
     nodes = {
         "topic_discovery": node("topic_discovery", "hypothesis_debate"),
         "hypothesis_debate": node("hypothesis_debate", "planning"),
-        "planning": node("planning", "data_validation"),
+        "planning": planning_node_with_plan,
+        "terminal_planning_failure": node("terminal_planning_failure", "complete"),
         "data_validation": node("data_validation", "writing_narrative"),
         "writing_narrative": node("writing_narrative", "engineering"),
         "engineering": node("engineering", "independent_validation"),
@@ -181,6 +195,7 @@ def test_offline_workflow_runs_every_phase_to_a_release_candidate():
         "reset": node("reset", "topic_discovery"),
         "should_reset": should_reset,
         "should_continue": should_continue,
+        "is_valid_plan": is_valid_plan,
     }
     graph = create_research_graph(nodes).compile()
     result = graph.invoke(initialize_state(), {"recursion_limit": 30})

@@ -293,6 +293,15 @@ class VerificationReport(TypedDict, total=False):
     checks: Dict[str, Any]
 
 
+class LiteratureContext(TypedDict, total=False):
+    """Raw literature retrieval output shared between full-research and QA paths."""
+    papers: List[Dict[str, Any]]
+    graph_signals: List[Dict[str, Any]]
+    evidence_map: Dict[str, Any]
+    query: str
+    domain: str
+
+
 class FeasibilityReport(TypedDict, total=False):
     ok: bool
     reasons: List[str]

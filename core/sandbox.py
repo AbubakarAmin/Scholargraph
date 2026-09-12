@@ -10,6 +10,7 @@ import ast
 import builtins
 import io
 import json
+import sys
 import traceback
 from contextlib import redirect_stdout, redirect_stderr
 from typing import Any, Dict, List, Set, Tuple
@@ -143,6 +144,86 @@ def validate_code(code: str) -> Tuple[bool, str]:
         return False, f"SyntaxError: {e}"
 
 
+def extract_local_code_structure(
+    tb: Any,
+    source_code: str,
+    generated_code_path: str = "<sandbox>",
+    preamble_offset: int = 10,
+) -> str:
+    """Walk a traceback and extract the full source of custom functions implicated in it.
+
+    Args:
+        tb: A traceback object (from ``sys.exc_info()[2]`` or ``e.__traceback__``).
+        source_code: The user-generated code (without the sandbox preamble).
+        generated_code_path: The filename passed to ``compile()``; frames from
+            other paths (stdlib, installed packages) are excluded.
+        preamble_offset: Number of lines the sandbox preamble occupies in the
+            compiled code.  Line numbers from the traceback are adjusted by
+            subtracting this value before mapping into *source_code*.
+
+    Returns:
+        A formatted string combining the traceback text with the extracted
+        function sources, clearly labelled.  Returns an empty string when
+        *tb* is ``None``.
+    """
+    import traceback as _tb
+
+    if tb is None:
+        return ""
+
+    # -- Parse source_code to locate every FunctionDef / AsyncFunctionDef ----
+    func_map: Dict[int, Tuple[str, str]] = {}  # lineno -> (name, full_source)
+    try:
+        source_lines = source_code.splitlines()
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        # Can't parse — fall back to raw traceback text
+        return "".join(_tb.format_tb(tb))
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = node.lineno
+            end = getattr(node, "end_lineno", start)
+            func_source = "\n".join(source_lines[start - 1 : end])
+            for ln in range(start, end + 1):
+                func_map[ln] = (node.name, func_source)
+
+    # -- Walk traceback frames, collect implicated custom functions -----------
+    collected: Dict[str, str] = {}  # name -> source (deduplicates)
+    for frame in _tb.extract_tb(tb):
+        if frame.filename != generated_code_path:
+            continue
+        adjusted = frame.lineno - preamble_offset
+        if adjusted in func_map:
+            name, src = func_map[adjusted]
+            collected[name] = src
+
+    # -- Build output --------------------------------------------------------
+    parts: List[str] = ["=== Traceback ==="]
+    parts.extend(_tb.format_tb(tb))
+
+    if collected:
+        parts.append("\n=== Implicated Custom Functions ===")
+        for name in sorted(collected):
+            parts.append(f"\n--- {name}() ---")
+            parts.append(collected[name])
+    else:
+        # No function-level match (error at module top-level or preamble).
+        # Include a short window around the failing line for context.
+        last_frame = _tb.extract_tb(tb)[-1] if _tb.extract_tb(tb) else None
+        if last_frame and last_frame.filename == generated_code_path:
+            adj = last_frame.lineno - preamble_offset
+            if 1 <= adj <= len(source_lines):
+                lo = max(0, adj - 4)
+                hi = min(len(source_lines), adj + 3)
+                parts.append("\n=== Source context (around failing line) ===")
+                for i in range(lo, hi):
+                    marker = ">>>" if i + 1 == adj else "   "
+                    parts.append(f"{marker} {i + 1:4d} | {source_lines[i]}")
+
+    return "\n".join(parts)
+
+
 def _safe_builtins() -> Dict[str, Any]:
     allowed = {
         "abs", "all", "any", "bool", "bytes", "callable", "chr", "complex",
@@ -252,12 +333,17 @@ def execute_sandboxed(
             "seed": seed,
         }
     except Exception as e:
+        preamble_offset = preamble.count("\n") + 1  # +1 for the separator line
+        local_ctx = extract_local_code_structure(
+            e.__traceback__, code, "<sandbox>", preamble_offset
+        )
         return {
             "success": False,
             "error": str(e),
             "traceback": traceback.format_exc(),
+            "local_code_context": local_ctx,
             "stdout": stdout_buf.getvalue(),
-            "stderr": stderr_buf.getvalue() + "\n" + traceback.format_exc(),
+            "stderr": stdout_buf.getvalue() + "\n" + traceback.format_exc(),
             "seed": seed,
         }
 
@@ -354,11 +440,19 @@ def run_multi_seed(
                 detail += f" | traceback: {tb[:300]}"
             error_details.append(detail)
         combined_error = "All seeded runs failed. Details:\n" + "\n".join(error_details)
+        # Propagate the richest local_code_context from the failed runs
+        # (last run is typically the most representative).
+        local_ctx = ""
+        for r in reversed(runs):
+            if r.get("local_code_context"):
+                local_ctx = r["local_code_context"]
+                break
         return {
             "success": False,
             "error": combined_error,
             "runs": runs,
             "aggregate_metrics": {},
+            "local_code_context": local_ctx,
         }
 
     # Aggregate numeric metrics from parsed JSON

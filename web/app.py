@@ -65,6 +65,8 @@ class KeysPayload(BaseModel):
 class RunPayload(BaseModel):
     domain: Optional[str] = None
     provider: Optional[str] = None
+    mode: Optional[str] = "full_research"
+    query: Optional[str] = None
 
 
 class ResetPayload(BaseModel):
@@ -292,7 +294,9 @@ def dashboard(run_id: Optional[str] = None):
         "provider": config.llm_provider,
         "model": config.resolve_model("default"),
         "domain": config.research_domain,
+        "research_db_path": config.research_db_path,
     }
+    dash["tracker_stats"] = tracker.stats if tracker else {}
     state = _get_latest_state() if tracker and (run_id is None or run_id == tracker.run_id) else {}
 
     debates = []
@@ -301,6 +305,7 @@ def dashboard(run_id: Optional[str] = None):
     if state:
         dash["workspace"] = {
             "debates": debates,
+            "mode": state.get("mode"),
             "plan": state.get("plan"),
             "plan_revision_requests": state.get("plan_revision_requests", []),
             "engineer_outputs": state.get("engineer_outputs", {}),
@@ -319,15 +324,43 @@ def dashboard(run_id: Optional[str] = None):
             "terminal_error": state.get("terminal_error"),
             "experiment_contracts": state.get("experiment_contracts", {}),
             "human_approved": state.get("human_approved", False),
+            "literature_context": state.get("literature_context"),
+            "qa_answer": state.get("qa_answer"),
+            "qa_citation_verification": state.get("qa_citation_verification"),
+            "user_query": state.get("user_query"),
         }
     dash["evidence_trace"] = research_db.claims(dash.get("run_id"))
     workspace = dash.get("workspace") or {}
     terminal = bool(workspace.get("terminal_error") or workspace.get("evidence_gate", {}).get("terminal"))
+    mode = workspace.get("mode", "full_research")
+    if mode == "qa":
+        qa_answer = workspace.get("qa_answer")
+        qa_citation = workspace.get("qa_citation_verification", {})
+        if terminal:
+            release_status = "blocked"
+            release_reason = workspace.get("terminal_error") or ""
+        elif qa_answer and qa_citation.get("passed"):
+            release_status = "ready"
+            release_reason = ""
+        elif qa_answer:
+            release_status = "complete_no_citations"
+            release_reason = "Answer generated but citation verification had issues"
+        else:
+            release_status = "incomplete"
+            release_reason = "QA answer not yet generated"
+    else:
+        release_status = (
+            "blocked" if terminal
+            else "pending_human_approval" if workspace.get("paper", {}).get("approval_required") and not workspace.get("human_approved", False)
+            else "ready" if workspace.get("reproducibility", {}).get("passed") and not any(
+                finding.get("blocking") for finding in workspace.get("verification_findings", [])
+            )
+            else "incomplete"
+        )
+        release_reason = workspace.get("terminal_error") or workspace.get("evidence_gate", {}).get("message", "")
     dash["release"] = {
-        "status": "blocked" if terminal else "pending_human_approval" if workspace.get("paper", {}).get("approval_required") and not workspace.get("human_approved", False) else "ready" if workspace.get("reproducibility", {}).get("passed") and not any(
-            finding.get("blocking") for finding in workspace.get("verification_findings", [])
-        ) else "incomplete",
-        "reason": workspace.get("terminal_error") or workspace.get("evidence_gate", {}).get("message", ""),
+        "status": release_status,
+        "reason": release_reason,
     }
     dash["capabilities"] = DEFAULT_MANIFESTS
     return dash
@@ -429,10 +462,13 @@ async def admin_stream(request: Request):
         while True:
             if await request.is_disconnected():
                 break
-            dash = dashboard()
-            payload = {"type": "dashboard", "payload": dash}
-            yield json.dumps(payload) + "\n\n"
-            await asyncio.sleep(30)  # push updates every half minute
+            try:
+                dash = dashboard()
+                payload = {"type": "dashboard", "payload": dash}
+                yield json.dumps(payload) + "\n\n"
+            except Exception:
+                yield json.dumps({"type": "heartbeat"}) + "\n\n"
+            await asyncio.sleep(10)
     return EventSourceResponse(event_generator())
 
 @app.post("/api/data/reset/outputs")
@@ -513,6 +549,7 @@ def _workspace_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
             item.__dict__ if hasattr(item, "__dict__") else item
             for item in state.get("debate_results", [])
         ],
+        "mode": state.get("mode"),
         "plan": state.get("plan"),
         "plan_revision_requests": state.get("plan_revision_requests", []),
         "engineer_outputs": state.get("engineer_outputs", {}),
@@ -535,6 +572,11 @@ def _workspace_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
         "topics": state.get("topics", []),
         "selected_topic": state.get("selected_topic"),
         "run_id": state.get("run_id"),
+        "human_approved": state.get("human_approved", False),
+        "literature_context": state.get("literature_context"),
+        "qa_answer": state.get("qa_answer"),
+        "qa_citation_verification": state.get("qa_citation_verification"),
+        "user_query": state.get("user_query"),
     }
 
 
@@ -551,7 +593,7 @@ def _load_state_from_db(run_id: str) -> Optional[Dict[str, Any]]:
     workspace = summary.get("workspace", {})
     if not workspace:
         return None
-    state = initialize_state()
+    state = initialize_state(mode=workspace.get("mode", "full_research"))
     state["run_id"] = run_id
     state["plan"] = workspace.get("plan")
     state["plan_revision_requests"] = workspace.get("plan_revision_requests", [])
@@ -573,6 +615,11 @@ def _load_state_from_db(run_id: str) -> Optional[Dict[str, Any]]:
     state["iteration"] = workspace.get("iteration")
     state["topics"] = workspace.get("topics", [])
     state["selected_topic"] = workspace.get("selected_topic")
+    state["human_approved"] = workspace.get("human_approved", False)
+    state["literature_context"] = workspace.get("literature_context")
+    state["qa_answer"] = workspace.get("qa_answer")
+    state["qa_citation_verification"] = workspace.get("qa_citation_verification")
+    state["user_query"] = workspace.get("user_query")
     if workspace.get("debates"):
         state["debate_results"] = workspace["debates"]
     return state
@@ -606,7 +653,8 @@ def _get_run_error() -> Optional[str]:
         return _run_error
 
 
-def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = None):
+def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = None,
+                  mode: str = "full_research", query: Optional[str] = None):
     global _run_error, _latest_state
     with _run_lock:
         _run_error = None
@@ -614,7 +662,7 @@ def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = N
         if domain:
             apply_runtime_keys({"RESEARCH_DOMAIN": domain})
         validate_config()
-        from main import create_checkpointer, create_research_graph, initialize_state, save_results
+        from main import create_checkpointer, create_research_graph, create_qa_mode_graph, initialize_state, save_results
         from core.context import create_run_context
         from core.pipeline import ResearchPipeline
 
@@ -628,17 +676,18 @@ def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = N
             create_research_graph,
             create_checkpointer,
             context=create_run_context(tracker),
+            mode_graphs={"qa": create_qa_mode_graph},
         )
         if resume_run_id and existing_state:
             state = existing_state
         else:
-            state = initialize_state()
+            state = initialize_state(mode=mode)
         state["run_id"] = tracker.run_id
+        if mode == "qa" and query:
+            state["user_query"] = query
         _set_latest_state(state)
         def on_node(node_name, node_output):
-            current = _get_latest_state()
-            current.update(node_output)
-            _set_latest_state(current)
+            _set_latest_state(dict(node_output))
             tracker.message(f"{node_name} -> {node_output.get('current_phase')}")
 
         result = pipeline.run(state, tracker.run_id, resume=bool(resume_run_id), on_node=on_node, finalize=save_results)
@@ -665,11 +714,14 @@ def start_research(payload: RunPayload = RunPayload()):
         if payload.provider:
             apply_runtime_keys({"LLM_PROVIDER": payload.provider})
             reset_llm_client()
+        mode = payload.mode or "full_research"
+        if mode == "qa" and not payload.query:
+            raise HTTPException(status_code=400, detail="query is required for QA mode")
         _run_thread = threading.Thread(
-            target=_run_pipeline, args=(payload.domain, None), daemon=True
+            target=_run_pipeline, args=(payload.domain, None, mode, payload.query), daemon=True
         )
         _run_thread.start()
-    return {"ok": True, "message": "Research run started"}
+    return {"ok": True, "message": f"Research run started (mode={mode})"}
 
 
 @app.post("/api/run/resume/{run_id}")

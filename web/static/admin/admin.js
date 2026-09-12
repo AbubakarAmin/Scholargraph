@@ -5,9 +5,11 @@ const short=(s,n=14)=>{const t=String(s??'');return t.length<=n?t:t.slice(0,n)+'
 const titleCase=s=>String(s||'').replaceAll('_',' ');
 
 let dashboard={},status={},scratch={},selectedRunId=null,toastTimer=null;
+let currentMode='full_research';
 
 const phases=['topic_discovery','hypothesis_debate','planning','data_validation','writing_narrative','engineering','independent_validation','writing_results','supervision','meta_evaluation','editing'];
-const titles={overview:'Run overview',experiments:'Experiments',evidence:'Evidence and lineage',agents:'Agent registry',paper:'Manuscript workspace',activity:'Activity',runs:'Run history',settings:'System settings'};
+const qaPhases=['qa_literature_retrieval','qa_answer','qa_verification'];
+const titles={overview:'Run overview',qa:'QA Answer',experiments:'Experiments',evidence:'Evidence and lineage',agents:'Agent registry',paper:'Manuscript workspace',activity:'Activity',runs:'Run history',settings:'System settings'};
 
 const settingDefs=[
  ['llm_provider','LLM provider','provider','LLM'],['gemini_model','Gemini model','text','LLM'],['gemini_embedding_model','Gemini embedding model','text','LLM'],['openai_model','OpenAI model','text','LLM'],['openai_embedding_model','OpenAI embedding model','text','LLM'],['openai_base_url','OpenAI-compatible base URL','text','LLM'],['llm_model_cheap','Cheap model override','text','LLM'],['llm_model_strong','Strong model override','text','LLM'],['llm_model_judge','Judge model override','text','LLM'],['ensemble_judge_models','Ensemble judge models','text','LLM'],
@@ -21,6 +23,96 @@ let activeSettingsGroup='LLM';
 function toast(msg){
   const el=$('toast');el.textContent=msg;el.classList.add('show');
   clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),1600);
+}
+
+// --- Confirm Dialog ---
+function confirmAction(title,message){
+  return new Promise(resolve=>{
+    $('confirmTitle').textContent=title;
+    $('confirmMessage').textContent=message;
+    $('confirmOverlay').classList.add('show');
+    const cleanup=()=>{$('confirmOverlay').classList.remove('show');$('confirmOk').onclick=null;$('confirmCancel').onclick=null};
+    $('confirmOk').onclick=()=>{cleanup();resolve(true)};
+    $('confirmCancel').onclick=()=>{cleanup();resolve(false)};
+  });
+}
+
+// --- Presets ---
+const PRESETS_KEY='scholargraph-presets';
+function getPresets(){try{return JSON.parse(localStorage.getItem(PRESETS_KEY)||'[]')}catch{return[]}}
+function savePresets(presets){localStorage.setItem(PRESETS_KEY,JSON.stringify(presets))}
+function renderPresets(){
+  const presets=getPresets();
+  $('presetList').innerHTML=presets.map(p=>{
+    const name=esc(p.name);
+    return `<div class="preset-chip" data-preset="${name}">${name}<span class="delete-preset" data-delete-preset="${name}">&times;</span></div>`;
+  }).join('');
+  document.querySelectorAll('[data-preset]').forEach(el=>{
+    el.onclick=async(e)=>{
+      if(e.target.dataset.deletePreset){
+        const name=e.target.dataset.deletePreset;
+        if(await confirmAction('Delete preset',`Delete preset "${name}"?`)){
+          savePresets(getPresets().filter(p=>p.name!==name));
+          renderPresets();
+        }
+        return;
+      }
+      const preset=presets.find(p=>p.name===el.dataset.preset);
+      if(preset){
+        Object.entries(preset.values||{}).forEach(([k,v])=>{
+          const field=$(`setting_${k}`);
+          if(field){
+            if(field.type==='checkbox')field.checked=v;
+            else field.value=v;
+          }
+        });
+        toast(`Loaded preset: ${preset.name}`);
+      }
+    };
+  });
+}
+$('savePresetBtn').onclick=()=>{
+  const name=$('presetNameInput').value.trim();
+  if(!name){toast('Enter a preset name');return}
+  const keys={};
+  settingDefs.forEach(([id])=>{keys[id]=settingValue(id)});
+  const presets=getPresets().filter(p=>p.name!==name);
+  presets.push({name,values:keys});
+  savePresets(presets);
+  $('presetNameInput').value='';
+  renderPresets();
+  toast(`Saved preset: ${name}`);
+};
+
+// --- Run Search & Filter ---
+let runSearchQuery='';
+let runFilterMode='all';
+$('runSearchInput').oninput=(e)=>{runSearchQuery=e.target.value.toLowerCase();renderRuns()};
+document.querySelectorAll('.run-filter-btn').forEach(btn=>{
+  btn.onclick=()=>{
+    document.querySelectorAll('.run-filter-btn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    runFilterMode=btn.dataset.filter;
+    renderRuns();
+  };
+});
+
+// --- Manuscript TOC ---
+function renderTOC(){
+  const w=workspace();
+  const s=w.draft_sections||w.paper?.sections||{};
+  const sections=Object.keys(s);
+  if(!sections.length){$('tocList').innerHTML='<div class="note">No sections yet</div>';return}
+  $('tocList').innerHTML=sections.map((n,i)=>`<a class="toc-item" data-toc-section="${esc(n)}" href="#section-${i}">${esc(n)}</a>`).join('');
+  document.querySelectorAll('[data-toc-section]').forEach(el=>{
+    el.onclick=(e)=>{
+      e.preventDefault();
+      document.querySelectorAll('.toc-item').forEach(x=>x.classList.remove('active'));
+      el.classList.add('active');
+      const target=document.getElementById(`section-${Array.from(document.querySelectorAll('[data-toc-section]')).indexOf(el)}`);
+      if(target)target.scrollIntoView({behavior:'smooth',block:'start'});
+    };
+  });
 }
 
 async function copyText(text,btn){
@@ -88,6 +180,34 @@ function experimentIndex(){
   });
 }
 
+// --- Pagination ---
+function paginate(items,page,size){
+  const total=Math.ceil(items.length/size);
+  const start=page*size;
+  return {items:items.slice(start,start+size),total,page,start};
+}
+function paginatedList(containerId,items,renderFn,opts={}){
+  const{pageSize=8,page=0}=opts;
+  const p=paginate(items,page,pageSize);
+  const el=$(containerId);
+  if(!items.length){el.innerHTML='<div class="empty">No entries.</div>';return}
+  el.innerHTML=p.items.map(renderFn).join('');
+  if(p.total>1){
+    el.innerHTML+=`<div class="pagination"><button class="ghost" data-page-prev="${containerId}" ${p.page===0?'disabled':''}>&#8592; Prev</button><span class="note">Page ${p.page+1} of ${p.total}</span><button class="ghost" data-page-next="${containerId}" ${p.page>=p.total-1?'disabled':''}>Next &#8594;</button></div>`;
+  }
+}
+const _pageState={};
+function nextPage(containerId,items,renderFn,opts={}){
+  const{pageSize=8}=opts;
+  const total=Math.ceil(items.length/pageSize);
+  _pageState[containerId]=Math.min((_pageState[containerId]||0)+1,total-1);
+  paginatedList(containerId,items,renderFn,{pageSize,page:_pageState[containerId]});
+}
+function prevPage(containerId,items,renderFn,opts={}){
+  _pageState[containerId]=Math.max((_pageState[containerId]||0)-1,0);
+  paginatedList(containerId,items,renderFn,{pageSize:opts.pageSize||8,page:_pageState[containerId]});
+}
+
 function renderSettingsForm(values={},keys={}){
   const groups=[...new Set(settingDefs.map(x=>x[3]))];
   $('settingsTabs').innerHTML=groups.map(g=>`<button class="${g===activeSettingsGroup?'primary':''}" data-settings-group="${g}">${g}</button>`).join('');
@@ -118,6 +238,20 @@ function showView(name){
   $('viewTitle').textContent=titles[name]||name;
 }
 
+function isQAMode(){
+  const w=workspace();
+  return w.current_phase?.startsWith('qa_') || w.mode === 'qa' || dashboard.phase?.startsWith('qa_');
+}
+
+function runMode(r){
+  const summary=tryParse(r.summary_json);
+  const ws=summary?.workspace||{};
+  if(ws.mode==='qa') return 'QA';
+  if(ws.current_phase?.startsWith('qa_')) return 'QA';
+  if(r.phase?.startsWith('qa_')) return 'QA';
+  return 'Research';
+}
+
 function renderOverview(){
   const w=workspace();
   const findings=w.verification_findings||[];
@@ -125,20 +259,53 @@ function renderOverview(){
   const exps=experimentIndex();
   const doneCount=exps.filter(x=>x.done).length;
   const listedCount=exps.filter(x=>x.listed||x.ran).length||exps.length;
-  const ready=!blocking.length && w.reproducibility?.passed && Object.keys(w.execution_artifacts||{}).length>0;
+  const qaMode=isQAMode();
+  const qaAnswer=w.qa_answer;
+  const qaCitation=w.qa_citation_verification;
+  const qaReady=qaAnswer&&qaCitation?.passed;
   const terminal=dashboard.release?.status==='blocked'||w.terminal_error||w.evidence_gate?.terminal;
+  const ready=qaMode?(qaReady||!!qaAnswer):(!blocking.length && w.reproducibility?.passed && Object.keys(w.execution_artifacts||{}).length>0);
 
-  $('readiness').textContent=terminal?'Blocked':ready?'Ready':'Blocked';
-  $('readiness').className='metric-value '+(terminal?'bad':ready?'good':'bad');
-  $('readinessNote').textContent=terminal?(dashboard.release?.reason||w.terminal_error||'Terminal evidence failure'):(ready?'Evidence gate passed':'Verification or reproducibility incomplete');
+  // Onboarding
+  const hasRun=dashboard.run_id||w.plan||w.paper||qaAnswer;
+  $('onboardingCard').style.display=hasRun?'none':'block';
+
+  $('readiness').textContent=terminal?'Blocked':qaMode?(qaReady?'Answer ready':qaAnswer?'Citations pending':dashboard.phase==='qa_literature_retrieval'?'Retrieving literature':dashboard.phase==='qa_answer'?'Generating answer':'Preparing'):(ready?'Ready':'Blocked');
+  $('readiness').className='metric-value '+(terminal?'bad':(qaReady||(ready&&!qaMode))?'good':qaAnswer?'warn':'bad');
+  $('readinessNote').textContent=terminal?(dashboard.release?.reason||w.terminal_error||'Terminal evidence failure'):(qaMode?(qaReady?'Citation-verified synthesis answer':qaAnswer?'Answer generated — some citations unverified':dashboard.phase==='qa_literature_retrieval'?'Searching for relevant papers and sources':'Synthesizing literature-backed answer'):(ready?'Evidence gate passed':'Verification or reproducibility incomplete'));
 
   $('phaseMetric').textContent=titleCase(dashboard.phase||'idle');
   $('phaseNote').textContent=dashboard.status||'idle';
-  $('experimentMetric').textContent=`${doneCount} / ${listedCount||0}`;
-  $('experimentNote').textContent=listedCount?`${doneCount} completed · ${exps.filter(x=>x.ran&&!x.done).length} in progress · ${exps.filter(x=>x.listed&&!x.ran).length} waiting`:'Awaiting plan experiments';
+
+  const modeLabel=qaMode?'QA Synthesis':w.mode==='qa'?'QA':'Full Research';
+  $('modeMetric').textContent=modeLabel;
+  $('modeMetric').className='metric-value '+(qaMode?'good':'');
+  $('modeNote').textContent=qaMode?'Literature-backed answer':'Full experiment pipeline';
+
   $('findingMetric').textContent=blocking.length;
   $('findingMetric').className='metric-value '+(blocking.length?'bad':'good');
-  $('topicLine').textContent=w.plan?.title||w.paper?.topic?.title||'No active research run';
+  $('topicLine').textContent=qaMode?(w.user_query||w.qa_answer?.query||'QA synthesis'):w.plan?.title||w.paper?.topic?.title||'No active research run';
+
+  // Run metrics
+  const events=dashboard.events_tail||[];
+  const stats=dashboard.tracker_stats||{};
+  const llmCalls=stats.llm_calls||0;
+  const phaseCount=qaMode?qaPhases:phases;
+  const completedPhases=phaseCount.filter((p,i)=>{
+    const at=phaseCount.indexOf(dashboard.phase);
+    return i<at;
+  }).length;
+  const tokenEst=llmCalls>0?`~${llmCalls*2000}`:'0';
+  $('costTokens').textContent=tokenEst;
+  $('costCalls').textContent=llmCalls;
+  const startTime=w.started_at?new Date(w.started_at):null;
+  if(startTime){
+    const mins=Math.floor((Date.now()-startTime.getTime())/60000);
+    $('costDuration').textContent=mins>60?`${(mins/60).toFixed(1)}h`:`${mins}m`;
+  }else{
+    $('costDuration').textContent='0m';
+  }
+  $('costPhases').textContent=`${completedPhases}/${phaseCount.length}`;
 
   $('runStatus').textContent=status.running?'Running':status.error?'Error':dashboard.status||'Idle';
   $('runId').textContent=dashboard.run_id?'#'+dashboard.run_id:'';
@@ -146,29 +313,66 @@ function renderOverview(){
   $('pulse').className='pulse '+(status.running?'live':status.error?'bad':'');
   $('phaseTag').textContent=titleCase(dashboard.phase||'idle');
 
-  const at=phases.indexOf(dashboard.phase);
-  $('phaseList').innerHTML=phases.map((p,i)=>`<div class="phase ${p===dashboard.phase?'active':i<at?'done':''}">${titleCase(p)}</div>`).join('');
+  // Pipeline timeline
+  const activePhases=qaMode?qaPhases:phases;
+  const at=activePhases.indexOf(dashboard.phase);
+  let timelineHtml='';
+  activePhases.forEach((p,i)=>{
+    const isDone=i<at;
+    const isActive=p===dashboard.phase;
+    const isError=isActive&&status.error;
+    timelineHtml+=`<div class="pipeline-node ${isDone?'done':isActive?'active':''}${isError?' error':''}"><div class="pipeline-dot"></div><div class="pipeline-label">${titleCase(p)}</div></div>`;
+    if(i<activePhases.length-1){
+      timelineHtml+=`<div class="pipeline-connector ${isDone?'done':isActive?'active':''}"></div>`;
+    }
+  });
+  $('pipelineTimeline').innerHTML=timelineHtml;
 
-  const checks=[
-    ['Plan exists',!!w.plan],
-    ['Data validated',w.data_validation?.passed!==false && !!Object.keys(w.data_artifacts||{}).length],
-    ['Execution artifacts',Object.keys(w.execution_artifacts||{}).length>0],
-    ['Independent analysis',Object.keys(w.analysis_reports||{}).length>0],
-    ['No blocking findings',!blocking.length],
-    ['Reproducibility dossier',!!w.reproducibility?.passed],
-  ];
-  $('gateRows').innerHTML=checks.map(([label,ok])=>`<div class="row"><div><strong>${esc(label)}</strong><small>${ok?'Requirement satisfied':'Evidence still required'}</small></div><span class="tag ${ok?'good':'bad'}">${ok?'PASS':'BLOCKED'}</span></div>`).join('');
-  $('gateTag').textContent=terminal?'Blocked':ready?'Ready for editing':'Incomplete';
-  $('gateTag').className='tag '+(terminal?'bad':ready?'good':'warn');
+  // Topic cards
+  const topics=w.topics||w.paper?.topic?.alternatives||[];
+  const topicList=topics.length?topics:[];
+  if(w.paper?.topic)topicList.unshift(w.paper.topic);
+  $('topicCount').textContent=`${topicList.length} topics`;
+  $('topicCards').innerHTML=topicList.length?topicList.slice(0,6).map(t=>{
+    const score=t.score||t.novelty_score||0;
+    const scorePercent=Math.round(score*100);
+    const scoreColor=scorePercent>70?'var(--green)':scorePercent>40?'var(--yellow)':'var(--red)';
+    return `<div class="topic-card">
+      <div class="topic-card-title">${esc(t.title||'Untitled')}</div>
+      <div class="topic-card-meta">${esc(t.domain||'')} ${t.year?`· ${esc(t.year)}`:''}</div>
+      <div class="topic-score-bar"><div class="topic-score-fill" style="width:${scorePercent}%;background:${scoreColor}"></div></div>
+      <div class="topic-score-label"><span>Score</span><span>${scorePercent}%</span></div>
+      <div class="topic-card-status"><span class="tag ${tagFor(t.status||'discovered')}">${esc(t.status||'discovered')}</span><span class="note">${esc(t.source||'')}</span></div>
+    </div>`;
+  }).join(''):'<div class="empty">No topics discovered yet. Topics appear after the first research phase.</div>';
 
-  $('expProgress').innerHTML=[
-    ['Listed',exps.filter(x=>x.listed||x.ran).length||exps.length],
-    ['Ran',exps.filter(x=>x.ran).length],
-    ['Done',doneCount],
-    ['Failed',exps.filter(x=>x.failed).length],
-  ].map(([l,n])=>`<div class="chip"><span class="n">${n}</span><span class="l">${l}</span></div>`).join('');
+  if(qaMode){
+    $('gateCard').style.display='none';
+    $('expProgressCard').style.display='none';
+  }else{
+    $('gateCard').style.display='';
+    $('expProgressCard').style.display='';
+    const checks=[
+      ['Plan exists',!!w.plan],
+      ['Data validated',w.data_validation?.passed!==false && !!Object.keys(w.data_artifacts||{}).length],
+      ['Execution artifacts',Object.keys(w.execution_artifacts||{}).length>0],
+      ['Independent analysis',Object.keys(w.analysis_reports||{}).length>0],
+      ['No blocking findings',!blocking.length],
+      ['Reproducibility dossier',!!w.reproducibility?.passed],
+    ];
+    $('gateRows').innerHTML=checks.map(([label,ok])=>`<div class="row"><div><strong>${esc(label)}</strong><small>${ok?'Requirement satisfied':'Evidence still required'}</small></div><span class="tag ${ok?'good':'bad'}">${ok?'PASS':'BLOCKED'}</span></div>`).join('');
+    $('gateTag').textContent=terminal?'Blocked':ready?'Ready for editing':'Incomplete';
+    $('gateTag').className='tag '+(terminal?'bad':ready?'good':'warn');
 
-  $('expOverviewList').innerHTML=exps.length?exps.slice(0,6).map(x=>`<div class="row"><div><strong>${esc(x.name)}</strong><small>${esc(x.spec?.falsifiable_prediction||x.contract?.hypothesis||x.spec?.description||'No prediction recorded')}</small></div><span class="tag ${tagFor(x.status)}">${esc(x.status)}</span></div>`).join('')+(exps.length>6?`<p class="note">${exps.length-6} more on Experiments</p>`:'') : '<div class="empty">No experiments listed yet.</div>';
+    $('expProgress').innerHTML=[
+      ['Listed',exps.filter(x=>x.listed||x.ran).length||exps.length],
+      ['Ran',exps.filter(x=>x.ran).length],
+      ['Done',doneCount],
+      ['Failed',exps.filter(x=>x.failed).length],
+    ].map(([l,n])=>`<div class="chip"><span class="n">${n}</span><span class="l">${l}</span></div>`).join('');
+
+    $('expOverviewList').innerHTML=exps.length?exps.slice(0,6).map(x=>`<div class="row"><div><strong>${esc(x.name)}</strong><small>${esc(x.spec?.falsifiable_prediction||x.contract?.hypothesis||x.spec?.description||'No prediction recorded')}</small></div><span class="tag ${tagFor(x.status)}">${esc(x.status)}</span></div>`).join('')+(exps.length>6?`<p class="note">${exps.length-6} more on Experiments</p>`:'') : '<div class="empty">No experiments listed yet.</div>';
+  }
 
   const ev=(dashboard.events_tail||[]).slice().reverse();
   $('activity').innerHTML=ev.length?ev.slice(0,12).map(e=>`<div class="event"><time>${esc((e.ts||'').slice(11,19))}</time><strong>${esc(e.agent||'system')}</strong><br><span class="mono">${esc(e.type)}</span></div>`).join(''):'<div class="empty">No activity yet.</div>';
@@ -181,12 +385,95 @@ function renderOverview(){
     ['Provider',dashboard.config?.provider||'—'],
     ['Model',dashboard.config?.model||'—'],
     ['Domain',dashboard.config?.domain||'—'],
+    ['Run mode',w.mode||'full_research'],
     ['Datasets',Object.keys(w.data_artifacts||{}).length],
     ['Claims', (dashboard.evidence_trace||[]).length],
     ['Supervisor avg',avg],
     ['Debate rounds',debate?.rounds?.length??'—'],
     ['Human approved',w.human_approved?'yes':'no'],
   ].map(([k,v])=>`<div class="row"><div><strong>${esc(k)}</strong></div><span class="mono">${esc(v)}</span></div>`).join('');
+
+  // Show/hide QA nav
+  $('navQA').style.display=(w.mode==='qa'||qaMode)?'':'none';
+}
+
+function renderQA(){
+  const w=workspace();
+  const qa=w.qa_answer;
+  const lit=w.literature_context;
+  const citation=w.qa_citation_verification;
+
+  if(!qa&&!lit){
+    $('qaAnswerContent').innerHTML='<div class="empty">No QA answer yet. Start a run in QA mode to generate a synthesis.</div>';
+    $('qaCitationDetails').innerHTML='';
+    $('qaKeyFindings').innerHTML='';
+    $('qaLimitations').textContent='';
+    $('qaBibliography').innerHTML='';
+    $('qaLiterature').innerHTML='';
+    return;
+  }
+
+  $('qaQueryLine').textContent=qa?.query||w.user_query||'QA synthesis';
+
+  if(qa){
+    $('qaAnswerTag').textContent='complete';
+    $('qaAnswerTag').className='tag good';
+    const answer=qa.answer||'';
+    $('qaAnswerContent').innerHTML=`<div class="qa-answer-text">${esc(answer).replace(/\n\n/g,'</p><p>').replace(/\n/g,'<br>')}</div>`;
+  }else{
+    $('qaAnswerTag').textContent='pending';
+    $('qaAnswerTag').className='tag idle';
+    $('qaAnswerContent').innerHTML='<div class="empty">Generating answer...</div>';
+  }
+
+  if(citation){
+    const passed=citation.passed;
+    $('qaCitationTag').textContent=passed?'verified':'issues found';
+    $('qaCitationTag').className='tag '+(passed?'good':'warn');
+    $('qaCitationDetails').innerHTML=`
+      <div class="qa-citation-stat">
+        <div class="chip"><span class="n">${citation.score?.toFixed(1)||'—'}</span><span class="l">Score</span></div>
+        <div class="chip"><span class="n">${(citation.resolved||[]).length}</span><span class="l">Resolved</span></div>
+        <div class="chip"><span class="n">${(citation.failed||[]).length}</span><span class="l">Failed</span></div>
+      </div>
+      <div class="note">${esc(citation.note||'')}</div>
+      ${(citation.failed||[]).length?`<div style="margin-top:10px"><strong style="color:var(--red);font-size:12px">Unresolved citations:</strong>${citation.failed.map(f=>`<div class="mono" style="font-size:11px;margin-top:4px">${esc(f.doi||f.arxiv_id||f.citation||'unknown')}</div>`).join('')}</div>`:''}
+      ${(citation.unverifiable||[]).length?`<div style="margin-top:10px"><strong style="color:var(--muted);font-size:12px">Unverifiable (author-year):</strong>${citation.unverifiable.slice(0,5).map(u=>`<div class="mono" style="font-size:11px;margin-top:4px">${esc(u.citation||'')}</div>`).join('')}</div>`:''}
+    `;
+  }else{
+    $('qaCitationTag').textContent='pending';
+    $('qaCitationTag').className='tag idle';
+    $('qaCitationDetails').innerHTML='<div class="empty">Citation verification pending.</div>';
+  }
+
+  const findings=qa.key_findings||[];
+  $('qaKeyFindings').innerHTML=findings.length?findings.map(f=>`<div class="qa-finding">${esc(f)}</div>`).join(''):'<div class="empty">No key findings recorded.</div>';
+  $('qaLimitations').textContent=qa.limitations||'No limitations noted.';
+
+  const bib=qa.bibliography||[];
+  $('qaBibTag').textContent=`${bib.length} sources`;
+  _pageState['qaBibliography']=_pageState['qaBibliography']||0;
+  paginatedList('qaBibliography',bib,(b,i)=>{
+    const id=b.doi||b.arxiv_id||'';
+    const link=b.doi?`https://doi.org/${b.doi}`:b.arxiv_id?`https://arxiv.org/abs/${b.arxiv_id}`:'';
+    return `<div class="qa-bib-entry">
+      <div class="qa-bib-title">${esc(b.title||'Untitled')} ${b.year?`<span class="note">(${esc(b.year)})</span>`:''}</div>
+      <div class="qa-bib-meta">${id?`<span class="mono">${esc(id)}</span>${link?` <a href="${esc(link)}" target="_blank" rel="noopener">link</a>`:''}`:'<span class="note">No identifier</span>'}</div>
+    </div>`;
+  },{pageSize:8,page:_pageState['qaBibliography']});
+
+  const papers=lit?.papers||[];
+  $('qaLitTag').textContent=`${papers.length} papers`;
+  _pageState['qaLiterature']=_pageState['qaLiterature']||0;
+  paginatedList('qaLiterature',papers,(p,i)=>{
+    return `<div class="qa-lit-row">
+      <div style="flex:1;min-width:0">
+        <div class="qa-lit-title">${esc(p.title||'Untitled')} ${p.year?`<span class="note">(${esc(p.year)})</span>`:''} ${p.cited_by_count?`<span class="note">· ${esc(p.cited_by_count)} citations</span>`:''}</div>
+        <div class="qa-lit-abstract">${esc((p.abstract||'').slice(0,300))}${(p.abstract||'').length>300?'…':''}</div>
+        <div class="mono" style="font-size:11px;margin-top:4px;color:var(--muted)">${p.doi?`doi: ${esc(p.doi)}`:''} ${p.arxiv_id?`arXiv: ${esc(p.arxiv_id)}`:''}</div>
+      </div>
+    </div>`;
+  },{pageSize:8,page:_pageState['qaLiterature']});
 }
 
 function artifactCard(kind,name,obj){
@@ -272,13 +559,46 @@ function renderAgents(){
 
 function renderPaper(){
   const w=workspace();
+  const qaMode=isQAMode();
+  const qa=w.qa_answer;
+  if(qaMode&&qa){
+    const bib=qa.bibliography||[];
+    const findings=qa.key_findings||[];
+    let html=`<div class="paper">`;
+    html+=`<div id="section-0" style="scroll-margin-top:80px"><h3>QA Synthesis Answer</h3>`;
+    html+=`<p style="color:var(--muted);font-size:13px;margin-bottom:16px">Query: ${esc(qa.query||w.user_query||'')}</p>`;
+    html+=`<div>${esc(qa.answer||'').replaceAll('\n\n','</p><p>').replaceAll('\n','<br>')}</div></div>`;
+    if(findings.length){
+      html+=`<div id="section-1" style="scroll-margin-top:80px;margin-top:24px"><h3>Key Findings</h3><ul>`;
+      findings.forEach(f=>{html+=`<li>${esc(f)}</li>`});
+      html+=`</ul></div>`;
+    }
+    if(qa.limitations){
+      html+=`<div id="section-2" style="scroll-margin-top:80px;margin-top:24px"><h3>Limitations</h3><p>${esc(qa.limitations)}</p></div>`;
+    }
+    if(bib.length){
+      html+=`<div id="section-${findings.length?2:1}${qa.limitations?1:0}" style="scroll-margin-top:80px;margin-top:24px"><h3>Bibliography</h3>`;
+      bib.forEach(b=>{
+        const id=b.doi||b.arxiv_id||'';
+        const link=b.doi?`https://doi.org/${b.doi}`:b.arxiv_id?`https://arxiv.org/abs/${b.arxiv_id}`:'';
+        html+=`<p>${esc(b.title||'Untitled')}${b.year?` (${esc(b.year)})`:''}${id?` <span class="mono" style="font-size:12px;color:var(--muted)">${esc(id)}</span>`:''}${link?` <a href="${esc(link)}" target="_blank" rel="noopener">link</a>`:''}</p>`;
+      });
+      html+=`</div>`;
+    }
+    html+=`</div>`;
+    $('paperScores').innerHTML='';
+    $('paperContent').innerHTML=html;
+    renderTOC();
+    return;
+  }
   const s=w.draft_sections||w.paper?.sections||{};
   const scores=w.supervisor_scores||{};
   $('paperScores').innerHTML=Object.keys(scores).length?Object.entries(scores).map(([k,v])=>`<div class="chip"><span class="n">${esc(v)}</span><span class="l">${esc(k)}</span></div>`).join(''):'';
-  $('paperContent').innerHTML=Object.keys(s).length?Object.entries(s).map(([n,c])=>{
+  $('paperContent').innerHTML=Object.keys(s).length?`<div class="paper">${Object.entries(s).map(([n,c],i)=>{
     const body=String(c??'');
-    return `<h3>${esc(n)} ${copyBtn(body,'copy')}</h3><div>${esc(body).replaceAll('\n','<br>')}</div>`;
-  }).join(''):'<div class="empty">The manuscript will appear after verified evidence is available.</div>';
+    return `<div id="section-${i}" style="scroll-margin-top:80px"><h3>${esc(n)} ${copyBtn(body,'copy')}</h3><div>${esc(body).replaceAll('\n','<br>')}</div></div>`;
+  }).join('')}</div>`:'<div class="paper"><div class="empty"><div class="empty-state-icon">&#128221;</div><div class="empty-state-title">No manuscript yet</div><div class="empty-state-desc">The manuscript will appear here after verified evidence is available and the writer agent has completed drafting.</div></div></div>';
+  renderTOC();
 }
 
 function renderActivity(){
@@ -307,21 +627,41 @@ function renderActivity(){
 
 async function renderRuns(){
   const data=await api('/api/runs');
-  $('runTable').innerHTML=`<table><thead><tr><th>Run</th><th>Status</th><th>Phase</th><th>Started</th><th></th></tr></thead><tbody>${
-    (data.runs||[]).map(r=>`<tr>
-      <td><div class="copy-row"><span class="mono">${esc(r.run_id)}</span>${copyBtn(r.run_id)}</div></td>
-      <td><span class="tag ${tagFor(r.status)}">${esc(r.status)}</span></td>
-      <td>${esc(r.phase||'')}</td>
-      <td class="mono">${esc(r.started_at||'')}</td>
-      <td><button data-select-run="${esc(r.run_id)}">Select</button> <button class="primary" data-rerun-run="${esc(r.run_id)}">Re-run</button> <button class="danger" data-delete-run="${esc(r.run_id)}">Delete</button></td>
-    </tr>`).join('')
-  }</tbody></table>`;
+  let runs=data.runs||[];
+  // Search filter
+  if(runSearchQuery){
+    runs=runs.filter(r=>{
+      const mode=runMode(r);
+      const searchStr=`${r.run_id} ${mode} ${r.status} ${r.phase||''}`.toLowerCase();
+      return searchStr.includes(runSearchQuery);
+    });
+  }
+  // Mode filter
+  if(runFilterMode!=='all'){
+    runs=runs.filter(r=>{
+      const isQA=runMode(r)==='QA';
+      return runFilterMode==='qa'?isQA:!isQA;
+    });
+  }
+  $('runTable').innerHTML=`<table><thead><tr><th>Run</th><th>Mode</th><th>Status</th><th>Phase</th><th>Started</th><th></th></tr></thead><tbody>${
+    runs.map(r=>{
+      const mode=runMode(r);
+      return `<tr>
+        <td><div class="copy-row"><span class="mono">${esc(r.run_id)}</span>${copyBtn(r.run_id)}</div></td>
+        <td><span class="tag">${esc(mode)}</span></td>
+        <td><span class="tag ${tagFor(r.status)}">${esc(r.status)}</span></td>
+        <td>${esc(r.phase||'')}</td>
+        <td class="mono">${esc(r.started_at||'')}</td>
+        <td><button data-select-run="${esc(r.run_id)}">Select</button> <button class="primary" data-rerun-run="${esc(r.run_id)}">Re-run</button> <button class="danger" data-delete-run="${esc(r.run_id)}">Delete</button></td>
+      </tr>`;
+    }).join('')
+  }</tbody></table>`+(!runs.length?'<div class="empty">No runs match your search.</div>':'');
   document.querySelectorAll('[data-select-run]').forEach(button=>button.onclick=async()=>{
     selectedRunId=button.dataset.selectRun;await refresh();showView('overview');
   });
   document.querySelectorAll('[data-rerun-run]').forEach(button=>button.onclick=async()=>{
     const runId=button.dataset.rerunRun;
-    if(!confirm(`Re-run from checkpoint for run ${runId}? This will resume from where it left off.`))return;
+    if(!await confirmAction('Re-run',`Re-run from checkpoint for run ${runId}? This will resume from where it left off.`))return;
     try{
       await api(`/api/run/resume/${encodeURIComponent(runId)}`,{method:'POST'});
       selectedRunId=runId;
@@ -329,7 +669,7 @@ async function renderRuns(){
     }catch(e){alert(e.message)}
   });
   document.querySelectorAll('[data-delete-run]').forEach(button=>button.onclick=async()=>{
-    if(!confirm(`Delete run ${button.dataset.deleteRun}?`))return;
+    if(!await confirmAction('Delete run',`Delete run ${button.dataset.deleteRun}? This cannot be undone.`))return;
     try{
       await api(`/api/runs/${encodeURIComponent(button.dataset.deleteRun)}`,{method:'DELETE'});
       if(selectedRunId===button.dataset.deleteRun)selectedRunId=null;
@@ -337,6 +677,8 @@ async function renderRuns(){
     }catch(e){$('settingsNote').textContent=e.message}
   });
 }
+
+function tryParse(s){try{return JSON.parse(s)}catch{return{}}}
 
 function bindCopies(root=document){
   root.querySelectorAll('[data-copy]').forEach(btn=>{
@@ -348,11 +690,13 @@ function bindCopies(root=document){
 
 function render(){
   renderOverview();
+  renderQA();
   renderExperiments();
   renderEvidence();
   renderAgents();
   renderPaper();
   renderActivity();
+  renderPresets();
   $('dbPath').textContent=dashboard.config?.research_db_path||window.settingsValues?.research_db_path||'local ledger';
   bindCopies();
 }
@@ -365,9 +709,9 @@ async function refresh(){
       api('/api/run/status'),
       api(`/api/scratchpad?limit=30${selectedRunId?`&run_id=${encodeURIComponent(selectedRunId)}`:''}`),
     ]);
-    render();
-    if($('runs').classList.contains('active')) await renderRuns();
   }catch(e){$('settingsNote').textContent=e.message}
+  render();
+  try{if($('runs').classList.contains('active')) await renderRuns()}catch(e){}
 }
 
 async function saveSettingsForm(){
@@ -384,6 +728,104 @@ async function saveSettingsForm(){
   return result;
 }
 
+// --- Mode selector ---
+$('runMode').onchange=()=>{
+  currentMode=$('runMode').value;
+  $('queryGroup').style.display=currentMode==='qa'?'flex':'none';
+};
+
+// --- Start run ---
+$('startButton').onclick=async()=>{
+  try{
+    const mode=$('runMode').value;
+    const body={domain:settingValue('research_domain')||null,provider:settingValue('llm_provider')||undefined,mode};
+    if(mode==='qa'){
+      const query=$('runQuery').value.trim();
+      if(!query){alert('Please enter a query for QA mode.');return}
+      body.query=query;
+    }
+    await api('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    refresh();
+  }catch(e){alert(e.message)}
+};
+
+// --- Dark mode ---
+function applyTheme(theme){
+  document.documentElement.setAttribute('data-theme',theme);
+  localStorage.setItem('scholargraph-theme',theme);
+  const btn=$('darkModeToggle');
+  if(btn)btn.textContent=theme==='dark'?'light':'dark';
+}
+function toggleDarkMode(){
+  const current=document.documentElement.getAttribute('data-theme');
+  applyTheme(current==='dark'?'light':'dark');
+}
+$('darkModeToggle').onclick=toggleDarkMode;
+// Restore saved theme
+const savedTheme=localStorage.getItem('scholargraph-theme');
+if(savedTheme)applyTheme(savedTheme);
+
+// --- QA export ---
+$('copyQaAnswer').onclick=()=>{
+  const w=workspace();
+  const qa=w.qa_answer;
+  if(!qa){toast('No QA answer to copy');return}
+  copyText(qa.answer||'');
+};
+$('exportQaAnswer').onclick=()=>{
+  const w=workspace();
+  const qa=w.qa_answer;
+  if(!qa){toast('No QA answer to export');return}
+  const bib=qa.bibliography||[];
+  const findings=qa.key_findings||[];
+  let md=`# QA Synthesis Answer\n\n`;
+  md+=`**Query:** ${qa.query||w.user_query||'—'}\n\n`;
+  md+=`## Answer\n\n${qa.answer||''}\n\n`;
+  if(findings.length){
+    md+=`## Key Findings\n\n`;
+    findings.forEach((f,i)=>{md+=`${i+1}. ${f}\n`});
+    md+=`\n`;
+  }
+  if(qa.limitations){md+=`## Limitations\n\n${qa.limitations}\n\n`}
+  if(bib.length){
+    md+=`## Bibliography\n\n`;
+    bib.forEach(b=>{
+      md+=`- ${b.title||'Untitled'} (${b.year||'n.d.'})`;
+      if(b.doi)md+=` doi:${b.doi}`;
+      if(b.arxiv_id)md+=` arXiv:${b.arxiv_id}`;
+      md+=`\n`;
+    });
+    md+=`\n`;
+  }
+  const w2=w.qa_citation_verification;
+  if(w2){
+    md+=`## Citation Verification\n\n`;
+    md+=`- Score: ${w2.score?.toFixed(1)||'—'}\n`;
+    md+=`- Passed: ${w2.passed?'Yes':'No'}\n`;
+    md+=`- Note: ${w2.note||'—'}\n`;
+  }
+  copyText(md);
+  toast('Markdown exported to clipboard');
+};
+
+// --- Keyboard shortcuts ---
+document.addEventListener('keydown',(e)=>{
+  // Ignore when typing in inputs
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;
+  const key=e.key.toLowerCase();
+  if(key==='r'&&!e.ctrlKey&&!e.metaKey){e.preventDefault();refresh()}
+  if(key==='d'&&!e.ctrlKey&&!e.metaKey){e.preventDefault();toggleDarkMode()}
+  if(key==='1'){e.preventDefault();showView('overview')}
+  if(key==='2'){e.preventDefault();showView('experiments')}
+  if(key==='3'){e.preventDefault();showView('evidence')}
+  if(key==='4'){e.preventDefault();showView('paper')}
+  if(key==='5'){e.preventDefault();showView('activity')}
+  if(key==='6'){e.preventDefault();showView('runs')}
+  if(key==='7'){e.preventDefault();showView('settings')}
+  if(key==='q'&&!e.ctrlKey&&!e.metaKey){e.preventDefault();showView('qa')}
+  if(e.key==='Escape'){document.activeElement?.blur()}
+});
+
 $('refreshButton').onclick=refresh;
 $('copyRunId').onclick=()=>copyText(dashboard.run_id,$('copyRunId'));
 $('copyExpSummary').onclick=()=>{
@@ -396,15 +838,8 @@ $('copyPaperBtn').onclick=()=>{
   copyText(text||'');
 };
 
-$('startButton').onclick=async()=>{
-  try{
-    await api('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({domain:settingValue('research_domain')||null,provider:settingValue('llm_provider')||undefined})});
-    refresh();
-  }catch(e){alert(e.message)}
-};
-
 $('resetOutputsButton').onclick=async()=>{
-  if(!confirm('Clear generated outputs only? History is preserved.'))return;
+  if(!await confirmAction('Reset outputs','Clear generated outputs only? History is preserved.'))return;
   const confirmation=prompt('Type RESET_OUTPUTS to confirm:');
   if(confirmation!=='RESET_OUTPUTS')return;
   try{await api('/api/data/reset/outputs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation})});await refresh()}
@@ -412,7 +847,7 @@ $('resetOutputsButton').onclick=async()=>{
 };
 
 $('resetCatalogButton').onclick=async()=>{
-  if(!confirm('This separately deletes catalog assets. Continue?'))return;
+  if(!await confirmAction('Reset catalog','This separately deletes catalog assets. Continue?'))return;
   const confirmation=prompt('Type DELETE_DATASET_CATALOG to confirm:');
   if(confirmation!=='DELETE_DATASET_CATALOG')return;
   try{await api('/api/data/reset/catalog',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation})});await refresh()}
@@ -444,23 +879,64 @@ document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{
 });
 
 // Server-Sent Events for real-time updates
-const source = new EventSource('/api/admin/stream');
-source.onmessage = function(event) {
-  try {
-    const data = JSON.parse(event.data);
-    if (data.type === 'dashboard') {
-      render();
+let sseRetryMs = 1000;
+let sseRetryMax = 30000;
+function connectSSE() {
+  const source = new EventSource('/api/admin/stream');
+  source.onmessage = function(event) {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.type === 'dashboard' && data.payload) {
+        dashboard = data.payload;
+        render();
+      }
+    } catch (e) {
+      console.error('Failed to parse SSE data', e);
     }
-  } catch (e) {
-    console.error('Failed to parse SSE data', e);
+  };
+  source.onerror = function() {
+    source.close();
+    setTimeout(function() { connectSSE(); }, sseRetryMs);
+    sseRetryMs = Math.min(sseRetryMs * 2, sseRetryMax);
+  };
+  source.onopen = function() {
+    sseRetryMs = 1000;
+  };
+}
+connectSSE();
+
+// --- Pagination event delegation ---
+document.addEventListener('click',(e)=>{
+  const prev=e.target.closest('[data-page-prev]');
+  const next=e.target.closest('[data-page-next]');
+  if(!prev&&!next)return;
+  const id=prev?.dataset.pagePrev||next?.dataset.pageNext;
+  if(!id)return;
+  const w=workspace();
+  const qa=w.qa_answer;
+  const lit=w.literature_context;
+  if(id==='qaBibliography'){
+    const bib=qa?.bibliography||[];
+    const renderFn=(b)=>{
+      const id2=b.doi||b.arxiv_id||'';
+      const link=b.doi?`https://doi.org/${b.doi}`:b.arxiv_id?`https://arxiv.org/abs/${b.arxiv_id}`:'';
+      return `<div class="qa-bib-entry"><div class="qa-bib-title">${esc(b.title||'Untitled')} ${b.year?`<span class="note">(${esc(b.year)})</span>`:''}</div><div class="qa-bib-meta">${id2?`<span class="mono">${esc(id2)}</span>${link?` <a href="${esc(link)}" target="_blank" rel="noopener">link</a>`:''}`:'<span class="note">No identifier</span>'}</div></div>`;
+    };
+    if(prev)prevPage(id,bib,renderFn,{pageSize:8});
+    else nextPage(id,bib,renderFn,{pageSize:8});
   }
-};
-source.onerror = function(err) {
-  console.error('SSE connection error', err);
-};
+  if(id==='qaLiterature'){
+    const papers=lit?.papers||[];
+    const renderFn=(p)=>{
+      return `<div class="qa-lit-row"><div style="flex:1;min-width:0"><div class="qa-lit-title">${esc(p.title||'Untitled')} ${p.year?`<span class="note">(${esc(p.year)})</span>`:''} ${p.cited_by_count?`<span class="note">· ${esc(p.cited_by_count)} citations</span>`:''}</div><div class="qa-lit-abstract">${esc((p.abstract||'').slice(0,300))}${(p.abstract||'').length>300?'…':''}</div><div class="mono" style="font-size:11px;margin-top:4px;color:var(--muted)">${p.doi?`doi: ${esc(p.doi)}`:''} ${p.arxiv_id?`arXiv: ${esc(p.arxiv_id)}`:''}</div></div></div>`;
+    };
+    if(prev)prevPage(id,papers,renderFn,{pageSize:8});
+    else nextPage(id,papers,renderFn,{pageSize:8});
+  }
+});
 
 (async()=>{
   try{await loadSettings()}catch(e){$('settingsNote').textContent=e.message}
   await refresh();
 })();
-setInterval(refresh,3000);
+setInterval(refresh,5000);

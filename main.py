@@ -20,6 +20,7 @@ from core.state import ResearchState, initialize_state
 from core.utils import log_agent_action
 from core.verification import reproducibility_dossier
 from core.workflow import create_research_graph as build_research_graph
+from core.workflow import create_qa_graph as build_qa_graph
 from core import workflow_nodes
 from core.workflow_nodes import (
     editing_node,
@@ -27,12 +28,17 @@ from core.workflow_nodes import (
     engineering_node,
     hypothesis_debate_node,
     independent_validation_node,
+    is_valid_plan,
     meta_evaluation_node,
     planning_node,
+    qa_answer_node,
+    qa_literature_retrieval_node,
+    qa_verification_node,
     reset_node,
     should_continue,
     should_reset,
     supervision_node,
+    terminal_planning_failure,
     verify_result_numbers,
     write_narrative_sections,
 )
@@ -71,6 +77,7 @@ def create_research_graph() -> StateGraph:
             "topic_discovery": topic_discovery_node,
             "hypothesis_debate": hypothesis_debate_node,
             "planning": planning_node,
+            "terminal_planning_failure": terminal_planning_failure,
             "data_validation": data_validation_node,
             "writing_narrative": write_narrative_sections,
             "engineering": engineering_node,
@@ -82,6 +89,18 @@ def create_research_graph() -> StateGraph:
             "reset": reset_node,
             "should_reset": should_reset,
             "should_continue": should_continue,
+            "is_valid_plan": is_valid_plan,
+        }
+    )
+
+
+def create_qa_mode_graph() -> StateGraph:
+    """Create the QA-mode LangGraph workflow."""
+    return build_qa_graph(
+        {
+            "qa_literature_retrieval": qa_literature_retrieval_node,
+            "qa_answer": qa_answer_node,
+            "qa_verification": qa_verification_node,
         }
     )
 
@@ -119,15 +138,23 @@ def main():
 
         parser = argparse.ArgumentParser(description="Run or resume a ScholarGraph research workflow")
         parser.add_argument("--resume", metavar="RUN_ID", help="resume a durable checkpoint by run id")
+        parser.add_argument("--mode", choices=["full_research", "qa"], default="full_research",
+                            help="run mode: full_research (default) or qa (literature synthesis)")
+        parser.add_argument("--query", metavar="QUERY", help="user query for QA mode")
         args = parser.parse_args()
+        if args.mode == "qa" and not args.query:
+            parser.error("--query is required when --mode=qa")
         tracker = start_run(args.resume)
         pipeline = ResearchPipeline(
             create_research_graph,
             create_checkpointer,
             context=create_run_context(tracker),
+            mode_graphs={"qa": create_qa_mode_graph},
         )
-        initial_state = initialize_state()
+        initial_state = initialize_state(mode=args.mode)
         initial_state["run_id"] = args.resume or tracker.run_id
+        if args.mode == "qa" and args.query:
+            initial_state["user_query"] = args.query
         print(f"✅ Initial state created (run_id={tracker.run_id})")
         print("\n🚀 Starting research workflow...")
         print("=" * 50)
@@ -167,13 +194,34 @@ def main():
         )
         state = result.state
         print("\n" + "=" * 50)
-        print("🎉 Research workflow completed!")
-        if state["latex_output"]:
-            print(f"📄 LaTeX paper generated: {config.output_dir}/paper_output.tex")
-        if state["supervisor_scores"]:
-            average = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
-            print(f"📊 Final average score: {average:.2f}")
-        print(f"📁 All outputs saved to: {config.output_dir}")
+        if state.get("mode") == "qa":
+            print("✅ QA synthesis completed!")
+            qa = state.get("qa_answer")
+            if qa:
+                print(f"\n📝 Query: {qa.get('query') or state.get('user_query', '?')}")
+                print(f"\n📖 Answer:\n{qa.get('answer', 'No answer')}")
+                findings = qa.get("key_findings", [])
+                if findings:
+                    print(f"\n🔑 Key Findings:")
+                    for i, f in enumerate(findings, 1):
+                        print(f"  {i}. {f}")
+                bib = qa.get("bibliography", [])
+                if bib:
+                    print(f"\n📚 Bibliography ({len(bib)} sources):")
+                    for b in bib:
+                        print(f"  - {b.get('title', '?')} ({b.get('year', '?')})")
+                citation = state.get("qa_citation_verification", {})
+                if citation:
+                    print(f"\n✔️  Citations: {'PASSED' if citation.get('passed') else 'ISSUES'} (score: {citation.get('score', 0):.1f})")
+            print(f"\n📁 Output saved to: {config.output_dir}")
+        else:
+            print("🎉 Research workflow completed!")
+            if state["latex_output"]:
+                print(f"📄 LaTeX paper generated: {config.output_dir}/paper_output.tex")
+            if state["supervisor_scores"]:
+                average = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
+                print(f"📊 Final average score: {average:.2f}")
+            print(f"📁 All outputs saved to: {config.output_dir}")
     except Exception as exc:
         logger.error(f"Research system failed: {exc}")
         print(f"❌ Error: {exc}")

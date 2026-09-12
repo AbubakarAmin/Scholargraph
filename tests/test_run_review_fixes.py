@@ -145,7 +145,7 @@ def test_engineer_retries_claim_inconsistency_before_failing(monkeypatch):
     monkeypatch.setattr("agents.engineer.validate_code", lambda code: (True, ""))
     monkeypatch.setattr("agents.engineer.fixture_for", lambda *_a, **_k: {})
     monkeypatch.setattr(
-        "agents.engineer.run_multi_seed",
+        "agents.engineer.execute_multi_seed",
         lambda *_a, **_k: {
             "success": True,
             "aggregate_metrics": {"accuracy": {"mean": 0.9, "std": 0.0}},

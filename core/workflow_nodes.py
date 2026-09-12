@@ -10,11 +10,12 @@ from typing import Any, Dict, List
 from core.config import config
 from core.context import get_active_context
 from core.evidence_gate import build_contract, gate_engineering_outputs, validate_dataset_identity, validate_experiments
+from core.llm import call_llm
 from core.run_log import CrossRunMemory, get_tracker
 from core.research_db import research_db
 from core.state import ResearchState, initialize_state
-from core.utils import log_agent_action
-from core.verification import reproducibility_dossier, validate_empirical_claims
+from core.utils import log_agent_action, parse_json_from_llm
+from core.verification import reproducibility_dossier, validate_empirical_claims, verify_citations
 
 from agents.editor import EditorAgent
 from agents.data import DataAgent
@@ -169,6 +170,7 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
                     "score": getattr(result, "score", None),
                     "decision": getattr(result, "moderator_decision", None),
                     "unresolved": list(getattr(result, "unresolved_objections", []) or [])[:5],
+                    "structured_hypothesis": current_topic.get("structured_hypothesis"),
                 },
             )
             state["topics"] = state["topics"][1:]
@@ -893,6 +895,189 @@ def editing_node(state: ResearchState) -> ResearchState:
         return state
 
 
+# ---------------------------------------------------------------------------
+# QA mode nodes
+# ---------------------------------------------------------------------------
+
+
+def qa_literature_retrieval_node(state: ResearchState) -> ResearchState:
+    """Retrieve literature for the user query using TopicHunter's shared retrieval."""
+    log_agent_action("Orchestrator", "qa_literature_retrieval", {"query": state.get("user_query")})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("qa_literature_retrieval")
+    query = state.get("user_query") or ""
+    if not query:
+        state["terminal_error"] = "QA mode requires a user_query"
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    try:
+        hunter = _create_agent(TopicHunterAgent)
+        lit = hunter.retrieve_literature(query)
+        if not lit.get("papers"):
+            state["terminal_error"] = "No literature found for the query"
+            state["current_phase"] = "complete"
+            state["should_continue"] = False
+            return state
+        state["literature_context"] = lit
+        state["current_phase"] = "qa_answer"
+        log_agent_action("Orchestrator", "qa_literature_retrieved", {"paper_count": len(lit.get("papers", []))})
+        return state
+    except ResearchSourceUnavailable as exc:
+        state["terminal_error"] = str(exc)
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        log_agent_action("Orchestrator", "qa_research_sources_unavailable", {"message": str(exc)})
+        return state
+    except Exception as exc:
+        logger.error(f"QA literature retrieval failed: {exc}")
+        state["terminal_error"] = f"QA literature retrieval failed: {exc}"
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+
+
+def qa_answer_node(state: ResearchState) -> ResearchState:
+    """Produce a citation-backed synthesis answer from retrieved literature."""
+    log_agent_action("Orchestrator", "qa_answer", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("qa_answer")
+    if state.get("terminal_error"):
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    lit = state.get("literature_context") or {}
+    papers = lit.get("papers", [])
+    query = state.get("user_query") or ""
+    if not papers or not query:
+        state["terminal_error"] = "No literature or query available for QA answer"
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    try:
+        paper_summaries = []
+        for p in papers[:15]:
+            paper_summaries.append({
+                "title": p.get("title", ""),
+                "abstract": (p.get("abstract") or "")[:1500],
+                "doi": p.get("doi"),
+                "arxiv_id": p.get("arxiv_id"),
+                "year": p.get("year"),
+                "cited_by_count": p.get("cited_by_count"),
+            })
+        prompt = f"""You are a research synthesis assistant. Answer the following question using ONLY the provided literature.
+For every factual claim, cite the source paper using its DOI or arXiv ID in the format: doi:10.XXXX/... or arXiv:XXXX.XXXXX.
+If you cannot answer from the provided literature, say so explicitly.
+
+Question: {query}
+
+Relevant Literature:
+{json.dumps(paper_summaries, indent=2)[:12000]}
+
+Provide a structured answer with:
+1. A concise summary (2-4 paragraphs)
+2. Key findings from the literature
+3. A bibliography listing each cited paper with its DOI/arXiv ID
+4. An limitations section noting what the literature does not cover
+
+Return JSON:
+{{
+  "answer": "synthesis text with inline citations",
+  "key_findings": ["finding 1", "finding 2"],
+  "bibliography": [{{"title": "...", "doi": "...", "arxiv_id": "...", "year": 2024}}],
+  "limitations": "what the literature does not cover"
+}}"""
+        raw = call_llm(prompt, temperature=0.3, tier="strong")
+        parsed = parse_json_from_llm(raw) or {}
+        answer_text = parsed.get("answer", "")
+        if not answer_text:
+            state["terminal_error"] = "QA answer generation produced empty output"
+            state["current_phase"] = "complete"
+            state["should_continue"] = False
+            return state
+        citation_verification = verify_citations(answer_text)
+        state["qa_answer"] = {
+            "answer": answer_text,
+            "key_findings": parsed.get("key_findings", []),
+            "bibliography": parsed.get("bibliography", []),
+            "limitations": parsed.get("limitations", ""),
+            "query": query,
+        }
+        state["qa_citation_verification"] = citation_verification
+        if not citation_verification.get("passed"):
+            state["meta_feedback"].append(
+                f"QA citation verification failed: {citation_verification.get('note', 'unknown')}"
+            )
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        log_agent_action("Orchestrator", "qa_answer_complete", {
+            "citations_passed": citation_verification.get("passed"),
+            "citations_score": citation_verification.get("score"),
+        })
+        return state
+    except Exception as exc:
+        logger.error(f"QA answer generation failed: {exc}")
+        state["terminal_error"] = f"QA answer generation failed: {exc}"
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+
+
+def qa_verification_node(state: ResearchState) -> ResearchState:
+    """Verify QA answer quality, citation integrity, and finalize the run."""
+    log_agent_action("Orchestrator", "qa_verification", {})
+    tracker = get_tracker()
+    if tracker:
+        tracker.set_phase("qa_verification")
+    if state.get("terminal_error"):
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    qa_answer = state.get("qa_answer")
+    if not qa_answer:
+        state["terminal_error"] = "QA verification failed: no answer to verify"
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+    try:
+        answer_text = qa_answer.get("answer", "")
+        bibliography = qa_answer.get("bibliography", [])
+        key_findings = qa_answer.get("key_findings", [])
+        citation_verification = state.get("qa_citation_verification", {})
+        issues = []
+        if not answer_text.strip():
+            issues.append("Empty answer text")
+        if len(key_findings) == 0:
+            issues.append("No key findings extracted")
+        if len(bibliography) == 0:
+            issues.append("No bibliography entries")
+        if not citation_verification.get("passed"):
+            score = citation_verification.get("score", 0)
+            failed_count = len(citation_verification.get("failed", []))
+            issues.append(f"Citation verification issues: score={score:.1f}, {failed_count} unresolved")
+        if issues:
+            state["meta_feedback"].append(f"QA verification notes: {'; '.join(issues)}")
+        else:
+            state["meta_feedback"].append("QA verification passed: answer, findings, bibliography, and citations all valid")
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        log_agent_action("Orchestrator", "qa_verification_complete", {
+            "issues": len(issues),
+            "citations_passed": citation_verification.get("passed"),
+            "findings_count": len(key_findings),
+            "bibliography_count": len(bibliography),
+        })
+        return state
+    except Exception as exc:
+        logger.error(f"QA verification failed: {exc}")
+        state["meta_feedback"].append(f"QA verification error: {exc}")
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
+
+
 def reset_node(state: ResearchState) -> ResearchState:
     current_iteration = state["iteration"]
     log_agent_action("Orchestrator", "system_reset", {"iteration": current_iteration})
@@ -904,6 +1089,76 @@ def reset_node(state: ResearchState) -> ResearchState:
     state["iteration"] = current_iteration + 1
     state["current_phase"] = "topic_discovery"
     log_agent_action("Orchestrator", "reset_complete", {"new_iteration": state["iteration"]})
+    return state
+
+
+def is_valid_plan(state: ResearchState) -> bool:
+    """Guard: return True only when the plan is present and experiment specs
+    satisfy the contract schema required by downstream nodes.
+
+    This catches malformed variants (e.g. dicts missing ``name``) that
+    ``validate_experiments`` in evidence_gate passes because it only checks
+    ``isinstance(variant, dict)``.
+    """
+    plan = state.get("plan")
+    if not plan or not isinstance(plan, dict):
+        return False
+    experiments = plan.get("experiments")
+    if not isinstance(experiments, list) or not experiments:
+        return False
+    for exp in experiments:
+        if not isinstance(exp, dict):
+            return False
+        name = exp.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return False
+        if not exp.get("evaluation_metrics"):
+            return False
+        for variant in exp.get("variants") or exp.get("alternatives") or []:
+            if not isinstance(variant, dict):
+                return False
+            if not (isinstance(variant.get("name"), str) and variant["name"].strip()):
+                return False
+    return True
+
+
+def terminal_planning_failure(state: ResearchState) -> ResearchState:
+    """Terminal node: attribute the failure to PlannerAgent and halt."""
+    errors = []
+    plan = state.get("plan") or {}
+    experiments = plan.get("experiments") or []
+    for exp in experiments:
+        if not isinstance(exp, dict):
+            errors.append(f"experiment is not an object: {type(exp).__name__}")
+            continue
+        name = exp.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"experiment missing required 'name' field")
+        for idx, variant in enumerate(exp.get("variants") or exp.get("alternatives") or []):
+            if not isinstance(variant, dict):
+                errors.append(f"{name or 'unnamed'} variant[{idx}] is not an object")
+            elif not (isinstance(variant.get("name"), str) and variant["name"].strip()):
+                errors.append(f"{name or 'unnamed'} variant[{idx}] missing required 'name' field")
+    message = "PlannerAgent produced invalid plan: " + "; ".join(errors) if errors else "PlannerAgent produced invalid plan"
+    state["terminal_error"] = state.get("terminal_error") or message
+    state["evidence_gate"] = {
+        "allowed": False,
+        "terminal": True,
+        "reason_code": "invalid_experiment_plan",
+        "message": message,
+    }
+    state["current_phase"] = "complete"
+    state["should_continue"] = False
+    state["meta_feedback"].append(message)
+    state["technical_failures"] = {
+        "planning": {
+            "success": False,
+            "failure_kind": "invalid_plan_schema",
+            "reason_code": "invalid_experiment_plan",
+            "message": message,
+        }
+    }
+    log_agent_action("Orchestrator", "terminal_planning_failure", {"message": message})
     return state
 
 

@@ -86,6 +86,32 @@ class Config(BaseSettings):
     # Sandbox
     sandbox_timeout_sec: int = int(os.getenv("SANDBOX_TIMEOUT_SEC", "120"))
     sandbox_max_output_bytes: int = int(os.getenv("SANDBOX_MAX_OUTPUT_BYTES", "1048576"))
+    sandbox_backend: str = os.getenv("SANDBOX_BACKEND", "docker")  # "ast" | "docker"
+    sandbox_docker_memory: str = os.getenv("SANDBOX_DOCKER_MEMORY", "2g")
+    sandbox_docker_cpus: str = os.getenv("SANDBOX_DOCKER_CPUS", "1.0")
+
+    # --- TopicHunter v2 feature flags ---
+    openalex_concept_filtering_enabled: bool = os.getenv("OPENALEX_CONCEPT_FILTERING_ENABLED", "true").lower() == "true"
+    hyde_enabled: bool = os.getenv("HYDE_ENABLED", "true").lower() == "true"
+    hyde_max_chars: int = int(os.getenv("HYDE_MAX_CHARS", "600"))
+    multi_hop_retrieval_enabled: bool = os.getenv("MULTI_HOP_RETRIEVAL_ENABLED", "true").lower() == "true"
+    multi_hop_min_papers_threshold: int = int(os.getenv("MULTI_HOP_MIN_PAPERS_THRESHOLD", "12"))
+    multi_hop_max_hops: int = int(os.getenv("MULTI_HOP_MAX_HOPS", "2"))
+    frontier_seeding_enabled: bool = os.getenv("FRONTIER_SEEDING_ENABLED", "true").lower() == "true"
+    frontier_refresh_every_n_runs: int = int(os.getenv("FRONTIER_REFRESH_EVERY_N_RUNS", "5"))
+    frontier_sample_size: int = int(os.getenv("FRONTIER_SAMPLE_SIZE", "30"))
+    frontier_terms_extracted: int = int(os.getenv("FRONTIER_TERMS_EXTRACTED", "8"))
+    cross_seed_paper_cache_enabled: bool = os.getenv("CROSS_SEED_PAPER_CACHE_ENABLED", "true").lower() == "true"
+    capability_first_dataset_scoping_enabled: bool = os.getenv("CAPABILITY_FIRST_DATASET_SCOPING_ENABLED", "true").lower() == "true"
+    structural_gap_mining_enabled: bool = os.getenv("STRUCTURAL_GAP_MINING_ENABLED", "true").lower() == "true"
+    structural_gap_max_pairs: int = int(os.getenv("STRUCTURAL_GAP_MAX_PAIRS", "8"))
+    sparsity_matrix_enabled: bool = os.getenv("SPARSITY_MATRIX_ENABLED", "true").lower() == "true"
+    contradiction_mining_enabled: bool = os.getenv("CONTRADICTION_MINING_ENABLED", "true").lower() == "true"
+    replication_target_mining_enabled: bool = os.getenv("REPLICATION_TARGET_MINING_ENABLED", "true").lower() == "true"
+    negative_result_seeding_enabled: bool = os.getenv("NEGATIVE_RESULT_SEEDING_ENABLED", "true").lower() == "true"
+    persona_ensemble_enabled: bool = os.getenv("PERSONA_ENSEMBLE_ENABLED", "true").lower() == "true"
+    persona_count: int = int(os.getenv("PERSONA_COUNT", "2"))
+    seed_strategy_elo_enabled: bool = os.getenv("SEED_STRATEGY_ELO_ENABLED", "true").lower() == "true"
 
     # Web UI
     web_host: str = os.getenv("WEB_HOST", "127.0.0.1")
@@ -168,9 +194,33 @@ def apply_runtime_keys(keys: dict) -> None:
         "COMPANION_REPO_DIR": "companion_repo_dir",
         "SANDBOX_TIMEOUT_SEC": "sandbox_timeout_sec",
         "SANDBOX_MAX_OUTPUT_BYTES": "sandbox_max_output_bytes",
+        "SANDBOX_BACKEND": "sandbox_backend",
+        "SANDBOX_DOCKER_MEMORY": "sandbox_docker_memory",
+        "SANDBOX_DOCKER_CPUS": "sandbox_docker_cpus",
         "WEB_HOST": "web_host",
         "WEB_PORT": "web_port",
         "KEYS_STORE_PATH": "keys_store_path",
+        "OPENALEX_CONCEPT_FILTERING_ENABLED": "openalex_concept_filtering_enabled",
+        "HYDE_ENABLED": "hyde_enabled",
+        "HYDE_MAX_CHARS": "hyde_max_chars",
+        "MULTI_HOP_RETRIEVAL_ENABLED": "multi_hop_retrieval_enabled",
+        "MULTI_HOP_MIN_PAPERS_THRESHOLD": "multi_hop_min_papers_threshold",
+        "MULTI_HOP_MAX_HOPS": "multi_hop_max_hops",
+        "FRONTIER_SEEDING_ENABLED": "frontier_seeding_enabled",
+        "FRONTIER_REFRESH_EVERY_N_RUNS": "frontier_refresh_every_n_runs",
+        "FRONTIER_SAMPLE_SIZE": "frontier_sample_size",
+        "FRONTIER_TERMS_EXTRACTED": "frontier_terms_extracted",
+        "CROSS_SEED_PAPER_CACHE_ENABLED": "cross_seed_paper_cache_enabled",
+        "CAPABILITY_FIRST_DATASET_SCOPING_ENABLED": "capability_first_dataset_scoping_enabled",
+        "STRUCTURAL_GAP_MINING_ENABLED": "structural_gap_mining_enabled",
+        "STRUCTURAL_GAP_MAX_PAIRS": "structural_gap_max_pairs",
+        "SPARSITY_MATRIX_ENABLED": "sparsity_matrix_enabled",
+        "CONTRADICTION_MINING_ENABLED": "contradiction_mining_enabled",
+        "REPLICATION_TARGET_MINING_ENABLED": "replication_target_mining_enabled",
+        "NEGATIVE_RESULT_SEEDING_ENABLED": "negative_result_seeding_enabled",
+        "PERSONA_ENSEMBLE_ENABLED": "persona_ensemble_enabled",
+        "PERSONA_COUNT": "persona_count",
+        "SEED_STRATEGY_ELO_ENABLED": "seed_strategy_elo_enabled",
     }
     for env_key, attr in mapping.items():
         if env_key in keys and keys[env_key] not in (None, ""):
@@ -234,9 +284,33 @@ def sync_env_file(keys: dict, env_path: Optional[Path] = None) -> Path:
         "COMPANION_REPO_DIR",
         "SANDBOX_TIMEOUT_SEC",
         "SANDBOX_MAX_OUTPUT_BYTES",
+        "SANDBOX_BACKEND",
+        "SANDBOX_DOCKER_MEMORY",
+        "SANDBOX_DOCKER_CPUS",
         "WEB_HOST",
         "WEB_PORT",
         "KEYS_STORE_PATH",
+        "OPENALEX_CONCEPT_FILTERING_ENABLED",
+        "HYDE_ENABLED",
+        "HYDE_MAX_CHARS",
+        "MULTI_HOP_RETRIEVAL_ENABLED",
+        "MULTI_HOP_MIN_PAPERS_THRESHOLD",
+        "MULTI_HOP_MAX_HOPS",
+        "FRONTIER_SEEDING_ENABLED",
+        "FRONTIER_REFRESH_EVERY_N_RUNS",
+        "FRONTIER_SAMPLE_SIZE",
+        "FRONTIER_TERMS_EXTRACTED",
+        "CROSS_SEED_PAPER_CACHE_ENABLED",
+        "CAPABILITY_FIRST_DATASET_SCOPING_ENABLED",
+        "STRUCTURAL_GAP_MINING_ENABLED",
+        "STRUCTURAL_GAP_MAX_PAIRS",
+        "SPARSITY_MATRIX_ENABLED",
+        "CONTRADICTION_MINING_ENABLED",
+        "REPLICATION_TARGET_MINING_ENABLED",
+        "NEGATIVE_RESULT_SEEDING_ENABLED",
+        "PERSONA_ENSEMBLE_ENABLED",
+        "PERSONA_COUNT",
+        "SEED_STRATEGY_ELO_ENABLED",
     }
     updates = {
         str(k): str(v)

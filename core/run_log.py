@@ -113,6 +113,7 @@ class RunTracker:
                 "started_at": self.started_at,
                 "ended_at": _now(),
                 "success": success,
+                "outcome_status": "released" if success else "unsupported",
                 "stats": self.stats,
                 "phase": self.phase,
             }
@@ -483,4 +484,34 @@ class CrossRunMemory:
         with _lock:
             if self.path.exists():
                 self.path.write_text("", encoding="utf-8")
+
+    def get_negative_result_lessons(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Feature 6: query rejected topics with structured hypotheses, returning
+        only structured hypothesis fields — never raw draft/narrative text.
+
+        Reads from rejection records (which now include structured_hypothesis
+        from the topic that failed debate). Fail-closed: any query error → return [].
+        """
+        try:
+            entries = self.load("rejection", limit=limit * 5)
+            negative = []
+            for entry in entries:
+                if entry.get("kind") != "topic":
+                    continue
+                meta = entry.get("meta") or {}
+                hyp = meta.get("structured_hypothesis") or {}
+                if not hyp:
+                    continue
+                negative.append({
+                    "hypothesis_kind": hyp.get("hypothesis_kind", ""),
+                    "research_question": hyp.get("research_question", ""),
+                    "falsification_condition": hyp.get("falsification_condition", ""),
+                    "dependent_variables": hyp.get("dependent_variables", []),
+                    "outcome_status": "unsupported",
+                })
+                if len(negative) >= limit:
+                    break
+            return negative
+        except Exception:
+            return []
 

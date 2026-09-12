@@ -1,13 +1,14 @@
 """Shared state contract for the ScholarGraph workflow."""
 
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
-from .contracts import DatasetArtifact, ExecutionArtifact, ExperimentContract, ExperimentOutput, Plan, StatisticalReport, Topic, VerificationReport
+from .contracts import DatasetArtifact, ExecutionArtifact, ExperimentContract, ExperimentOutput, LiteratureContext, Plan, StatisticalReport, Topic, VerificationReport
 
 
 class ResearchState(TypedDict):
     """Mutable state passed between LangGraph workflow nodes."""
 
+    mode: Union[Literal["full_research"], Literal["qa"]]
     iteration: int
     current_phase: str
     should_reset: bool
@@ -43,11 +44,16 @@ class ResearchState(TypedDict):
     evidence_gate: Dict[str, Any]
     human_approved: bool
     outcome_calibration: Dict[str, Any]
+    literature_context: Optional[LiteratureContext]
+    qa_answer: Optional[Dict[str, Any]]
+    qa_citation_verification: Optional[Dict[str, Any]]
+    user_query: Optional[str]
 
 
-def initialize_state() -> ResearchState:
+def initialize_state(mode: str = "full_research") -> ResearchState:
     """Return a fresh state for a new research run."""
     return ResearchState(
+        mode=mode,
         iteration=0,
         current_phase="topic_discovery",
         should_reset=False,
@@ -83,4 +89,8 @@ def initialize_state() -> ResearchState:
         evidence_gate={},
         human_approved=False,
         outcome_calibration={},
+        literature_context=None,
+        qa_answer=None,
+        qa_citation_verification=None,
+        user_query=None,
     )

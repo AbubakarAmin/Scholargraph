@@ -17,11 +17,32 @@ from core.llm import call_llm, generate_embedding
 from core.llm import get_llm_client
 from core.context import RunContext, get_active_context
 from core.memory import memory
-from core.sandbox import execute_sandboxed, run_multi_seed, run_known_answer_check, validate_code
+from core.sandbox import run_known_answer_check, validate_code
+from core.sandbox_dispatch import execute as sandbox_execute, execute_multi_seed
 from core.run_log import get_tracker, CrossRunMemory, emit_event
 from core.research_db import research_db
 from core.contracts import CodeClaimReport, ExperimentOutput, ExperimentSpec, RevisionRequest
 from core.known_answers import fixture_for
+
+
+def _effectively_empty_code(code: str) -> bool:
+    """Return True if code contains only comments/docstrings with no runnable statements."""
+    code_text = (code or "").strip()
+    if not code_text:
+        return True
+    try:
+        import ast
+        tree = ast.parse(code_text)
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.Assign, ast.For, ast.While,
+                                 ast.If, ast.With, ast.FunctionDef, ast.ClassDef,
+                                 ast.Return, ast.Import, ast.ImportFrom)):
+                return False
+            if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
+                return False
+        return True
+    except SyntaxError:
+        return not bool(code_text)
 
 
 class EngineerAgent:
@@ -93,6 +114,8 @@ class EngineerAgent:
         original_experiment_name = experiment.get("name")
         decision_log = []
         code = ""
+        last_error = ""
+        last_failure_kind = "technical"
         self._progress("experiment_start", {
             "experiment": experiment.get("name"),
             "max_attempts": max_attempts,
@@ -106,7 +129,6 @@ class EngineerAgent:
                 "max_attempts": max_attempts,
                 "action": "generate_code",
             })
-            # Prefer previously refined code when REFINE left it on approach
             if approach.get("_refined_code"):
                 code = approach.pop("_refined_code")
             else:
@@ -120,14 +142,36 @@ class EngineerAgent:
                     "attempt": attempt,
                     "reason": reason,
                 })
+                last_error = reason
+                last_failure_kind = reason
                 if attempt >= max_attempts:
                     self.request_plan_revision(reason, approach, detail="code generation returned empty string")
-                    return self._fail(approach, reason, decision_log, code, failure_kind=reason, original_name=original_experiment_name)
                 approach = {
                     **approach,
                     "refine_feedback": (
                         "Previous generation returned NO code (empty string). "
                         "Return COMPLETE runnable Python only — no markdown fences, no prose."
+                    ),
+                }
+                continue
+
+            if (code or "").strip() and _effectively_empty_code(code):
+                reason = "empty_code_generation"
+                decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": reason})
+                self._progress("experiment_refine", {
+                    "experiment": approach.get("name"),
+                    "attempt": attempt,
+                    "reason": reason,
+                })
+                last_error = reason
+                last_failure_kind = reason
+                if attempt >= max_attempts:
+                    self.request_plan_revision(reason, approach, detail="code contains only comments/docstrings")
+                approach = {
+                    **approach,
+                    "refine_feedback": (
+                        "Previous generation returned only comments or docstrings with no runnable code. "
+                        "Return COMPLETE runnable Python with actual computation — no markdown fences, no prose."
                     ),
                 }
                 continue
@@ -143,13 +187,13 @@ class EngineerAgent:
                 code = self._refine_code(code, err, approach)
                 ok, err = validate_code(code)
                 if not ok:
-                    if attempt >= max_attempts or self._is_plan_level_sandbox_block(err):
-                        self.request_plan_revision(
-                            "sandbox_blocked_required_api",
-                            approach,
-                            detail=err,
-                        )
+                    if self._is_plan_level_sandbox_block(err):
+                        self.request_plan_revision("sandbox_blocked_required_api", approach, detail=err)
                         return self._fail(approach, err, decision_log, code, original_name=original_experiment_name)
+                    last_error = err
+                    last_failure_kind = "technical"
+                    if attempt >= max_attempts:
+                        self.request_plan_revision("sandbox_blocked_required_api", approach, detail=err)
                     approach = {**approach, "refine_feedback": err}
                     continue
 
@@ -158,17 +202,11 @@ class EngineerAgent:
                 check = run_known_answer_check(code, known_answer.get("metrics") or {}, float(known_answer.get("tolerance", 1e-3)))
                 if not check.get("passed"):
                     detail = json.dumps(check.get("mismatches") or check.get("reason"), default=str)
+                    decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": "known_answer_check_failed"})
+                    last_error = "known_answer_check_failed: " + detail
+                    last_failure_kind = "known_answer_check_failed"
                     if attempt >= max_attempts:
                         self.request_plan_revision("known_answer_check_failed", approach, detail=detail)
-                        return self._fail(
-                            approach,
-                            "known_answer_check_failed: " + detail,
-                            decision_log,
-                            code,
-                            failure_kind="known_answer_check_failed",
-                            original_name=original_experiment_name,
-                        )
-                    decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": "known_answer_check_failed"})
                     approach = {
                         **approach,
                         "refine_feedback": f"Known-answer check failed: {detail}. Fix the implementation.",
@@ -191,16 +229,10 @@ class EngineerAgent:
                     "reason": "code_claim_inconsistency",
                     "detail": detail[:400],
                 })
+                last_error = "code_claim_inconsistency: " + detail
+                last_failure_kind = "code_claim_inconsistency"
                 if attempt >= max_attempts:
                     self.request_plan_revision("code_claim_inconsistency", approach, detail=detail)
-                    return self._fail(
-                        approach,
-                        "code_claim_inconsistency: " + detail,
-                        decision_log,
-                        code,
-                        failure_kind="code_claim_inconsistency",
-                        original_name=original_experiment_name,
-                    )
                 baselines = approach.get("baselines") or approach.get("baseline_comparison") or []
                 components = approach.get("claimed_components") or approach.get("components") or []
                 approach = {
@@ -219,7 +251,7 @@ class EngineerAgent:
                 "action": "multi_seed",
                 "seeds": self.runtime_config.experiment_seeds,
             })
-            multi = run_multi_seed(code, n_seeds=self.runtime_config.experiment_seeds)
+            multi = execute_multi_seed(code, n_seeds=self.runtime_config.experiment_seeds)
 
             if multi.get("success") and multi.get("aggregate_metrics"):
                 self._progress("experiment_ablation", {
@@ -277,10 +309,13 @@ class EngineerAgent:
                 "decision": decision,
                 "reason": str(error)[:400],
             })
+            last_error = error
+            last_failure_kind = "technical"
             if decision == "REFINE":
                 if tracker:
                     tracker.bump("refines")
-                refined = self._refine_code(code, error, approach)
+                local_ctx = multi.get("local_code_context", "")
+                refined = self._refine_code(code, error, approach, local_context=local_ctx)
                 approach = {**approach, "refine_feedback": error, "_refined_code": refined}
             else:  # PIVOT
                 if tracker:
@@ -293,7 +328,7 @@ class EngineerAgent:
                     return self._fail(approach, error, decision_log, code, original_name=original_experiment_name)
 
         self.request_plan_revision("max_attempts_exhausted", approach, detail="bounded code-only repair attempts exhausted")
-        return self._fail(approach, "max_attempts_exhausted", decision_log, code, original_name=original_experiment_name)
+        return self._fail(approach, last_error or "max_attempts_exhausted", decision_log, code, failure_kind=last_failure_kind, original_name=original_experiment_name)
 
     def run_branching_search(
         self,
@@ -314,7 +349,7 @@ class EngineerAgent:
         for cand in candidates:
             code = self._generate_experiment_code({**cand, "cheap_mode": True})
             # Single seed cheap probe
-            probe = execute_sandboxed(code, seed=42)
+            probe = sandbox_execute(code, seed=42)
             score = 0.0
             probe_ok = False
             if probe.get("success"):
@@ -619,11 +654,14 @@ Return ONLY Python code.
             log_agent_action("EngineerAgent", "code_generation_error", {"error": str(e)})
             return self._generate_fallback_code(experiment)
 
-    def _refine_code(self, code: str, error: str, experiment: Dict[str, Any]) -> str:
+    def _refine_code(self, code: str, error: str, experiment: Dict[str, Any], local_context: str = "") -> str:
+        context_block = ""
+        if local_context:
+            context_block = f"\nDebugging context (traceback + implicated custom functions):\n{local_context}\n"
         prompt = f"""
 Fix this experiment code. Error:
 {error}
-
+{context_block}
 Code:
 ```python
 {code}
@@ -657,7 +695,7 @@ Return ONLY Python. Still print JSON metrics.
             ok, _ = validate_code(abl_code)
             if not ok:
                 continue
-            run = execute_sandboxed(abl_code, seed=42)
+            run = sandbox_execute(abl_code, seed=42)
             abl_results[comp] = {
                 "success": run.get("success"),
                 "metrics": (run.get("parsed") or {}).get("metrics"),
@@ -677,7 +715,9 @@ Return ONLY Python. Still print JSON metrics.
         if not artifact["error"] or artifact["error"] == "this isn't feasible":
             artifact["suspicious_bare_claim"] = True
         error_text = str(error)
-        if failure_kind == "technical":
+        if _effectively_empty_code(code or ""):
+            failure_kind = "empty_code_generation"
+        elif failure_kind == "technical":
             if error_text.startswith("empty_code_generation"):
                 failure_kind = "empty_code_generation"
             elif error_text.startswith("code_claim_inconsistency"):

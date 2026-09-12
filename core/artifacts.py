@@ -48,10 +48,13 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
         elif hasattr(state, "__dict__"):
             state = state.__dict__
 
+        is_qa = state.get("mode") == "qa"
+
         if state.get("terminal_error") or state.get("evidence_gate", {}).get("terminal"):
-            dossier = save_failure_dossier(state, target_dir)
-            logger.warning("Run stopped before release; failure dossier saved to %s", dossier)
-            return
+            if not is_qa or not state.get("qa_answer"):
+                dossier = save_failure_dossier(state, target_dir)
+                logger.warning("Run stopped before release; failure dossier saved to %s", dossier)
+                return
 
         if state.get("latex_output") and state.get("human_approved", False):
             latex_file = os.path.join(target_dir, "paper_output.tex")
@@ -67,7 +70,23 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
                 yaml.dump(state["plan"], handle, default_flow_style=False)
             logger.info("Plan saved to %s", plan_file)
 
+        if is_qa and state.get("qa_answer"):
+            qa_file = os.path.join(target_dir, "qa_answer.json")
+            qa_output = {
+                "query": state.get("user_query"),
+                "answer": state["qa_answer"].get("answer"),
+                "key_findings": state["qa_answer"].get("key_findings", []),
+                "bibliography": state["qa_answer"].get("bibliography", []),
+                "limitations": state["qa_answer"].get("limitations", ""),
+                "citation_verification": state.get("qa_citation_verification", {}),
+                "literature_paper_count": len((state.get("literature_context") or {}).get("papers", [])),
+            }
+            with open(qa_file, "w", encoding="utf-8") as handle:
+                json.dump(qa_output, handle, indent=2)
+            logger.info("QA answer saved to %s", qa_file)
+
         summary = {
+            "mode": state.get("mode", "full_research"),
             "iteration": state.get("iteration", 0),
             "selected_topic": state.get("selected_topic"),
             "sections_written": list(state.get("draft_sections", {}).keys()),
@@ -76,6 +95,11 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
             "meta_feedback": [str(item) for item in state.get("meta_feedback", [])],
             "publishable": bool(state.get("human_approved", False)),
         }
+        if is_qa:
+            summary["user_query"] = state.get("user_query")
+            summary["qa_answer"] = state.get("qa_answer")
+            summary["qa_citation_verification"] = state.get("qa_citation_verification")
+            summary["literature_paper_count"] = len((state.get("literature_context") or {}).get("papers", []))
         summary_file = os.path.join(target_dir, "research_summary.json")
         with open(summary_file, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2)
@@ -95,6 +119,7 @@ def save_failure_dossier(state: ResearchState, output_dir: str) -> str:
     summary = build_run_summary(state, error=state.get("terminal_error"))
     dossier = {
         "status": "failed",
+        "mode": state.get("mode", "full_research"),
         "run_id": state.get("run_id") or summary.get("run_id"),
         "terminal_error": state.get("terminal_error"),
         "evidence_gate": state.get("evidence_gate", {}),
@@ -105,6 +130,11 @@ def save_failure_dossier(state: ResearchState, output_dir: str) -> str:
         "verification_findings": state.get("verification_findings", []),
         "summary": summary,
     }
+    if state.get("mode") == "qa":
+        dossier["user_query"] = state.get("user_query")
+        dossier["literature_context"] = state.get("literature_context")
+        dossier["qa_answer"] = state.get("qa_answer")
+        dossier["qa_citation_verification"] = state.get("qa_citation_verification")
     dossier_path = target_dir / "failure_dossier.json"
     dossier_path.write_text(json.dumps(dossier, indent=2, default=str), encoding="utf-8")
     summary_path = target_dir / "research_summary.json"

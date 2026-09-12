@@ -13,6 +13,7 @@
   <div class="rail-label">Workspace</div>
   <nav class="nav">
     <button class="active" data-view="overview">Overview</button>
+    <button data-view="qa" id="navQA" style="display:none">QA Answer</button>
     <button data-view="experiments">Experiments</button>
     <button data-view="evidence">Evidence</button>
     <button data-view="agents">Agents</button>
@@ -24,14 +25,32 @@
     <button data-view="runs">Run history</button>
     <button data-view="settings">Settings</button>
   </nav>
-  <div class="rail-foot">Local control plane<br><span id="dbPath">Connecting...</span></div>
+  <div class="rail-foot">
+    <div class="rail-controls">
+      <button class="ghost" id="darkModeToggle" title="Toggle dark mode">dark</button>
+    </div>
+    Local control plane<br><span id="dbPath">Connecting...</span>
+  </div>
 </aside>
 
 <main class="main">
 <header class="topbar">
   <h1 id="viewTitle">Run overview</h1>
   <div class="run-state"><i id="pulse" class="pulse"></i><span id="runStatus">Idle</span><span id="runId"></span><button class="ghost" id="copyRunId" title="Copy run id" style="display:none">copy</button></div>
-  <button class="primary" id="startButton">Start run</button>
+  <div class="run-controls">
+    <div class="mode-select">
+      <label for="runMode">Mode</label>
+      <select id="runMode">
+        <option value="full_research">Full Research</option>
+        <option value="qa">QA Synthesis</option>
+      </select>
+    </div>
+    <div class="query-input" id="queryGroup" style="display:none">
+      <label for="runQuery">Query</label>
+      <input id="runQuery" type="text" placeholder="e.g., What are the main attention mechanisms in transformers?">
+    </div>
+    <button class="primary" id="startButton">Start run</button>
+  </div>
 </header>
 
 <div class="content">
@@ -49,23 +68,45 @@
       <button class="danger" id="resetCatalogButton">Reset dataset catalog</button>
     </div>
   </div>
+  <div id="onboardingCard" class="onboarding-card" style="display:none">
+    <h3>Welcome to ScholarGraph</h3>
+    <p>Get started with your research in three simple steps:</p>
+    <div class="onboarding-steps">
+      <div class="onboarding-step"><div class="onboarding-step-num">1</div><div class="onboarding-step-text"><strong>Choose mode</strong><br>Select Full Research for complete pipeline or QA Synthesis for quick literature-backed answers.</div></div>
+      <div class="onboarding-step"><div class="onboarding-step-num">2</div><div class="onboarding-step-text"><strong>Configure settings</strong><br>Set your research domain and LLM provider in Settings.</div></div>
+      <div class="onboarding-step"><div class="onboarding-step-num">3</div><div class="onboarding-step-text"><strong>Start run</strong><br>Click "Start run" to begin automated research.</div></div>
+    </div>
+  </div>
   <div class="grid">
     <article class="card span-3"><div class="metric-label">Release readiness</div><div id="readiness" class="metric-value">Pending</div><div class="note" id="readinessNote">Waiting for evidence</div></article>
     <article class="card span-3"><div class="metric-label">Current phase</div><div id="phaseMetric" class="metric-value">Idle</div><div class="note" id="phaseNote">No run selected</div></article>
-    <article class="card span-3"><div class="metric-label">Experiments</div><div id="experimentMetric" class="metric-value">0 / 0</div><div class="note" id="experimentNote">None planned</div></article>
+    <article class="card span-3"><div class="metric-label">Run mode</div><div id="modeMetric" class="metric-value">-</div><div class="note" id="modeNote">No active run</div></article>
     <article class="card span-3"><div class="metric-label">Blocking findings</div><div id="findingMetric" class="metric-value">0</div><div class="note">Independent verifier</div></article>
     <article class="card span-12">
-      <div class="card-head"><h3>Pipeline state</h3><span id="phaseTag" class="tag">idle</span></div>
-      <div id="phaseList" class="phase-list"></div>
+      <div class="card-head"><h3>Run metrics</h3><span class="tag">live</span></div>
+      <div class="cost-tracker">
+        <div class="cost-item"><span class="cost-value" id="costTokens">0</span><span class="cost-label">Tokens</span></div>
+        <div class="cost-item"><span class="cost-value" id="costCalls">0</span><span class="cost-label">LLM calls</span></div>
+        <div class="cost-item"><span class="cost-value" id="costDuration">0m</span><span class="cost-label">Duration</span></div>
+        <div class="cost-item"><span class="cost-value" id="costPhases">0</span><span class="cost-label">Phases done</span></div>
+      </div>
     </article>
-    <article class="card span-7">
+    <article class="card span-12">
+      <div class="card-head"><h3>Pipeline progress</h3><span id="phaseTag" class="tag">idle</span></div>
+      <div id="pipelineTimeline" class="pipeline-timeline"></div>
+    </article>
+    <article class="card span-7" id="gateCard">
       <div class="card-head"><h3>Release gate</h3><span id="gateTag" class="tag warn">Incomplete</span></div>
       <div id="gateRows"></div>
     </article>
-    <article class="card span-5">
-      <div class="card-head"><h3>Experiment progress</h3><span class="tag">planned → ran</span></div>
+    <article class="card span-5" id="expProgressCard">
+      <div class="card-head"><h3>Experiment progress</h3><span class="tag">planned -> ran</span></div>
       <div id="expProgress" class="progress"></div>
       <div id="expOverviewList" style="margin-top:14px"></div>
+    </article>
+    <article class="card span-12">
+      <div class="card-head"><h3>Discovered topics</h3><span class="tag" id="topicCount">0 topics</span></div>
+      <div id="topicCards" class="topic-cards"></div>
     </article>
     <article class="card span-7">
       <div class="card-head"><h3>Latest activity</h3><span class="tag">live feed</span></div>
@@ -74,6 +115,42 @@
     <article class="card span-5">
       <div class="card-head"><h3>Run snapshot</h3><span class="tag">signals</span></div>
       <div id="snapshotRows"></div>
+    </article>
+  </div>
+</section>
+
+<section id="qa" class="view">
+  <div class="title-row">
+    <div>
+      <div class="eyebrow">QA Synthesis</div>
+      <h2>QA Answer</h2>
+      <p class="sub" id="qaQueryLine">Literature-backed synthesis answer.</p>
+    </div>
+    <div class="actions">
+      <button id="copyQaAnswer">Copy answer</button>
+      <button id="exportQaAnswer">Export as Markdown</button>
+    </div>
+  </div>
+  <div class="grid">
+    <article class="card span-8">
+      <div class="card-head"><h3>Synthesis answer</h3><span id="qaAnswerTag" class="tag idle">pending</span></div>
+      <div id="qaAnswerContent" class="paper"></div>
+    </article>
+    <article class="card span-4">
+      <div class="card-head"><h3>Citation verification</h3><span id="qaCitationTag" class="tag idle">pending</span></div>
+      <div id="qaCitationDetails"></div>
+      <div class="card-head" style="margin-top:20px"><h3>Key findings</h3></div>
+      <div id="qaKeyFindings"></div>
+      <div class="card-head" style="margin-top:20px"><h3>Limitations</h3></div>
+      <div id="qaLimitations" class="note"></div>
+    </article>
+    <article class="card span-12">
+      <div class="card-head"><h3>Bibliography</h3><span id="qaBibTag" class="tag">0 sources</span></div>
+      <div id="qaBibliography"></div>
+    </article>
+    <article class="card span-12">
+      <div class="card-head"><h3>Retrieved literature</h3><span id="qaLitTag" class="tag">0 papers</span></div>
+      <div id="qaLiterature"></div>
     </article>
   </div>
 </section>
@@ -151,7 +228,13 @@
     <div class="actions"><button id="copyPaperBtn">Copy manuscript</button></div>
   </div>
   <div id="paperScores" class="progress" style="margin-bottom:16px"></div>
-  <div id="paperContent" class="paper"></div>
+  <div class="paper-toc">
+    <nav class="toc-panel">
+      <div class="toc-title">Sections</div>
+      <div id="tocList"></div>
+    </nav>
+    <div class="paper-content" id="paperContent"></div>
+  </div>
 </section>
 
 <section id="activity" class="view">
@@ -190,6 +273,14 @@
       <p class="sub">Durable runs stored in the research ledger.</p>
     </div>
   </div>
+  <div class="run-search">
+    <input id="runSearchInput" type="text" placeholder="Search runs by ID, mode, or status...">
+    <div class="run-filters">
+      <button class="run-filter-btn active" data-filter="all">All</button>
+      <button class="run-filter-btn" data-filter="full_research">Research</button>
+      <button class="run-filter-btn" data-filter="qa">QA</button>
+    </div>
+  </div>
   <article class="card"><div id="runTable"></div></article>
 </section>
 
@@ -199,6 +290,14 @@
       <div class="eyebrow">Runtime</div>
       <h2>System settings</h2>
       <p class="sub">All runtime fields are editable. Saving updates the live process, local keys store, and project .env.</p>
+    </div>
+  </div>
+  <div class="preset-bar">
+    <span class="note">Presets:</span>
+    <div id="presetList"></div>
+    <div class="preset-save">
+      <input id="presetNameInput" type="text" placeholder="Preset name...">
+      <button class="ghost" id="savePresetBtn">Save current</button>
     </div>
   </div>
   <div id="settingsTabs" class="actions" style="margin-bottom:16px"></div>
@@ -217,6 +316,16 @@
 </main>
 </div>
 <div id="toast" class="toast"></div>
+<div id="confirmOverlay" class="confirm-overlay">
+  <div class="confirm-dialog">
+    <h3 id="confirmTitle" class="confirm-title">Confirm action</h3>
+    <p id="confirmMessage" class="confirm-message">Are you sure?</p>
+    <div class="confirm-actions">
+      <button id="confirmCancel">Cancel</button>
+      <button class="primary" id="confirmOk">Confirm</button>
+    </div>
+  </div>
+</div>
 
 <script src="/static/admin/admin.js"></script>
 </body>

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Mapping, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterator, Mapping, Optional
 
 from .context import RunContext, activate_context, create_run_context, reset_context
 from .state import ResearchState
@@ -26,11 +26,21 @@ class ResearchPipeline:
         checkpointer_factory: Callable[[], Any],
         recursion_limit: int = 1000,
         context: Optional[RunContext] = None,
+        mode_graphs: Optional[Dict[str, Callable[[], Any]]] = None,
     ) -> None:
         self._graph_factory = graph_factory
         self._checkpointer_factory = checkpointer_factory
         self._recursion_limit = recursion_limit
         self.context = context or create_run_context()
+        self._mode_graphs = mode_graphs or {}
+
+    def _resolve_graph_factory(self, state: Optional[ResearchState]) -> Callable[[], Any]:
+        """Return the graph factory for the run's mode, falling back to default."""
+        if state:
+            mode = state.get("mode", "full_research")
+            if mode in self._mode_graphs:
+                return self._mode_graphs[mode]
+        return self._graph_factory
 
     def run(
         self,
@@ -41,22 +51,22 @@ class ResearchPipeline:
         finalize: Optional[Callable[[ResearchState], None]] = None,
     ) -> PipelineResult:
         """Execute the graph, finalize artifacts, and complete the run tracker."""
-        last_state = initial_state or {}
+        full_state = dict(initial_state) if initial_state else {}
         nodes_seen = 0
         try:
             for node_name, node_output in self.stream(initial_state, run_id, resume=resume):
                 nodes_seen += 1
-                last_state = node_output
+                full_state.update(node_output)
                 if on_node:
-                    on_node(node_name, node_output)
+                    on_node(node_name, full_state)
             if finalize:
-                finalize(last_state)
+                finalize(full_state)
             if self.context.tracker:
                 self.context.tracker.complete(
-                    success=bool(last_state.get("latex_output"))
-                    and not last_state.get("terminal_error")
+                    success=bool(full_state.get("latex_output") or full_state.get("qa_answer"))
+                    and not full_state.get("terminal_error")
                 )
-            return PipelineResult(last_state, nodes_seen)
+            return PipelineResult(full_state, nodes_seen)
         except Exception:
             if self.context.tracker:
                 self.context.tracker.complete(success=False)
@@ -72,7 +82,8 @@ class ResearchPipeline:
         self.context.run_id = run_id
         token = activate_context(self.context)
         try:
-            graph = self._graph_factory()
+            graph_factory = self._resolve_graph_factory(initial_state)
+            graph = graph_factory()
             app = graph.compile(checkpointer=self._checkpointer_factory())
             config = {
                 "configurable": {"thread_id": run_id},

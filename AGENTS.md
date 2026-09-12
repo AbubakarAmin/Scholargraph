@@ -10,6 +10,7 @@ python tests/smoke_offline.py    # quick smoke check, no API keys
 python run_ui.py                 # web UI at http://127.0.0.1:8765
 python main.py                   # CLI run
 python main.py --resume <run_id> # resume crashed run
+python main.py --mode qa --query "your question"  # QA literature synthesis mode
 ```
 
 ## Key gotchas
@@ -19,6 +20,8 @@ python main.py --resume <run_id> # resume crashed run
 - `memory/keys.json` stores UI-entered API keys. Never commit it; it's in `.gitignore`.
 - `memory/checkpoints.sqlite` and `memory/research_ledger.sqlite` are durable run state. Both are gitignored.
 - Matplotlib is forced to `Agg` backend process-wide (`core/config.py:18`) to avoid Tcl crashes on Windows.
+- `run_ui.py` kills existing processes on the same port before binding — no manual cleanup needed.
+- Config defaults in `core/config.py` may differ from `env_example.txt` (e.g., `DEBATE_PASS_THRESHOLD` is `7.0` in code, `7.5` in env_example.txt). Code wins at runtime.
 
 ## Project structure
 
@@ -29,7 +32,7 @@ This is a flat Python project, not a monorepo.
 | `agents/` | One file per agent role (topic_hunter, debate, planner, writer, engineer, data, execution, analysis, verification, supervisor, meta_agent, editor) |
 | `core/` | Shared services: config, LLM client, sandbox, memory, verification, workflow graph, research DB, source broker, contracts, capabilities |
 | `web/` | FastAPI app (`app.py`) + static frontend (`static/admin.html`) |
-| `tests/` | Offline eval harness and per-module tests |
+| `tests/` | Offline eval harness and per-module tests (26 files; all mocked/offline) |
 | `output/` | Generated papers, raw results, events, companion repo (gitignored) |
 | `memory/` | FAISS index, keys, cross-run lessons, Elo ratings (gitignored) |
 | `templates/` | LaTeX templates |
@@ -57,6 +60,8 @@ The eval harness (`tests/test_eval_harness.py`) is the primary measurement surfa
 LangGraph orchestrates a pipeline: Topic Hunter → Debate → Planner → Data Validation → Writer (pre-engineering) → Engineer → Independent Validation (Execution → Analysis → Verification) → Writer (post-engineering) → Supervisor → Editor.
 
 Graph definition lives in `core/workflow.py` and `core/workflow_nodes.py`. State is `ResearchState` TypedDict in `core/state.py`.
+
+A separate QA-mode graph (`core/workflow.py:create_qa_graph`) runs: Literature Retrieval → Synthesis Answer → Verification. Invoked via `--mode qa --query "..."`.
 
 ## What NOT to do
 

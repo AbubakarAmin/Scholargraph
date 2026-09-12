@@ -20,6 +20,7 @@ def create_research_graph(nodes: Mapping[str, Node]) -> StateGraph:
     workflow.add_node("topic_discovery", nodes["topic_discovery"])
     workflow.add_node("hypothesis_debate", nodes["hypothesis_debate"])
     workflow.add_node("planning", nodes["planning"])
+    workflow.add_node("terminal_planning_failure", nodes["terminal_planning_failure"])
     workflow.add_node("data_validation", nodes["data_validation"])
     workflow.add_node("writing_narrative", nodes["writing_narrative"])
     workflow.add_node("engineering", nodes["engineering"])
@@ -48,13 +49,16 @@ def create_research_graph(nodes: Mapping[str, Node]) -> StateGraph:
             return "end"
         if state.get("should_reset"):
             return "reset"
+        if not nodes["is_valid_plan"](state):
+            return "invalid_plan"
         return "continue"
 
     workflow.add_conditional_edges(
         "planning",
         _after_planning,
-        {"continue": "data_validation", "reset": "reset", "end": END},
+        {"continue": "data_validation", "invalid_plan": "terminal_planning_failure", "reset": "reset", "end": END},
     )
+    workflow.add_edge("terminal_planning_failure", END)
 
     def _after_data_validation(state: ResearchState) -> str:
         if state.get("current_phase") == "complete" or state.get("terminal_error") or not state.get("should_continue", True):
@@ -146,5 +150,27 @@ def create_research_graph(nodes: Mapping[str, Node]) -> StateGraph:
     )
     workflow.add_edge("editing", END)
     workflow.add_edge("reset", "topic_discovery")
+
+    return workflow
+
+
+def create_qa_graph(nodes: Mapping[str, Node]) -> StateGraph:
+    """Build the QA-mode graph: literature retrieval → synthesis answer → verification → done.
+
+    This graph skips hypothesis debate, planning, engineering, and
+    evidence-gate machinery entirely.  Citation grounding is enforced
+    via verify_citations() inside the qa_answer node, and a final
+    verification step checks answer completeness before completion.
+    """
+    workflow = StateGraph(ResearchState)
+
+    workflow.add_node("qa_literature_retrieval", nodes["qa_literature_retrieval"])
+    workflow.add_node("qa_answer", nodes["qa_answer"])
+    workflow.add_node("qa_verification", nodes["qa_verification"])
+
+    workflow.set_entry_point("qa_literature_retrieval")
+    workflow.add_edge("qa_literature_retrieval", "qa_answer")
+    workflow.add_edge("qa_answer", "qa_verification")
+    workflow.add_edge("qa_verification", END)
 
     return workflow

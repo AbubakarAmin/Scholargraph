@@ -216,6 +216,44 @@ class EloStore:
         self._persist()
         return delta
 
+    def record_strategy_outcome(self, strategy: str, outcome_status: str) -> float:
+        """Feature 8: record seed-strategy outcome under a strategy:<name> namespace key,
+        reusing the existing rating/shrinkage record shape. Returns Elo delta.
+
+        outcome_status uses debate-derived labels: "debate_pass", "debate_weak",
+        "debate_fail". These are NOT experiment-level outcomes — kind-Elo uses
+        the same semantics (there is no post-experiment Elo update in the system).
+        """
+        key = f"strategy:{strategy}"
+        record = self.get_record(key)
+        ra = _coerce_float(record.get("raw_rating"), self.prior)
+        rb = self.prior
+        ea = 1 / (1 + 10 ** ((rb - ra) / 400))
+        outcome_map = {"debate_pass": 1.0, "debate_weak": 0.5, "debate_fail": 0.0}
+        outcome = outcome_map.get(outcome_status, 0.5)
+        k_factor = 32
+        delta = k_factor * (outcome - ea)
+        new_raw = ra + delta
+        observations = _coerce_int(record.get("observations"), 0) + 1
+        prior = _coerce_float(record.get("prior"), self.prior)
+        shrink_k = _coerce_float(record.get("shrinkage_k"), self.shrinkage_k)
+        effective_k = (
+            max(shrink_k, self.min_observations - observations + 1)
+            if observations < self.min_observations
+            else shrink_k
+        )
+        shrunk = self._shrink(new_raw, observations, prior, effective_k)
+        self.records[key] = {
+            "rating": shrunk,
+            "raw_rating": new_raw,
+            "observations": observations,
+            "prior": prior,
+            "shrinkage_k": shrink_k,
+            "updated_at": datetime.now().isoformat(),
+        }
+        self._persist()
+        return delta
+
 
 def hypothesis_kind(title: str) -> str:
     """Coarse bucket for Elo (kinds of hypotheses)."""
@@ -721,6 +759,16 @@ class HypothesisDebateSystem:
 
         unresolved_now = [o for o in current_objections if o.get("status") != "resolved"]
         delta = self.elo.update(topic.get("title", "general"), final["score"], final["passed"])
+        # Feature 8: record seed-strategy outcome alongside kind-Elo
+        # NOTE: outcome_status here is debate-derived (argument quality), NOT
+        # experiment-derived. kind-Elo uses the same semantics — there is no
+        # second Elo update at the post-experiment stage.
+        seed_strategy = topic.get("seed_strategy")
+        if seed_strategy:
+            strategy_outcome = "debate_pass" if final["passed"] else (
+                "debate_weak" if final["score"] >= 6 else "debate_fail"
+            )
+            self.elo.record_strategy_outcome(seed_strategy, strategy_outcome)
         unresolved_text = [f"[{u.get('criterion')}] {u.get('objection')}" for u in unresolved_now]
 
         result = DebateResult(

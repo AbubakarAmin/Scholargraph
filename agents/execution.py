@@ -13,7 +13,8 @@ from typing import Any, Optional
 from core.capabilities import DEFAULT_MANIFESTS
 from core.context import RunContext, get_active_context
 from core.contracts import CodeArtifact, ExecutionArtifact, ExecutionRequest
-from core.sandbox import run_multi_seed, validate_code
+from core.sandbox import validate_code
+from core.sandbox_dispatch import execute_multi_seed
 
 
 class ExecutionAgent:
@@ -54,7 +55,7 @@ class ExecutionAgent:
                 created_at=now,
             )
 
-        result = run_multi_seed(code, n_seeds=len(seeds), base_seed=seeds[0])
+        result = execute_multi_seed(code, n_seeds=len(seeds), base_seed=seeds[0])
         if result.get("success") and len(seeds) != result.get("n_seeds"):
             result["requested_seeds"] = seeds
         status = "completed" if result.get("success") else "failed"

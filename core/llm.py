@@ -137,7 +137,7 @@ class LLMClient:
                 logger.warning(f"Embedding failed, attempt {attempt+1}/{_MAX_RETRIES}: {e}. Retrying in {wait:.1f}s")
                 time.sleep(wait)
         logger.error(f"Embedding failed after {_MAX_RETRIES} attempts: {last_error}")
-        return np.zeros(768)
+        return np.zeros(config.embedding_dimension)
 
     def _embed_gemini(self, text: str, model: Optional[str]) -> np.ndarray:
         model_id = model or config.gemini_embedding_model
@@ -145,23 +145,41 @@ class LLMClient:
         response = self._gemini.models.embed_content(
             model=model_name,
             contents=text,
+            output_dimensionality=config.embedding_dimension,
         )
         if hasattr(response, "embeddings") and response.embeddings:
-            return np.array(response.embeddings[0].values)
-        if hasattr(response, "embedding") and response.embedding:
+            vec = np.array(response.embeddings[0].values, dtype=float)
+        elif hasattr(response, "embedding") and response.embedding:
             vals = response.embedding.values
-            return np.array(vals[0].values if hasattr(vals[0], "values") else vals)
-        return np.array(response.values[0].values)
+            vec = np.array(vals[0].values if hasattr(vals[0], "values") else vals, dtype=float)
+        else:
+            vec = np.array(response.values[0].values, dtype=float)
+        actual_dim = vec.shape[0]
+        if actual_dim != config.embedding_dimension:
+            logger.warning(
+                f"Gemini embedding returned {actual_dim} dims, expected {config.embedding_dimension}. "
+                f"Adjusting to match FAISS index."
+            )
+            if actual_dim < config.embedding_dimension:
+                vec = np.pad(vec, (0, config.embedding_dimension - actual_dim))
+            else:
+                vec = vec[:config.embedding_dimension]
+        return vec
 
     def _embed_openai(self, text: str, model: Optional[str]) -> np.ndarray:
         model_id = model or config.openai_embedding_model
         response = self._openai.embeddings.create(model=model_id, input=text)
         vec = np.array(response.data[0].embedding, dtype=float)
-        # Pad/truncate to 768 for FAISS compatibility with existing indexes
-        if vec.shape[0] < 768:
-            vec = np.pad(vec, (0, 768 - vec.shape[0]))
-        elif vec.shape[0] > 768:
-            vec = vec[:768]
+        actual_dim = vec.shape[0]
+        if actual_dim != config.embedding_dimension:
+            logger.warning(
+                f"OpenAI embedding returned {actual_dim} dims, expected {config.embedding_dimension}. "
+                f"Adjusting to match FAISS index."
+            )
+            if actual_dim < config.embedding_dimension:
+                vec = np.pad(vec, (0, config.embedding_dimension - actual_dim))
+            else:
+                vec = vec[:config.embedding_dimension]
         return vec
 
 

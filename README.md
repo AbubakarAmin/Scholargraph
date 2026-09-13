@@ -83,8 +83,11 @@ copy env_example.txt .env   # Windows
 python run_ui.py
 # → http://127.0.0.1:8765
 
-# 3b. CLI
+# 3b. CLI — full research
 python main.py
+
+# 3c. CLI — QA literature synthesis
+python main.py --mode qa --query "What are the limitations of attention mechanisms for long sequences?"
 
 # 4. Tests (no API keys required for most)
 python -m pytest tests -q
@@ -229,19 +232,18 @@ Defined in `main.py` → `create_research_graph()`:
 |---|---|---|
 | `topic_discovery` | `should_reset` → reset / continue / end | `reset` \| `hypothesis_debate` \| `END` |
 | `hypothesis_debate` | same | `reset` \| `planning` \| `END` |
-| `planning` | always | `data_validation` |
-| `data_validation` | no explicit dataset | `writing_narrative` |
-| `data_validation` | valid explicit dataset | `writing_narrative` |
-| `data_validation` | invalid explicit dataset | `END` with terminal validation error |
-| `writing_narrative` | safe non-results sections only | `engineering` |
+| `planning` | valid plan | `data_validation` |
+| `planning` | invalid plan | `terminal_planning_failure` → `END` |
+| `planning` | `should_reset` / `terminal_error` | `reset` \| `END` |
+| `data_validation` | `should_continue` | `writing_narrative` |
+| `data_validation` | `terminal_error` / `complete` | `END` |
+| `writing_narrative` | `should_continue` | `engineering` |
 | `engineering` | `current_phase == "planning"` | `planning` (revision bounce) |
 | `engineering` | else | `independent_validation` |
-| `independent_validation` | no executable code artifact | `writing_results` with compatibility note |
-| `independent_validation` | code artifacts available | `writing_results` after replay, analysis, verification |
+| `independent_validation` | `should_continue` | `writing_results` |
 | `writing_results` | ungrounded quantitative claim, ≤2 retries | `writing_results` |
 | `writing_results` | grounded results/discussion/abstract | `supervision` |
-| `supervision` | avg ≥ threshold and no blocking finding | `editing` |
-| `supervision` | blocking independent finding | `meta_evaluation` |
+| `supervision` | `current_phase == "editing"` | `editing` |
 | `supervision` | else | `meta_evaluation` |
 | `meta_evaluation` | `should_continue` | `writing_narrative` \| `END` |
 | `editing` | always | `END` |
@@ -350,15 +352,16 @@ FROM research_artifacts WHERE run_id = ?;
 
 | Field | Type | Purpose |
 |---|---|---|
+| `mode` | `Union[Literal["full_research"], Literal["qa"]]` | Graph mode selection |
 | `iteration` | `int` | Outer loop / reset counter |
 | `current_phase` | `str` | Routing signal (`planning`, `editing`, `complete`, …) |
 | `should_reset` / `should_continue` | `bool` | Gate flags |
 | `error_count` | `int` | Consecutive soft-failure budget |
-| `topics` | `List[Dict]` | Ranked candidate topics |
-| `selected_topic` | `Optional[Dict]` | Topic under debate / plan |
-| `debate_results` | `List[DebateResult]` | Multi-round debate artifacts |
+| `topics` | `List[Topic]` | Ranked candidate topics |
+| `selected_topic` | `Optional[Topic]` | Topic under debate / plan |
+| `debate_results` | `List[Dict[str, Any]]` | Multi-round debate artifacts |
 | `hypothesis_passed` | `bool` | Debate gate |
-| `plan` | `Optional[Dict]` | Sections, contributions, experiments, variants |
+| `plan` | `Optional[Plan]` | Sections, contributions, experiments, variants |
 | `data_artifacts` | `Dict[str, DatasetArtifact]` | Validated user-provided dataset metadata, schema, and hashes |
 | `data_validation` | `VerificationReport` | Dataset gate result; explicit invalid datasets stop the run |
 | `execution_artifacts` | `Dict[str, ExecutionArtifact]` | Seeded replay outputs, raw paths, environment, and hashes |
@@ -376,6 +379,16 @@ FROM research_artifacts WHERE run_id = ?;
 | `results_verification` | `Dict[str, Any]` | Per-section numeric claim audit results |
 | `reproducibility` | `Dict[str, Any]` | Dossier: predictions, baselines, stats, raw results, code |
 | `terminal_error` | `Optional[str]` | User-actionable terminal infrastructure error; never a research conclusion |
+| `experiment_contracts` | `Dict[str, ExperimentContract]` | Immutable experiment contracts built by evidence gate |
+| `experiment_outcomes` | `Dict[str, str]` | Per-experiment outcome labels |
+| `technical_failures` | `Dict[str, Dict]` | Per-subsystem failure dossiers |
+| `evidence_gate` | `Dict[str, Any]` | Gate decision (allowed/terminal/reason) |
+| `human_approved` | `bool` | Explicit human checkpoint before publishable release |
+| `outcome_calibration` | `Dict[str, Any]` | Positive/negative/inconclusive outcome counts |
+| `literature_context` | `Optional[LiteratureContext]` | Raw literature retrieval for QA and full-research |
+| `qa_answer` | `Optional[Dict]` | QA-mode synthesis answer |
+| `qa_citation_verification` | `Optional[Dict]` | QA-mode citation verification |
+| `user_query` | `Optional[str]` | User query for QA mode |
 
 ---
 
@@ -396,12 +409,13 @@ Runtime settings from env / `.env` / UI `keys.json` via `apply_runtime_keys()`.
 | `llm_model_cheap` / `strong` / `judge` | empty | Optional tier overrides |
 | `ensemble_judge_models` | empty | Comma-separated judge models |
 | `supervisor_threshold` | `8.5` | Mean section score → editing |
-| `debate_pass_threshold` | `7.5` | Debate PASS floor |
-| `debate_min_rounds` / `max` | `2` / `4` | Adversarial rounds |
-| `novelty_similarity_reject` | `0.88` | Cosine ≥ → reject topic |
+| `debate_pass_threshold` | `7.0` | Debate PASS floor |
+| `debate_min_rounds` / `max` | `2` / `5` | Adversarial rounds |
+| `novelty_similarity_reject` | `0.92` | Cosine ≥ → reject topic |
 | `experiment_seeds` | `3` | Multi-seed runs |
 | `experiment_branch_count` | `3` | Max cheap variants probed |
 | `sandbox_timeout_sec` | `120` | Soft timeout budget |
+| `sandbox_backend` | `docker` | `ast` (in-process) or `docker` execution backend |
 | Paths | `./memory/*`, `./output/*` | FAISS, logs, raw results, companion repo |
 
 `validate_config()` requires a key for the selected provider + `OPENALEX_EMAIL`, and creates output dirs.
@@ -597,14 +611,7 @@ validated from the source/experiment ledger rather than from similarity memory.
 | Plan revision | `request_plan_revision(reason, experiment, detail)` |
 | Persistence | `output/raw_results/*.json` + experiment results JSON |
 
-**Give-up guard:** bare “not feasible” without error/traceback/decision_log marked suspicious (`failure_artifact`).
-
-Engineer remains a compatibility-heavy role: it still contains the legacy
-generation, execution, branch, ablation, and recovery path. The live graph now
-adds an independent validation stage after Engineering, so Engineer output is
-not the only execution or analysis evidence. The long-term target is to narrow
-Engineer to implementation and move all execution/statistics responsibilities
-behind the newer worker contracts.
+**Give-up guard:** bare "not feasible" without error/traceback/decision_log marked suspicious (`failure_artifact`).
 
 ### Data — `agents/data.py`
 
@@ -632,7 +639,7 @@ does not generate code or interpret scientific meaning.
 
 `AnalysisAgent` consumes execution artifacts only. It uses SciPy and NumPy to
 compute metric summaries, 95% confidence intervals, Welch comparisons, and
-Cohen’s d where two groups are available. It records warnings for insufficient
+Cohen's d where two groups are available. It records warnings for insufficient
 seeds, missing raw values, missing primary metrics, failed executions, and
 missing comparison artifacts. It cannot mutate code or datasets.
 
@@ -863,9 +870,12 @@ Template: [`env_example.txt`](env_example.txt) → copy to `.env`.
 | Scholarly sources | `OPENALEX_EMAIL`, `SEMANTIC_SCHOLAR_API_KEY`, `SCITE_API_KEY` | Source identity and optional enrichment |
 | Research gates | `SUPERVISOR_THRESHOLD`, `DEBATE_PASS_THRESHOLD`, `DEBATE_MIN_ROUNDS`, `DEBATE_MAX_ROUNDS`, `NOVELTY_SIMILARITY_REJECT` | Acceptance rigor and debate behavior |
 | Experiment budget | `EXPERIMENT_SEEDS`, `EXPERIMENT_BRANCH_COUNT`, `MAX_ITERATIONS` | Replication, branch exploration, revision budget |
+| Sandbox | `SANDBOX_TIMEOUT_SEC`, `SANDBOX_MAX_OUTPUT_BYTES`, `SANDBOX_BACKEND`, `SANDBOX_DOCKER_MEMORY`, `SANDBOX_DOCKER_CPUS` | Execution limits and backend selection |
 | Durable stores | `CHECKPOINT_PATH`, `RESEARCH_DB_PATH`, `VECTOR_DB_PATH`, `CROSS_RUN_MEMORY_PATH`, `ELO_RATINGS_PATH`, `KEYS_STORE_PATH` | Recovery, ledger, similarity memory, historical learning |
 | Outputs | `OUTPUT_DIR`, `DRAFT_VERSIONS_DIR`, `RAW_RESULTS_DIR`, `COMPANION_REPO_DIR`, `RUN_LOG_PATH`, `RUN_EVENTS_PATH` | Generated paper and compatibility exports |
-| Runtime / UI | `SANDBOX_TIMEOUT_SEC`, `SANDBOX_MAX_OUTPUT_BYTES`, `WEB_HOST`, `WEB_PORT`, `LOG_LEVEL`, `DEBUG_MODE` | Local operational behavior |
+| Runtime / UI | `WEB_HOST`, `WEB_PORT`, `LOG_LEVEL`, `DEBUG_MODE` | Local operational behavior |
+| TopicHunter v2 | `OPENALEX_CONCEPT_FILTERING_ENABLED`, `HYDE_ENABLED`, `MULTI_HOP_RETRIEVAL_ENABLED`, `FRONTIER_SEEDING_ENABLED`, `CROSS_SEED_PAPER_CACHE_ENABLED`, `CAPABILITY_FIRST_DATASET_SCOPING_ENABLED`, `STRUCTURAL_GAP_MINING_ENABLED`, `SPARSITY_MATRIX_ENABLED`, `CONTRADICTION_MINING_ENABLED`, `REPLICATION_TARGET_MINING_ENABLED`, `NEGATIVE_RESULT_SEEDING_ENABLED`, `PERSONA_ENSEMBLE_ENABLED`, `SEED_STRATEGY_ELO_ENABLED` | Topic discovery feature flags |
+| TopicHunter tuning | `HYDE_MAX_CHARS`, `MULTI_HOP_MIN_PAPERS_THRESHOLD`, `MULTI_HOP_MAX_HOPS`, `FRONTIER_REFRESH_EVERY_N_RUNS`, `FRONTIER_SAMPLE_SIZE`, `FRONTIER_TERMS_EXTRACTED`, `STRUCTURAL_GAP_MAX_PAIRS`, `PERSONA_COUNT`, `TOPIC_EXPLORATION_EVERY`, `TOPIC_EXPLORATION_SEED` | TopicHunter v2 parameter tuning |
 
 The UI writes non-empty values to `memory/keys.json` and applies them to the
 running process. Secrets are masked on read but are stored locally in that file;
@@ -885,55 +895,59 @@ Scholargraph/
 ├── demo.py                 # Mock demo (no live APIs)
 ├── run_with_real_api.py    # Thin wrapper → main
 ├── setup.py                # Bootstrap helper
+├── replay_run.py           # Clean-environment replay
+├── forensic_report.py      # Per-run forensic incident report
+├── historical_report.py    # Reconstruct latest run pair
 ├── requirements.txt
 ├── env_example.txt
 ├── agents/
-│   ├── topic_hunter.py
-│   ├── hypothesis_debate.py
-│   ├── planner.py
-│   ├── writer.py
-│   ├── engineer.py
-│   ├── data.py              # Dataset validation and provenance
-│   ├── execution.py         # Independent seeded replay worker
-│   ├── analysis.py          # Independent SciPy analysis worker
-│   ├── verification.py      # Artifact/hash/statistical verifier
-│   ├── supervisor.py
-│   ├── meta_agent.py
-│   └── editor.py
+│   ├── topic_hunter.py     # TopicHunter v2: evidence synthesis, gap mining, persona ensemble
+│   ├── hypothesis_debate.py # Adversarial debate + ensemble + Elo + contract repair
+│   ├── planner.py          # Falsifiable plans with feasibility checks
+│   ├── writer.py           # Two-pass: narrative (pre-engineering) + results (post-engineering)
+│   ├── engineer.py         # Code gen, sandbox execution, branch search, PIVOT/REFINE
+│   ├── data.py             # Dataset validation and provenance
+│   ├── execution.py        # Independent seeded replay worker
+│   ├── analysis.py         # Independent SciPy analysis worker
+│   ├── verification.py     # Artifact/hash/statistical verifier
+│   ├── supervisor.py       # Hard checks + soft reviewer
+│   ├── meta_agent.py       # Workflow evaluation and reset policy
+│   └── editor.py           # LaTeX assembly, bibliography, companion repo
 ├── core/
-│   ├── config.py           # Settings + runtime key apply
+│   ├── config.py           # Settings + runtime key apply + env sync
 │   ├── llm.py              # Gemini / OpenAI-compatible client
 │   ├── utils.py            # Shared helpers + legacy aliases
 │   ├── memory.py           # FAISS + debate/feedback logs
-│   ├── sandbox.py          # Restricted code execution
-│   ├── capabilities.py     # Role manifests and authorization
+│   ├── sandbox.py          # Restricted code execution (AST + Docker backends)
+│   ├── capabilities.py     # Role manifests + SandboxCapabilityManifest
 │   ├── tool_broker.py      # Auditable registered-tool dispatch
 │   ├── sources.py          # Allowlisted cached scholarly retrieval
 │   ├── contracts.py        # Typed artifact/evidence handoffs
-│   ├── context.py          # Per-run dependencies and manifests
-│   ├── state.py            # ResearchState and validation artifacts
-│   ├── workflow.py         # LangGraph graph assembly
-│   ├── workflow_nodes.py   # Phase nodes and validation gate
-│   ├── verification.py     # Citation + statistical hard checks
+│   ├── context.py          # Per-run RunContext and dependency injection
+│   ├── state.py            # ResearchState TypedDict and initializer
+│   ├── workflow.py         # LangGraph graph assembly (research + QA)
+│   ├── workflow_nodes.py   # Phase nodes and validation gates
+│   ├── pipeline.py         # Shared CLI/web execution service
+│   ├── evidence_gate.py    # Immutable experiment contracts and handoffs
+│   ├── evidence_synthesis.py # Cross-paper evidence map and bridge validation
+│   ├── datasets.py         # Curated local dataset catalog
+│   ├── known_answers.py    # Known-answer validation fixtures
+│   ├── verification.py     # Citation + statistical hard checks + cross-section consistency
+│   ├── research_db.py      # SQLite runs, provenance, evidence, artifacts
 │   ├── run_log.py          # Events, scratchpad, cross-run memory
-│   └── research_db.py      # SQLite runs, provenance, evidence, artifacts
+│   ├── ports.py            # Persistence port protocols
+│   ├── structural_gaps.py  # Bibliographic coupling gap analysis
+│   ├── sparsity_matrix.py  # Method × domain sparsity detection
+│   ├── contradiction_mining.py # Opposing-claim detection
+│   ├── forensics.py        # Durable incident reports
+│   └── replay.py           # Clean-environment replay
 ├── web/
 │   ├── app.py              # FastAPI Control Deck API
-│   └── static/admin.html   # Current operations console
-│       static/index.html   # Legacy UI fallback
-├── tests/
-│   ├── test_eval_harness.py
-│   ├── test_capabilities.py
-│   ├── test_sources.py
-│   ├── test_data_agent.py
-│   ├── test_execution_agent.py
-│   ├── test_analysis_agent.py
-│   ├── test_verification_agent.py
-│   ├── test_refactor_boundaries.py
-│   └── smoke_offline.py
+│   └── static/admin/       # Current operations console
+├── tests/                  # 26 offline test files + smoke_offline.py
 ├── templates/              # LaTeX templates (legacy/support)
-├── memory/                 # FAISS, keys.json, cross_run.jsonl, elo
-└── output/                 # Papers, raw_results, events, companion_repo
+├── memory/                 # FAISS, keys.json, cross_run.jsonl, elo, SQLite
+└── output/                 # Papers, raw_results, events, companion_repo, source_cache
 ```
 
 ---
@@ -947,7 +961,7 @@ Scholargraph/
 | `output/plan_*.json` / `plan.yaml` | Research plan snapshot |
 | `output/research_summary.json` | Run summary (topic, scores, experiments) |
 | `output/raw_results/*.json` | Multi-seed raw + aggregate metrics |
-| `output/source_cache/*.json` | Cached OpenAlex source artifacts for offline replay |
+| `output/source_cache/*.json` | Cached OpenAlex/arXiv source artifacts for offline replay |
 | `output/*_results.json` | Per-experiment Engineer dumps |
 | `memory/research_ledger.sqlite` | Authoritative runs, events, scratchpad, claims, artifacts |
 | `memory/checkpoints.sqlite` | Durable LangGraph execution checkpoints |
@@ -956,9 +970,10 @@ Scholargraph/
 | `output/companion_repo/` | README, requirements, experiment scripts |
 | `output/debate_log.json` | Debate transcripts |
 | `output/feedback_log.json` | Supervisor feedback history |
+| `output/forensic_report.json` | Forensic incident report |
 | `memory/vector_db/` | FAISS index + metadata |
 | `memory/cross_run.jsonl` | Cross-run lessons |
-| `memory/elo_ratings.json` | Hypothesis-kind Elo |
+| `memory/elo_ratings.json` | Hypothesis-kind Elo + seed-strategy Elo |
 | `memory/keys.json` | UI-stored API keys (local; do not commit) |
 
 ---
@@ -970,6 +985,47 @@ python -m pytest tests/test_eval_harness.py -q
 ```
 
 Coverage includes (offline / mocked where needed):
+
+- Sandbox blocks `subprocess`, `exit`, `os.system`; allows numpy JSON metrics
+- Multi-seed aggregation (`mean` / `std`)
+- Citation ID extraction + mocked resolve fail/pass
+- Statistical match vs fabricated mismatch
+- Planner unfalsifiable / missing-baseline flags
+- Code–claim inconsistency heuristic
+- Cross-run memory lessons text
+- Config model resolution + runtime key apply
+- DebateResult schema fields
+- Current arXiv client API contract
+- Graceful scholarly-source outage termination (no misleading reset loop)
+- SQLite run/event/claim/scratchpad/artifact persistence
+- Reproducibility dossier requirements
+- Capability manifests fail closed for undeclared tools
+- Capability broker audits authorized calls and denies before dispatch
+- Source client allowlisting, validation, retries, cache replay, hashes, and outages
+- DatasetAgent hashing, schema checks, target checks, and unsupported formats
+- ExecutionAgent seeded replay, raw artifact creation, and forbidden-code rejection
+- AnalysisAgent confidence intervals, Welch tests, effect sizes, and seed warnings
+- VerificationAgent raw-path, hash, and statistical mismatch blockers
+- Evidence gate contract building, validation, and dataset identity checks
+- Evidence synthesis bridge construction and candidate validation
+- QA mode literature retrieval and answer generation
+- TopicHunter v2 features: concept filtering, HyDE, multi-hop retrieval, frontier seeding, structural gaps, sparsity matrix, contradiction mining, persona ensemble, seed-strategy Elo
+- Known-answer validation fixtures
+- Container sandbox compatibility
+- Power analysis and dataset rescoping
+- Metrics parsing from experiment output
+
+Run the complete current suite with:
+
+```bash
+python -m pytest -q
+```
+
+Smoke check (no API keys required):
+
+```bash
+python tests/smoke_offline.py
+```
 
 - Sandbox blocks `subprocess`, `exit`, `os.system`; allows numpy JSON metrics
 - Multi-seed aggregation (`mean` / `std`)
@@ -1012,9 +1068,15 @@ These tests are the measurement surface for “did this upgrade help?” — add
 | Command | Role |
 |---|---|
 | `python main.py` | Full LangGraph research run (CLI progress) |
+| `python main.py --mode qa --query "..."` | QA literature synthesis mode |
+| `python main.py --resume <run_id>` | Resume a crashed run from checkpoint |
 | `python run_ui.py` | Control Deck on `:8765` |
 | `python run_with_real_api.py` | Alias → `main.main()` |
 | `python demo.py` | Mock agents / no live LLM |
+| `python replay_run.py output/companion_repo` | Replay companion code in sandbox |
+| `python replay_run.py output/companion_repo --clean-env` | Replay in a fresh virtualenv |
+| `python forensic_report.py RUN_ID output/report.json` | Generate forensic incident report |
+| `python historical_report.py output/report.json` | Reconstruct latest run pair |
 | `python -m pytest tests/` | Eval harness |
 | `python setup.py` | Env bootstrap / smoke (legacy helper) |
 

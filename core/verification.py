@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -88,21 +89,29 @@ def resolve_doi(doi: str) -> Dict[str, Any]:
 
 
 def resolve_arxiv(arxiv_id: str) -> Dict[str, Any]:
-    try:
-        url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200 and "<entry>" in r.text:
-            title_m = re.search(r"<title>(.*?)</title>", r.text, re.DOTALL)
-            title = title_m.group(1).strip() if title_m else ""
-            if title.lower().startswith("arxiv query"):
-                # first title is feed title; take next
-                titles = re.findall(r"<title>(.*?)</title>", r.text, re.DOTALL)
-                title = titles[1].strip() if len(titles) > 1 else title
-            authors = re.findall(r"<name>(.*?)</name>", r.text, re.DOTALL)
-            return {"resolved": True, "arxiv_id": arxiv_id, "title": title, "authors": [a.strip() for a in authors]}
-        return {"resolved": False, "arxiv_id": arxiv_id, "error": "not found"}
-    except Exception as e:
-        return {"resolved": False, "arxiv_id": arxiv_id, "error": str(e)}
+    for attempt in range(3):
+        try:
+            url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
+            r = requests.get(url, timeout=15)
+            if r.status_code == 429 and attempt < 2:
+                retry_after = float(r.headers.get("Retry-After", "5"))
+                time.sleep(min(30.0, max(retry_after, 5.0 * (2 ** attempt))))
+                continue
+            if r.status_code == 200 and "<entry>" in r.text:
+                title_m = re.search(r"<title>(.*?)</title>", r.text, re.DOTALL)
+                title = title_m.group(1).strip() if title_m else ""
+                if title.lower().startswith("arxiv query"):
+                    titles = re.findall(r"<title>(.*?)</title>", r.text, re.DOTALL)
+                    title = titles[1].strip() if len(titles) > 1 else title
+                authors = re.findall(r"<name>(.*?)</name>", r.text, re.DOTALL)
+                return {"resolved": True, "arxiv_id": arxiv_id, "title": title, "authors": [a.strip() for a in authors]}
+            return {"resolved": False, "arxiv_id": arxiv_id, "error": f"HTTP {r.status_code}"}
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2.0 * (2 ** attempt))
+                continue
+            return {"resolved": False, "arxiv_id": arxiv_id, "error": str(e)}
+    return {"resolved": False, "arxiv_id": arxiv_id, "error": "max retries exceeded"}
 
 
 def _normalize_words(value: str) -> set[str]:

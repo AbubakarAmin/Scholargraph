@@ -409,25 +409,70 @@ above, using real or reconstructed cases, not just a happy-path run.
 This repository now implements the plan's safety gates and the remaining local
 research-quality controls. The following operational features are available:
 
-- Local catalogued datasets with a checked-in Iris asset and bundled
-  scikit-learn loaders; planners rescope infeasible external datasets.
-- Open-access-only full-text retrieval through `SourceClient.fetch_open_access_text`.
-  A license signal is mandatory and responses are cached with hashes.
-- Clean replay with `python replay_run.py PATH --clean-env`.
-- Automatic known-answer fixtures for supported experiment types plus explicit
-  plan-provided fixtures for domain-specific algorithms.
-- Prospective power preregistration through `core.verification.preregister_power`.
-- Historical reports through `historical_report.py`, including durable claims,
-  artifacts, events, unresolved claims, and lineage.
-- Deterministic reviewer checklist enforcement before assembly.
-- Outcome calibration through `ResearchDatabase.outcome_calibration`; positive,
-  negative, and inconclusive validated outcomes receive equal base credit.
-- Human approval persistence and deferred export through `/api/release/approve`.
+### Safety gates (Section 2 fixes)
 
-The system still cannot legally retrieve paywalled full text without an explicit
-open-access permission signal, and no local system can guarantee that an external
-provider's API or license remains available. Those cases fail closed and remain
-visible in the source artifact and forensic report.
+- **Citation metadata matching** (`core/verification.py`): `verify_citations` resolves DOIs/arXiv IDs via CrossRef/arXiv APIs and compares title/author metadata against writer-supplied bibliography entries. Mismatches are hard failures.
+- **Claim typing** (`core/verification.py:classify_claim`): Claims are classified as `literature_reference`, `method_definition`, `planned_test`, or `empirical_result` before entering the evidence ledger. Only `empirical_result` claims tied to artifact IDs are eligible for verification.
+- **Cross-section numeric consistency** (`core/verification.py:cross_section_numeric_consistency`): Collects every numeric claim tied to the same experiment across all drafted sections and diffs them against each other and the structured artifact. Conflicts are hard failures.
+- **Consistency referee** (`core/verification.py:consistency_referee`): One isolated model pass over the full assembled draft to find contradictions in numbers, datasets, methods, outcomes, or contribution framing.
+- **Prohibited manuscript text** (`core/verification.py:PROHIBITED_MANUSCRIPT_TEXT`): Blocks leaked harness diagnostics (e.g., "tracemalloc", "sandbox blocked", "traceback") from appearing in narrative sections.
+- **No manuscript from dead runs** (`agents/editor.py`): `create_final_paper()` checks run status; failed runs produce a failure dossier, not a manuscript or companion repository.
+
+### Research quality (Section 3 ideas)
+
+- **Local catalogued datasets** (`core/datasets.py`): Iris, digits, synthetic, and OpenReview calibration datasets with local-only access policy. Planners rescope infeasible external datasets.
+- **Capability-first dataset scoping**: TopicHunter and Planner check dataset plans against the local catalog before bridge validation; uncatalogued datasets are rejected early.
+- **Sandbox capability manifest** (`core/capabilities.py:SandboxCapabilityManifest`): Shared execution limits (wall clock, libraries, GPU, network, dataset size) used by planning, debate, and engineering.
+- **Feasibility checking** (`core/capabilities.py:check_plan_feasibility`): Plans requiring outbound access, GPU, or exceeding size limits are rejected before contract commitment.
+- **Open-access-only full-text retrieval** (`core/sources.py:fetch_open_access_text`): A license signal is mandatory; responses are cached with hashes.
+- **Known-answer fixtures** (`core/known_answers.py`): Validates generated experiment code against synthetic cases before trusting on real data.
+- **Prospective power preregistration** (`core/verification.py:preregister_power`): Computes sample-size requirements before execution.
+- **Deterministic reviewer checklist** (`core/verification.py:validate_reviewer_checklist`): Enforces limitations, baselines, outcomes, uncertainty reporting, and literature evidence requirements.
+- **Outcome calibration** (`core/research_db.py:outcome_calibration`): Positive, negative, and inconclusive validated outcomes receive equal base credit.
+- **Human approval gate** (`POST /api/release/approve`): Explicit human checkpoint before publishable release, persisted in the research ledger.
+- **Clean replay** (`replay_run.py`): Replays companion code in a fresh virtual environment.
+- **Historical reports** (`historical_report.py`): Reconstructs the latest failed/completed run pair with durable claims, artifacts, events, and lineage.
+- **Forensic incident reports** (`forensic_report.py`): Per-run report with events, claims, artifacts, and claim-to-artifact lineage.
+
+### TopicHunter v2 features
+
+- OpenAlex concept filtering for domain-scoped queries
+- HyDE (Hypothetical Document Embeddings) for query expansion
+- Multi-hop retrieval via Semantic Scholar citation graph
+- Frontier seeding from very recent papers
+- Cross-seed paper cache for deduplication
+- Structural gap mining via bibliographic coupling
+- Method × domain sparsity matrix analysis
+- Contradiction mining across papers
+- Replication-target detection (strong claims, no variance reporting)
+- Negative result seeding from prior unsupported hypotheses
+- Persona ensemble generation (skeptic + practitioner)
+- Seed-strategy Elo tracking with exploration reserve
+- Rejection-history windowing with keyword survival floor
+- Quick grounding pre-filter before expensive gate chain
+
+### QA literature synthesis mode
+
+- Separate graph: Literature Retrieval → Synthesis Answer → Verification
+- Invoked via `--mode qa --query "..."` or the Web UI
+- Citation grounding enforced via `verify_citations()` inside the answer node
+- Skips hypothesis debate, planning, engineering, and evidence-gate machinery
+
+### What the system still cannot do
+
+- The system cannot legally retrieve paywalled full text without an explicit
+  open-access permission signal. Those cases fail closed and remain visible in
+  the source artifact and forensic report.
+- No local system can guarantee that an external provider's API or license
+  remains available.
+- The capability broker is an application-level policy, not an OS security
+  boundary. The sandbox blocks documented failure modes but is not container
+  isolation.
+- The admin console is local single-user and polling-based with no
+  authentication.
+- Passing all gates does **not** prove publication-quality novelty,
+  generalizability, or real-world usefulness. Human domain review, appropriate
+  data governance, and independent reproduction remain necessary.
 
 Operational validation currently passes the full repository suite. Use the
 commands in `docs/testing.md` for regression, clean replay, and incident reports.

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +15,8 @@ from urllib.parse import urlparse
 import requests
 
 from .contracts import SourceArtifact
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_SOURCE_BASES = {
@@ -74,6 +78,16 @@ class SourceClient:
                     headers=dict(headers or {}),
                     timeout=self.policy.timeout_seconds,
                 )
+                if response.status_code == 429:
+                    retry_after = float(response.headers.get("Retry-After", "5"))
+                    wait = min(30.0, max(retry_after, 5.0 * (2 ** attempt)))
+                    if attempt < self.policy.retries:
+                        logger.warning(
+                            "SourceClient 429 from %s — backing off %.1fs (attempt %d/%d)",
+                            source, wait, attempt + 1, self.policy.retries + 1,
+                        )
+                        time.sleep(wait)
+                        continue
                 response.raise_for_status()
                 content_length = len(response.content)
                 if content_length > self.policy.max_response_bytes:

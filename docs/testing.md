@@ -1,64 +1,84 @@
 # Testing
-![Docs version](https://img.shields.io/badge/docs‑v2024.09‑blue)
-
-## Memory retrieval integrity
-
-```powershell
-python -m pytest tests/test_memory_integrity.py -v
-```
-
-Adversarial coverage with printed transcripts: fallback/hallucinated-claim poisoning, debate-tag-only retrieval, outcome filtering, provenance, Elo shrinkage, exploration distribution, and a static bypass audit that agents do not call raw memory APIs for prompts.
 
 ## Focused offline suite
 
-```powershell
+```bash
 python -m pytest tests/test_eval_harness.py -q
 ```
 
-This suite covers sandbox restrictions, multi-seed aggregation, citation extraction, statistical verification, planner gates, code-claim consistency, cross-run memory, configuration, debate shape, source outage handling, SQLite persistence, and reproducibility checks.
-
-## Smoke script
-
-```powershell
-python -m tests.smoke_offline
-```
-
-The smoke script exercises the same core paths without requiring live provider keys.
+This is the primary measurement surface for "did this upgrade help?" It covers sandbox restrictions, multi-seed aggregation, citation extraction, statistical verification, planner gates, code-claim consistency, cross-run memory, configuration, debate shape, source outage handling, SQLite persistence, reproducibility checks, and more.
 
 ## Full pytest collection
 
-```powershell
+```bash
 python -m pytest -q
 ```
+
+The full suite covers (all offline/mocked where needed):
+
+| Test file | Coverage |
+|---|---|
+| `test_eval_harness.py` | Sandbox, multi-seed, citations, stats, planner, code-claim, cross-run memory, config, debate, source outage, SQLite, reproducibility |
+| `test_capabilities.py` | Capability manifests, authorization, sandbox capability manifest |
+| `test_sources.py` | SourceClient allowlisting, caching, retries, outages |
+| `test_data_agent.py` | DatasetAgent hashing, schema, target checks, formats |
+| `test_execution_agent.py` | ExecutionAgent seeded replay, artifact creation, forbidden code |
+| `test_analysis_agent.py` | AnalysisAgent CIs, Welch tests, effect sizes, warnings |
+| `test_verification_agent.py` | VerificationAgent hash, path, statistical mismatch |
+| `test_refactor_boundaries.py` | Module boundary enforcement |
+| `test_evidence_gate.py` | Contract building, validation, dataset identity |
+| `test_evidence_synthesis.py` | Cross-paper evidence maps, bridge validation |
+| `test_qa_mode.py` | QA literature retrieval, answer generation |
+| `test_topic_hunter_v2.py` | TopicHunter v2 core features |
+| `test_topic_hunter_features_8_15.py` | Persona ensemble, seed-strategy Elo, frontier seeding |
+| `test_memory_integrity.py` | Adversarial memory retrieval, poisoning, bypass audit |
+| `test_power_and_rescope.py` | Prospective power preregistration, dataset rescoping |
+| `test_container_sandbox.py` | Docker sandbox backend compatibility |
+| `test_sandbox_allowlist.py` | Sandbox import allowlist enforcement |
+| `test_datasets_openreview.py` | OpenReview calibration dataset loading |
+| `test_planner_manifest.py` | Planner feasibility checks against capability manifest |
+| `test_run_review_fixes.py` | Run review hardening fixes |
+| `test_run_review_fixes_2.py` | Additional run review fixes |
+| `test_extract_local_code_structure.py` | Traceback source extraction |
+| `test_metrics_parsing.py` | Metric extraction from stdout |
+| `test_arxiv_sleep_guard.py` | arXiv rate-limit backoff |
+| `test_remaining_implementation.py` | Remaining implementation coverage |
+| `tests/smoke_offline.py` | Quick standalone smoke check (no pytest) |
+
+## Smoke script
+
+```bash
+python tests/smoke_offline.py
+```
+
+The smoke script exercises the same core paths without requiring live provider keys.
 
 ## Reproducibility and incident reports
 
 Replay a generated companion repository in the locked local sandbox:
 
-```powershell
+```bash
 python replay_run.py output/companion_repo
 ```
 
 Replay in a newly created clean virtual environment:
 
-```powershell
+```bash
 python replay_run.py output/companion_repo --clean-env
 ```
 
 Generate a report for one run or for the latest failed/completed pair:
 
-```powershell
+```bash
 python forensic_report.py RUN_ID output/forensic_report.json
 python historical_report.py output/historical_report.json
 ```
 
 These reports include events, claims, artifacts, unresolved claims, and claim-to-artifact lineage. They do not bypass source licensing or network policy.
 
-This includes the maintained offline suite and the repository-level compatibility scripts.
-
 ## Full legacy checks
 
-```powershell
+```bash
 python test_system.py
 ```
 

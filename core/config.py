@@ -27,7 +27,8 @@ class Config(BaseSettings):
     # Gemini
     google_api_key: str = os.getenv("GOOGLE_API_KEY", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    gemini_embedding_model: str = os.getenv("GEMINI_EMBEDDING_MODEL", "text-embedding-004")
+    gemini_embedding_model: str = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
+    embedding_dimension: int = int(os.getenv("EMBEDDING_DIMENSION", "3072"))
 
     # OpenAI / OpenAI-compatible (OpenRouter, Groq, Together, local vLLM, Ollama, etc.)
     openai_api_key: Optional[str] = os.getenv("OPENAI_API_KEY", "")
@@ -155,6 +156,7 @@ def apply_runtime_keys(keys: dict) -> None:
         "OPENAI_MODEL": "openai_model",
         "GEMINI_EMBEDDING_MODEL": "gemini_embedding_model",
         "OPENAI_EMBEDDING_MODEL": "openai_embedding_model",
+        "EMBEDDING_DIMENSION": "embedding_dimension",
         "LLM_MODEL_CHEAP": "llm_model_cheap",
         "LLM_MODEL_STRONG": "llm_model_strong",
         "LLM_MODEL_JUDGE": "llm_model_judge",
@@ -250,6 +252,7 @@ def sync_env_file(keys: dict, env_path: Optional[Path] = None) -> Path:
         "OPENAI_MODEL",
         "GEMINI_EMBEDDING_MODEL",
         "OPENAI_EMBEDDING_MODEL",
+        "EMBEDDING_DIMENSION",
         "LLM_MODEL_CHEAP",
         "LLM_MODEL_STRONG",
         "LLM_MODEL_JUDGE",
@@ -386,6 +389,11 @@ def validate_config():
             raise ValueError(
                 "GOOGLE_API_KEY is required when LLM_PROVIDER=gemini. "
                 "Get it from https://aistudio.google.com/apikey"
+            )
+        if not config.gemini_embedding_model:
+            raise ValueError(
+                "GEMINI_EMBEDDING_MODEL is required when LLM_PROVIDER=gemini. "
+                "Default is gemini-embedding-2."
             )
     elif provider in ("openai", "openai_compatible"):
         if not config.openai_api_key:

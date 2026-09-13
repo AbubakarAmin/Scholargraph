@@ -534,8 +534,9 @@ def clear_all_data():
 
 @app.delete("/api/runs/{run_id}")
 def delete_single_run(run_id: str):
-    research_db.delete_run(run_id)
-    return {"ok": True, "message": f"Run {run_id} deleted."}
+    cleaned = research_db.delete_run_comprehensive(run_id)
+    memory.delete_run_vectors(run_id)
+    return {"ok": True, "message": f"Run {run_id} deleted.", "cleaned": cleaned}
 
 
 @app.get("/api/runs/{run_id}/lineage")
@@ -768,6 +769,8 @@ def main():
         host=config.web_host,
         port=config.web_port,
         reload=False,
+        access_log=False,
+        log_level="info",
     )
 
 

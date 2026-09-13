@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -28,8 +29,24 @@ def find_coupling_gaps(
     paper_refs: Dict[str, List[str]] = {}
     paper_titles: Dict[str, str] = {}
 
+    def _s2_get_with_retry(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[requests.Response]:
+        for attempt in range(3):
+            try:
+                r = requests.get(url, headers=s2_headers, params=params or {}, timeout=15)
+                if r.status_code == 429 and attempt < 2:
+                    retry_after = float(r.headers.get("Retry-After", "3"))
+                    wait = min(30.0, max(retry_after, 3.0 * (2 ** attempt)))
+                    time.sleep(wait)
+                    continue
+                return r
+            except requests.RequestException:
+                if attempt < 2:
+                    time.sleep(2.0 * (2 ** attempt))
+                    continue
+                return None
+        return None
+
     for p in candidate_papers:
-        # Build S2-compatible paper ID with proper prefix (DOI: or ARXIV:)
         raw_doi = (p.get("doi") or "").replace("https://doi.org/", "").strip()
         raw_arxiv = (p.get("arxiv_id") or "").strip()
         raw_s2 = (p.get("s2_paper_id") or "").strip()
@@ -38,7 +55,6 @@ def find_coupling_gaps(
         elif raw_doi:
             paper_id = f"DOI:{raw_doi}"
         elif raw_arxiv:
-            # Extract numeric arxiv ID from full URL if needed
             arxiv_num = raw_arxiv.split("/")[-1] if "/" in raw_arxiv else raw_arxiv
             paper_id = f"ARXIV:{arxiv_num}"
         else:
@@ -47,13 +63,8 @@ def find_coupling_gaps(
         paper_titles[paper_id] = title
         try:
             url = f"{base_url}/paper/{paper_id}"
-            r = requests.get(
-                url,
-                headers=s2_headers,
-                params={"fields": "references.paperId,citations.paperId"},
-                timeout=15,
-            )
-            if r.status_code != 200:
+            r = _s2_get_with_retry(url, params={"fields": "references.paperId,citations.paperId"})
+            if r is None or r.status_code != 200:
                 paper_refs[paper_id] = []
                 continue
             data = r.json()
@@ -64,6 +75,7 @@ def find_coupling_gaps(
                     ref_ids.add(rid)
             paper_refs[paper_id] = list(ref_ids)
             paper_titles[paper_id] = data.get("title") or title
+            time.sleep(1.0)
         except Exception as e:
             logger.debug("find_coupling_gaps: S2 fetch error for %s: %s", paper_id, e)
             paper_refs[paper_id] = []

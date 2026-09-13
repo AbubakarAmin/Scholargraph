@@ -220,7 +220,7 @@ class TopicHunterAgent:
         self._arxiv_client = arxiv.Client(
             page_size=100,
             delay_seconds=3.0,
-            num_retries=3,
+            num_retries=0,
         )
         self._arxiv_lock = threading.Lock()
 
@@ -229,6 +229,32 @@ class TopicHunterAgent:
 
     def _source_failed(self, name: str, error: Exception):
         self.source_health[name] = {"ok": False, "error": str(error)}
+
+    def _s2_get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[requests.Response]:
+        """Rate-limited Semantic Scholar GET with 429 retry and backoff."""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                r = requests.get(
+                    url,
+                    headers=self.s2_headers,
+                    params=params or {},
+                    timeout=20,
+                )
+                if r.status_code == 429 and attempt < max_attempts - 1:
+                    retry_after = float(r.headers.get("Retry-After", "3"))
+                    wait = min(30.0, max(retry_after, 3.0 * (2 ** attempt)))
+                    logger.warning("S2 rate-limited (429) on %s — backing off %.1fs", url, wait)
+                    time.sleep(wait)
+                    continue
+                return r
+            except requests.RequestException as e:
+                if attempt < max_attempts - 1:
+                    time.sleep(2.0 * (2 ** attempt))
+                    continue
+                logger.debug("S2 request failed for %s: %s", url, e)
+                return None
+        return None
 
     def search_openalex(self, query: str, limit: int = 50, extra_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         try:
@@ -269,30 +295,66 @@ class TopicHunterAgent:
             return []
 
     def search_arxiv(self, query: str, max_results: int = 50) -> List[Dict[str, Any]]:
-        try:
-            search = arxiv.Search(
-                query=query,
-                max_results=max_results,
-                sort_by=arxiv.SortCriterion.SubmittedDate,
-            )
-            results = []
-            with self._arxiv_lock:
-                for result in self._arxiv_client.results(search):
-                    results.append({
-                        "title": result.title,
-                        "abstract": result.summary,
-                        "year": result.published.year,
-                        "authors": [a.name for a in result.authors],
-                        "arxiv_id": result.entry_id,
-                        "categories": result.categories,
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            try:
+                search = arxiv.Search(
+                    query=query,
+                    max_results=max_results,
+                    sort_by=arxiv.SortCriterion.SubmittedDate,
+                )
+                results = []
+                with self._arxiv_lock:
+                    for result in self._arxiv_client.results(search):
+                        results.append({
+                            "title": result.title,
+                            "abstract": result.summary,
+                            "year": result.published.year,
+                            "authors": [a.name for a in result.authors],
+                            "arxiv_id": result.entry_id,
+                            "categories": result.categories,
+                        })
+                self._source_ok("arxiv")
+                return results
+            except arxiv.HTTPError as e:
+                if e.status == 429 and attempt < max_attempts - 1:
+                    wait = min(30.0, 5.0 * (2 ** attempt))
+                    logger.warning(
+                        "arxiv rate-limited (429) on attempt %d/%d for query=%r — backing off %.1fs",
+                        attempt + 1, max_attempts, query, wait,
+                    )
+                    log_agent_action("TopicHunter", "arxiv_429_backoff", {
+                        "query": query, "attempt": attempt + 1, "wait_seconds": wait,
                     })
-            self._source_ok("arxiv")
-            return results
-        except Exception as e:
-            self._source_failed("arxiv", e)
-            logger.warning(f"arxiv search failed for query={query!r}: {e}")
-            log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e), "query": query})
-            return []
+                    time.sleep(wait)
+                    continue
+                self._source_failed("arxiv", e)
+                logger.warning(f"arxiv search failed for query={query!r}: {e}")
+                log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e), "query": query})
+                return []
+            except (arxiv.UnexpectedEmptyPageError, requests.exceptions.ConnectionError) as e:
+                if attempt < max_attempts - 1:
+                    wait = min(15.0, 3.0 * (2 ** attempt))
+                    logger.warning(
+                        "arxiv transient error (%s) on attempt %d/%d for query=%r — backing off %.1fs",
+                        type(e).__name__, attempt + 1, max_attempts, query, wait,
+                    )
+                    log_agent_action("TopicHunter", "arxiv_transient_backoff", {
+                        "query": query, "attempt": attempt + 1, "error_type": type(e).__name__,
+                        "wait_seconds": wait,
+                    })
+                    time.sleep(wait)
+                    continue
+                self._source_failed("arxiv", e)
+                logger.warning(f"arxiv search failed for query={query!r}: {e}")
+                log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e), "query": query})
+                return []
+            except Exception as e:
+                self._source_failed("arxiv", e)
+                logger.warning(f"arxiv search failed for query={query!r}: {e}")
+                log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e), "query": query})
+                return []
+        return []
 
     def search_openalex_multi(self, queries: List[Tuple[str, Dict[str, Any]]], limit: int = 30) -> List[Dict[str, Any]]:
         """Run multiple OpenAlex queries with optional extra params and merge results."""
@@ -302,12 +364,19 @@ class TopicHunterAgent:
         return all_results
 
     def search_arxiv_multi(self, queries: List[str], max_results: int = 30) -> List[Dict[str, Any]]:
-        """Run multiple arXiv queries and merge results."""
+        """Run multiple arXiv queries and merge results with adaptive inter-query delay."""
         all_results = []
+        base_delay = 3.0
+        current_delay = base_delay
         for i, query in enumerate(queries):
             if i > 0:
-                time.sleep(3)
+                time.sleep(current_delay)
+            prev_ok = self.source_health.get("arxiv", {}).get("ok", True)
             all_results.extend(self.search_arxiv(query, max_results))
+            if not self.source_health.get("arxiv", {}).get("ok", True):
+                current_delay = min(30.0, current_delay * 2)
+            elif prev_ok:
+                current_delay = base_delay
         return all_results
 
     def _extract_rejected_fingerprints(self, cross_run_context: List[Dict[str, Any]]) -> List[str]:
@@ -682,22 +751,15 @@ class TopicHunterAgent:
         try:
             fields = "title,year,citationCount,referenceCount,influentialCitationCount"
             url = f"{self.base_urls['s2']}/paper/{paper_id}"
-            r = requests.get(
-                url,
-                headers=self.s2_headers,
-                params={"fields": fields},
-                timeout=20,
-            )
-            if r.status_code != 200:
+            r = self._s2_get(url, params={"fields": fields})
+            if r is None or r.status_code != 200:
                 return {}
             paper = r.json()
             # Recent citing papers (proxy for out-degree from recent work extending it)
             cites_url = f"{self.base_urls['s2']}/paper/{paper_id}/citations"
-            c = requests.get(
+            c = self._s2_get(
                 cites_url,
-                headers=self.s2_headers,
                 params={"fields": "citingPaper.year,citingPaper.title", "limit": 50},
-                timeout=20,
             )
             recent_extensions = 0
             if c.status_code == 200:

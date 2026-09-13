@@ -10,6 +10,7 @@ Raw narrative stays on disk for audit.
 from __future__ import annotations
 
 import json
+import logging
 import pickle
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -19,6 +20,8 @@ from pathlib import Path
 
 from .config import config
 
+logger = logging.getLogger(__name__)
+
 
 class ResearchMemory:
     """Memory system for storing research knowledge and agent interactions."""
@@ -27,7 +30,7 @@ class ResearchMemory:
         self.vector_db_path = Path(config.vector_db_path)
         self.vector_db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.dimension = 768
+        self.dimension = config.embedding_dimension
         self.index = faiss.IndexFlatL2(self.dimension)
 
         self.metadata: List[Dict[str, Any]] = []
@@ -40,7 +43,26 @@ class ResearchMemory:
         """Load existing memory data from disk."""
         try:
             if (self.vector_db_path / "index.faiss").exists():
-                self.index = faiss.read_index(str(self.vector_db_path / "index.faiss"))
+                loaded_index = faiss.read_index(str(self.vector_db_path / "index.faiss"))
+                if loaded_index.d != self.dimension:
+                    logger.warning(
+                        f"FAISS index dimension mismatch: index={loaded_index.d}, "
+                        f"expected={self.dimension}. Rebuilding index (old embeddings lost)."
+                    )
+                    # Archive old index for potential manual recovery
+                    archive_path = self.vector_db_path / f"index.dim{loaded_index.d}.faiss.bak"
+                    try:
+                        import shutil
+                        shutil.copy2(
+                            str(self.vector_db_path / "index.faiss"),
+                            str(archive_path),
+                        )
+                        logger.info(f"Archived old index to {archive_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not archive old index: {e}")
+                    self.index = faiss.IndexFlatL2(self.dimension)
+                else:
+                    self.index = loaded_index
 
             if (self.vector_db_path / "metadata.pkl").exists():
                 with open(self.vector_db_path / "metadata.pkl", "rb") as f:
@@ -356,6 +378,68 @@ class ResearchMemory:
         self.debate_log = []
         self.feedback_log = []
         self.save()
+
+    def delete_run_vectors(self, run_id: str) -> dict:
+        """Remove all vectors, debate, and feedback entries for a given run_id.
+
+        Rebuilds the FAISS index from scratch with only the remaining data.
+        Returns a summary of what was cleaned.
+        """
+        removed_vectors = 0
+        removed_debate = 0
+        removed_feedback = 0
+
+        # 1. Filter metadata and rebuild FAISS index
+        if self.metadata:
+            keep_mask = [entry.get("run_id") != run_id for entry in self.metadata]
+            removed_vectors = sum(1 for keep in keep_mask if not keep)
+
+            remaining_metadata = [entry for entry, keep in zip(self.metadata, keep_mask) if keep]
+
+            # Rebuild index from scratch with only remaining vectors
+            new_index = faiss.IndexFlatL2(self.dimension)
+            if remaining_metadata:
+                # Re-read the full index to get vectors, then rebuild
+                # Since FAISS doesn't let us extract individual vectors by position
+                # after adding, we rebuild from the original vectors stored alongside metadata
+                # Actually, we need to re-add vectors. The index stores them sequentially.
+                # We must rebuild by re-adding all vectors for the kept entries.
+                old_index = self.index
+                if old_index.ntotal == len(self.metadata):
+                    # Index is in sync — extract kept vectors and rebuild
+                    import numpy as np
+                    vectors = np.vstack([
+                        old_index.reconstruct(i).reshape(1, -1)
+                        for i in range(old_index.ntotal)
+                        if keep_mask[i]
+                    ])
+                    if vectors.shape[0] > 0:
+                        new_index.add(vectors)
+                else:
+                    # Index out of sync — can't reconstruct, start fresh
+                    pass
+
+            self.index = new_index
+            self.metadata = remaining_metadata
+
+        # 2. Filter debate log
+        original_debate = len(self.debate_log)
+        self.debate_log = [entry for entry in self.debate_log if entry.get("run_id") != run_id]
+        removed_debate = original_debate - len(self.debate_log)
+
+        # 3. Filter feedback log
+        original_feedback = len(self.feedback_log)
+        self.feedback_log = [entry for entry in self.feedback_log if entry.get("run_id") != run_id]
+        removed_feedback = original_feedback - len(self.feedback_log)
+
+        # 4. Save to disk
+        self.save()
+
+        return {
+            "vectors_removed": removed_vectors,
+            "debate_entries_removed": removed_debate,
+            "feedback_entries_removed": removed_feedback,
+        }
 
 
 # Global memory instance

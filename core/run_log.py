@@ -30,6 +30,32 @@ def _append_jsonl(path: str, record: Dict[str, Any]) -> None:
             f.write(json.dumps(record, default=str) + "\n")
 
 
+def filter_jsonl_by_run_id(path: str, run_id: str) -> int:
+    """Remove all lines matching *run_id* from a JSONL file. Returns count removed."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    removed = 0
+    with _lock:
+        kept: List[str] = []
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                    if record.get("run_id") == run_id:
+                        removed += 1
+                        continue
+                except json.JSONDecodeError:
+                    pass
+                kept.append(line)
+        with open(p, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+    return removed
+
+
 class RunTracker:
     """Per-run observability + raw scratchpad shared by all agents."""
 

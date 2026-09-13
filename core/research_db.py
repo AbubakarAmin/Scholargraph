@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -172,6 +173,103 @@ class ResearchDatabase:
             con.execute("DELETE FROM run_scratchpad WHERE run_id=?", (run_id,))
             con.execute("DELETE FROM evidence_claims WHERE run_id=?", (run_id,))
             con.execute("DELETE FROM research_artifacts WHERE run_id=?", (run_id,))
+
+    def delete_run_comprehensive(self, run_id: str) -> dict:
+        """Delete every trace of a run across all data stores.
+
+        Returns a summary dict of what was cleaned.
+        """
+        from .run_log import filter_jsonl_by_run_id
+
+        cleaned: dict = {}
+
+        # 1. Research ledger (5 tables)
+        self.delete_run(run_id)
+        cleaned["research_ledger"] = True
+
+        # 2. Checkpoints (LangGraph SqliteSaver tables)
+        cleaned["checkpoints"] = self._delete_checkpoints(run_id)
+
+        # 3. JSONL event/scratchpad logs
+        cleaned["run_events_jsonl"] = filter_jsonl_by_run_id(config.run_events_path, run_id)
+        cleaned["run_scratchpad_jsonl"] = filter_jsonl_by_run_id(config.run_log_path, run_id)
+
+        # 4. Cross-run memory
+        cleaned["cross_run_jsonl"] = filter_jsonl_by_run_id(config.cross_run_memory_path, run_id)
+
+        # 5. Debate and feedback logs (JSON arrays)
+        cleaned["debate_log"] = self._filter_json_array(config.debate_log_path, run_id)
+        cleaned["feedback_log"] = self._filter_json_array(config.feedback_log_path, run_id)
+
+        # 6. Raw results directory
+        cleaned["raw_results"] = self._delete_raw_results(run_id)
+
+        return cleaned
+
+    def _delete_checkpoints(self, run_id: str) -> bool:
+        """Delete LangGraph checkpoint rows for a given thread_id (= run_id)."""
+        ckpt_path = Path(config.checkpoint_path)
+        if not ckpt_path.exists():
+            return False
+        try:
+            import sqlite3 as _sqlite3
+            con = _sqlite3.connect(str(ckpt_path), timeout=10)
+            try:
+                cur = con.execute("DELETE FROM checkpoints WHERE thread_id=?", (run_id,))
+                writes_deleted = cur.rowcount
+                con.execute("DELETE FROM writes WHERE thread_id=?", (run_id,))
+                con.commit()
+                return writes_deleted > 0 or con.total_changes > 0
+            finally:
+                con.close()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _filter_json_array(path_str: str, run_id: str) -> int:
+        """Remove entries matching run_id from a JSON-array file. Returns count removed."""
+        p = Path(path_str)
+        if not p.exists():
+            return 0
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                return 0
+            original_len = len(data)
+            filtered = [entry for entry in data if entry.get("run_id") != run_id]
+            removed = original_len - len(filtered)
+            if removed > 0:
+                p.write_text(json.dumps(filtered, indent=2, default=str), encoding="utf-8")
+            return removed
+        except (json.JSONDecodeError, OSError):
+            return 0
+
+    @staticmethod
+    def _delete_raw_results(run_id: str) -> int:
+        """Remove raw_results directories that reference this run_id."""
+        raw_dir = Path(config.raw_results_dir)
+        if not raw_dir.exists():
+            return 0
+        removed = 0
+        for child in raw_dir.iterdir():
+            if not child.is_dir():
+                continue
+            # Match directories named after the run_id or containing it
+            if run_id in child.name:
+                shutil.rmtree(child, ignore_errors=True)
+                removed += 1
+                continue
+            # Check metadata files inside the directory for run_id references
+            for meta_file in child.glob("*.json"):
+                try:
+                    text = meta_file.read_text(encoding="utf-8")
+                    if run_id in text:
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed += 1
+                        break
+                except OSError:
+                    continue
+        return removed
 
     def clear_all(self):
         with self.lock, self._connect() as con:

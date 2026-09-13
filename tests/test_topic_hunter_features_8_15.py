@@ -875,6 +875,3 @@ class TestSeedStrategyProvenance:
         for gap in result:
             assert "builds_on_negative_result" not in gap, \
                 f"builds_on_negative_result should have been stripped from '{gap.get('title')}'"
-
-
-import tempfile

@@ -662,6 +662,19 @@ Return JSON:
                         text = str(obj.get("objection", ""))
                         seen_texts.add(text.lower().strip())
                         updated.append(obj)
+                    elif isinstance(obj, str):
+                        updated.append({"objection": obj, "severity": 3, "status": "unresolved"})
+                        seen_texts.add(obj.lower().strip())
+                    elif isinstance(obj, list) and obj:
+                        # Nested list — take first dict or wrap
+                        for sub in obj:
+                            if isinstance(sub, dict):
+                                text = str(sub.get("objection", ""))
+                                seen_texts.add(text.lower().strip())
+                                updated.append(sub)
+                                break
+                        else:
+                            updated.append({"objection": str(obj), "severity": 3, "status": "unresolved"})
                 for prior in prior_objections:
                     if not isinstance(prior, dict):
                         prior = {"objection": str(prior), "severity": 3}
@@ -861,6 +874,7 @@ class HypothesisDebateSystem:
             if final.get("needs_longer_debate") and len(rounds) < max_r:
                 response = self.proposer.respond_to_objections(topic, argument, current_objections)
                 current_objections = self.challenger.followup_objections(topic, response, current_objections)
+                current_objections = _ensure_objections_are_dicts(current_objections)
                 rounds.append({"round": len(rounds) + 1, "proposer": response, "objections": current_objections})
                 final = self.moderator.evaluate_debate(topic, rounds, current_objections)
 

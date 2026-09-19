@@ -9,7 +9,7 @@ ScholarGraph is a local research-workflow system. It combines LLM-assisted plann
 1. **Entry points** start either the CLI (`main.py`), demo (`demo.py`), real-API wrapper (`run_with_real_api.py`), or FastAPI UI (`run_ui.py` → `web/app.py`).
 2. **Orchestration** in `main.py` builds a LangGraph state machine via `core/workflow.py`. A separate QA-mode graph handles literature synthesis queries.
 3. **Agents** perform domain work: discovery, debate, planning, data validation, writing (narrative + results), engineering, independent validation (execution → analysis → verification), supervision, meta-evaluation, and editing.
-4. **Core services** provide configuration, LLM access, memory, logging, sandbox execution, persistence, verification, evidence gating, evidence synthesis, dataset catalog, source retrieval, and capability brokering.
+4. **Core services** provide configuration, LLM access, memory, logging, sandbox execution, persistence, verification, evidence gating, evidence synthesis, dataset catalog, source retrieval, capability brokering, and rate-limited external API access.
 5. **Artifacts** are written to `output/` and durable run data is stored in SQLite (`core/research_db.py`) with JSONL compatibility exports.
 
 ## Important boundaries
@@ -21,7 +21,7 @@ ScholarGraph is a local research-workflow system. It combines LLM-assisted plann
 - `core.evidence_gate` owns immutable experiment contracts and fail-closed handoffs. LLM review is advisory and cannot rescue a hard failure.
 - `core.evidence_synthesis` builds auditable cross-paper evidence maps with cited bridges; candidates must cite valid bridge IDs.
 - `core.verification` contains deterministic statistical, provenance, and manuscript checks. LLM review is advisory and cannot rescue a hard failure.
-- `core.sandbox` is a local AST/builtins lockdown mechanism, not a security boundary. Supports both `ast` (in-process) and `docker` backends via `SANDBOX_BACKEND`.
+- `core.sandbox` is a local AST/builtins lockdown mechanism, not a security boundary. Supports both `ast` (in-process) and `docker` backends via `SANDBOX_BACKEND`, with automatic fallback when Docker is unavailable.
 - `core.datasets` is the local-only dataset catalog; planners may use catalogued assets or generated synthetic data, never implicit downloads.
 - `core.sources` caches allowlisted source responses. Full text requires an explicit open-access/license signal.
 - `core.known_answers` provides known-answer validation fixtures for experiment code before trust.
@@ -31,6 +31,7 @@ ScholarGraph is a local research-workflow system. It combines LLM-assisted plann
 - `core.tool_broker` authorizes registered tool calls, fails closed for unknown capabilities, and records audit entries.
 - `core.ports` defines persistence port protocols (`ResearchLedgerPort`, `VectorMemoryPort`) for future adapter injection.
 - `core.structural_gaps`, `core.sparsity_matrix`, and `core.contradiction_mining` provide additional gap signals for TopicHunter v2.
+- `core.api_gateway` provides centralized rate limiting, circuit breakers, adaptive backoff, and health tracking for all external API calls.
 - `web.app` reads workflow state and persistence services but starts the pipeline in a background thread.
 
 ## Main data flow
@@ -50,6 +51,25 @@ TopicHunterAgent (with evidence synthesis + structural gap mining)
 ```
 
 State is passed between these phases as a mutable `ResearchState` dictionary. Before engineering, each experiment receives a content-hashed contract and dataset identity (`core.evidence_gate`). Code repairs may change implementation only; contract drift is terminal. Technical execution failure produces a failure dossier and stops downstream agents. Results writing can redraft numeric grounding, but cannot invent measurements or override the evidence gate.
+
+### v4/v4.1 upgrades (2026-09)
+
+| Upgrade | Where | Behavior |
+|---|---|---|
+| Feedback-aware revision | `agents/writer.py`, `core/workflow_nodes.py` | Redrafts carry deterministic check failures + supervisor feedback; results redrafts re-draft only failing sections |
+| Narrative revision loop | `write_narrative_sections` | Below-threshold narrative sections re-drafted once with supervisor feedback |
+| Editor referee repair | `workflow_nodes.editor_repair_route` | Release-referee failures route to one bounded repair pass instead of terminal failure |
+| Self-correcting JSON | `core/utils.py:call_llm_json` | Re-asks with parse error on malformed JSON |
+| Novelty-plagiarism gate | `core/verification.py:novelty_overlap_check` | Deterministic overlap-coefficient screen of Abstract+Introduction vs closest prior work |
+| Evidence-grounded proposer | `agents/hypothesis_debate.py` | Round-1 arguments include structured hypothesis, retrieved evidence, and prior objection tags |
+| Prompt hardening | `agents/writer.py` | Intro/abstract get literature evidence + "never invent citations"; Results gets copy-exact + statistical-test requirements |
+| LLM failure visibility | `core/llm.py` | `llm_failures` run stat + error-level message on chat failure |
+| Engineer failure-gradient hints | `agents/engineer.py` | Deterministic hints per failure category injected into refinement prompts |
+| Cross-run lessons for Engineer | `agents/engineer.py` | Uses `CrossRunMemory().get_prompt_context()` for prior failure patterns |
+| Supervisor checklist hardening | `agents/supervisor.py` | Requires explicit falsifiable-prediction verdict with controls/robustness evidence |
+| Writer context budget | `agents/writer.py` | Experiment JSON dumps bounded (`[:6000]`) |
+
+New state fields: `narrative_revision_count`, `editor_repair_count`, `editor_repair_findings`.
 
 ### QA-mode flow
 
@@ -71,8 +91,8 @@ The editor runs deterministic citation, numeric, dataset, checklist, reproducibi
 | Directory | Key files | Purpose |
 |---|---|---|
 | `agents/` | `topic_hunter.py`, `hypothesis_debate.py`, `planner.py`, `writer.py`, `engineer.py`, `data.py`, `execution.py`, `analysis.py`, `verification.py`, `supervisor.py`, `meta_agent.py`, `editor.py` | One file per agent role |
-| `core/` | `config.py`, `llm.py`, `state.py`, `workflow.py`, `workflow_nodes.py`, `pipeline.py`, `context.py`, `contracts.py`, `verification.py`, `sandbox.py`, `sources.py`, `datasets.py`, `evidence_gate.py`, `evidence_synthesis.py`, `capabilities.py`, `tool_broker.py`, `research_db.py`, `run_log.py`, `memory.py`, `ports.py`, `utils.py`, `known_answers.py`, `structural_gaps.py`, `sparsity_matrix.py`, `contradiction_mining.py`, `forensics.py`, `replay.py` | Shared services |
-| `web/` | `app.py`, `static/admin/` | FastAPI backend + operations console |
-| `tests/` | 26 test files + `smoke_offline.py` | Offline eval harness and per-module tests |
+| `core/` | `config.py`, `llm.py`, `state.py`, `workflow.py`, `workflow_nodes.py`, `pipeline.py`, `context.py`, `contracts.py`, `verification.py`, `sandbox.py`, `sources.py`, `datasets.py`, `evidence_gate.py`, `evidence_synthesis.py`, `capabilities.py`, `tool_broker.py`, `research_db.py`, `run_log.py`, `memory.py`, `ports.py`, `utils.py`, `known_answers.py`, `structural_gaps.py`, `sparsity_matrix.py`, `contradiction_mining.py`, `forensics.py`, `replay.py`, `api_gateway.py`, `sandbox_dispatch.py`, `container_sandbox.py`, `sources_s2_bulk.py`, `sources_openreview.py`, `artifacts.py` | Shared services |
+| `web/` | `app.py`, `static/admin.html` | FastAPI backend + operations console |
+| `tests/` | 26+ test files + `smoke_offline.py` | Offline eval harness and per-module tests |
 | `output/` | `raw_results/`, `companion_repo/`, `source_cache/` | Generated artifacts (gitignored) |
 | `memory/` | `vector_db/`, `keys.json`, `cross_run.jsonl`, `elo_ratings.json`, `checkpoints.sqlite`, `research_ledger.sqlite` | Durable run state (gitignored) |

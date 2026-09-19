@@ -19,4 +19,4 @@ Composition root for the CLI research workflow. It defines the graph nodes, grap
 
 ## Refactor note
 
-This file is currently the largest orchestration surface. The next safe extraction is `workflow_nodes.py`, followed by a shared pipeline runner for CLI and web.
+Graph construction and node wrappers live in `core/workflow.py` and `core/workflow_nodes.py`. Shared CLI/web execution lives in `core/pipeline.py`. This file retains the CLI entry point and compatibility re-exports.

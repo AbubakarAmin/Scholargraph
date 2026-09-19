@@ -53,6 +53,10 @@ class Config(BaseSettings):
     openreview_username: str = os.getenv("OPENREVIEW_USERNAME", "")
     openreview_password: str = os.getenv("OPENREVIEW_PASSWORD", "")
     openreview_enabled: bool = os.getenv("OPENREVIEW_ENABLED", "true").lower() == "true"
+
+    # HuggingFace (for dataset access)
+    huggingface_token: str = os.getenv("HUGGINGFACE_TOKEN", "")
+    huggingface_max_download_mb: int = int(os.getenv("HUGGINGFACE_MAX_DOWNLOAD_MB", "500"))
     openreview_venues: list = ["iclr2025", "iclr2026", "neurips2025"]
     arxiv_enabled: bool = os.getenv("ARXIV_ENABLED", "true").lower() == "true"
     openalex_enabled: bool = os.getenv("OPENALEX_ENABLED", "true").lower() == "true"
@@ -246,6 +250,8 @@ def apply_runtime_keys(keys: dict) -> None:
         "OPENREVIEW_ENABLED": "openreview_enabled",
         "ARXIV_ENABLED": "arxiv_enabled",
         "OPENALEX_ENABLED": "openalex_enabled",
+        "HUGGINGFACE_TOKEN": "huggingface_token",
+        "HUGGINGFACE_MAX_DOWNLOAD_MB": "huggingface_max_download_mb",
     }
     for env_key, attr in mapping.items():
         if env_key in keys and keys[env_key] not in (None, ""):
@@ -343,6 +349,8 @@ def sync_env_file(keys: dict, env_path: Optional[Path] = None) -> Path:
         "OPENREVIEW_ENABLED",
         "ARXIV_ENABLED",
         "OPENALEX_ENABLED",
+        "HUGGINGFACE_TOKEN",
+        "HUGGINGFACE_MAX_DOWNLOAD_MB",
     }
     updates = {
         str(k): str(v)

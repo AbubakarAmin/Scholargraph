@@ -20,3 +20,8 @@ Generates experiment code, validates it, executes multi-seed runs, performs chea
 ## Safety
 
 All generated code must pass `core.sandbox.validate_code` before execution.
+
+## v4.1 upgrades (2026-09)
+
+- **Failure-gradient hints** (`_error_category_hint`): Deterministic hints per failure category (timeout → shrink workload; import → allowed imports; sandbox → no file/subprocess; JSON → metrics line) injected into `_refine_code` prompts.
+- **Cross-run lessons**: `_generate_experiment_code` uses `CrossRunMemory().get_prompt_context()` to list prior failure patterns. Never uses `lessons_for_prompt()` — the memory-integrity static audit forbids it.

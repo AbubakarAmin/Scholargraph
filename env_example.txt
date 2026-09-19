@@ -36,6 +36,11 @@ OPENREVIEW_USERNAME=
 OPENREVIEW_PASSWORD=
 OPENREVIEW_ENABLED=true
 
+# HuggingFace (for dataset access — agents can download datasets from HF Hub)
+# https://huggingface.co/settings/tokens
+HUGGINGFACE_TOKEN=
+HUGGINGFACE_MAX_DOWNLOAD_MB=100
+
 # Source toggles (disable individual sources without touching code)
 ARXIV_ENABLED=true
 OPENALEX_ENABLED=true
@@ -52,7 +57,6 @@ EXPERIMENT_SEEDS=3
 EXPERIMENT_BRANCH_COUNT=3
 DEBUG_MODE=true
 LOG_LEVEL=INFO
-LLM_REQUEST_INTERVAL=1.0
 
 # Paths
 VECTOR_DB_PATH=./memory/vector_db

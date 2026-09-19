@@ -67,6 +67,12 @@ This folder documents the current codebase module by module. The project is a lo
 - [Contradiction Mining](modules/core-contradiction_mining.md) — opposing-claim detection across papers
 - [Forensics](modules/core-forensics.md) — durable incident reports
 - [Replay](modules/core-replay.md) — clean-environment replay
+- [API Gateway](modules/core-api_gateway.md) — rate limiting, circuit breakers, and adaptive backoff for external APIs
+- [Sandbox Dispatch](modules/core-sandbox_dispatch.md) — AST vs Docker backend selection and fallback
+- [Container Sandbox](modules/core-container_sandbox.md) — Docker-based sandboxed code execution
+- [Sources S2 Bulk](modules/core-sources_s2_bulk.md) — Semantic Scholar bulk retrieval adapter
+- [Sources OpenReview](modules/core-sources_openreview.md) — OpenReview venue retrieval adapter
+- [Artifacts](modules/core-artifacts.md) — artifact export, companion repo assembly, and release gating
 
 ### Web and tests
 

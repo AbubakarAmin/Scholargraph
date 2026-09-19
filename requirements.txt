@@ -28,4 +28,6 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pytest>=8.0.0
 openreview-py>=2.5.1
+datasets>=2.14.0,<3
+huggingface-hub>=0.20.0
 editdistance>=0.8.1,<1  # transitive dep of openreview-py; may fail to build on Python 3.14+ (no pre-built wheels)

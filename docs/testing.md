@@ -43,6 +43,8 @@ The full suite covers (all offline/mocked where needed):
 | `test_metrics_parsing.py` | Metric extraction from stdout |
 | `test_arxiv_sleep_guard.py` | arXiv rate-limit backoff |
 | `test_remaining_implementation.py` | Remaining implementation coverage |
+| `test_v4_research_upgrades.py` | v4 upgrades: feedback-aware revision, narrative revision loop, editor referee repair, self-correcting JSON, novelty-plagiarism gate, evidence-grounded proposer, prompt hardening, LLM failure visibility |
+| `test_debate_robustness.py` | Debate payload-shape fixes: objection normalization, self-correcting parse, followup envelope tolerance, iteration hardening |
 | `tests/smoke_offline.py` | Quick standalone smoke check (no pytest) |
 
 ## Smoke script

@@ -474,5 +474,40 @@ research-quality controls. The following operational features are available:
   generalizability, or real-world usefulness. Human domain review, appropriate
   data governance, and independent reproduction remain necessary.
 
+### v4 research upgrades (2026-09)
+
+Informed by 2025–2026 agentic-research literature (WARA artifact repair, AppliedScientist reviewer-guided revision, AgentGrad failure gradients, Gupta & Pruthi ACL 2025 novelty-plagiarism findings, TruthInsightBench "discriminating acts"):
+
+- **Feedback-aware revision** (`agents/writer.py`, `core/workflow_nodes.py`): Redrafts carry deterministic check failures + supervisor feedback into the writer prompt; results redrafts re-draft only failing sections.
+- **Narrative revision loop** (`write_narrative_sections`): On meta-continue, below-threshold narrative sections are re-drafted once with supervisor feedback (`narrative_revision_count` bound = 1).
+- **Editor referee repair** (`workflow_nodes.editor_repair_route`): Release-referee failures route to one bounded repair pass instead of terminal failure; failed-experiment failures stay terminal.
+- **Self-correcting JSON** (`core/utils.py:call_llm_json`): Re-asks with parse error on malformed JSON; wired into `consistency_referee`, supervisor soft checks, meta feedback.
+- **Novelty-plagiarism gate** (`core/verification.py:novelty_overlap_check`): Deterministic overlap-coefficient screen of Abstract+Introduction vs closest prior work / literature evidence.
+- **Evidence-grounded proposer** (`agents/hypothesis_debate.py`): Round-1 arguments include structured hypothesis, retrieved evidence, and prior objection tags to preempt recurring objections.
+- **Prompt hardening** (`agents/writer.py`): Intro/abstract get literature evidence + "never invent citations" policy; Results gets copy-exact + n=/std/CI + statistical-test + falsifiability-reporting requirements.
+- **LLM failure visibility** (`core/llm.py`): `llm_failures` run stat + error-level message on chat failure.
+
+### v4.1 round two (2026-09, same batch)
+
+Informed by Anthropic context engineering (attention budget / minimal high-signal tokens), Critic Experience Bank, CYCLE, and AgentGrad:
+
+- **Engineer failure-gradient hints** (`agents/engineer.py:_error_category_hint`): Deterministic hints per failure category injected into `_refine_code` prompts.
+- **Cross-run lessons for Engineer** (`_generate_experiment_code`): Uses `CrossRunMemory().get_prompt_context()` to list prior failure patterns.
+- **Screener self-correction** (`agents/topic_hunter.py`): `call_llm_json` replaces the parse-blind 2-attempt loop.
+- **Challenger followup self-correction** (`agents/hypothesis_debate.py:followup_objections`): Self-correcting parse with fail-closed prior objections.
+- **QA answer robustness** (`core/workflow_nodes.py:qa_answer_node`): `call_llm_json` with parse-error re-ask.
+- **Supervisor checklist hardening** (`agents/supervisor.py:REVIEW_CHECKLIST`): Requires explicit falsifiable-prediction verdict (supported/falsified/inconclusive) with controls/robustness evidence.
+- **Writer context budget** (`agents/writer.py`): Experiment JSON dumps bounded (`[:6000]`).
+
+### Debate payload-shape fixes (2026-09-19, from run logs)
+
+- **Objection normalization** (`agents/hypothesis_debate.py:build_rebuttal`): `_normalize_objection_payload` coerces bare array / single-dict objections → canonical envelope.
+- **Challenger self-correcting parse** (`build_rebuttal`): `call_llm_json` re-ask carries the parse error + offending excerpt.
+- **Followup envelope tolerance** (`followup_objections`): Bare-array objection payloads are coerced instead of failed closed.
+- **Iteration hardening** (`evaluate_debate`, `conduct_debate`, `revise_topic_from_objections`): All `.get`-on-objection loops filter `isinstance(o, dict)`; `structured_hypothesis` accessed via `_as_dict()`.
+- **`parse_json_from_llm` type safety** (`core/utils.py`): Non-str input → None; broad `except Exception`.
+
+Tests: `tests/test_v4_research_upgrades.py`, `tests/test_debate_robustness.py`.
+
 Operational validation currently passes the full repository suite. Use the
 commands in `docs/testing.md` for regression, clean replay, and incident reports.

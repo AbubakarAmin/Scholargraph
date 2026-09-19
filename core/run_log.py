@@ -72,6 +72,8 @@ class RunTracker:
             "hard_check_fails": 0,
             "llm_calls": 0,
             "llm_failures": 0,
+            "llm_tokens_in": 0,
+            "llm_tokens_out": 0,
             "cost_estimate_usd": 0.0,
         }
         self.phase = "idle"
@@ -121,6 +123,8 @@ class RunTracker:
     def bump(self, key: str, amount: int = 1):
         if key in self.stats:
             self.stats[key] += amount
+        else:
+            self.stats[key] = amount
         emit_event("stat", {"key": key, "value": self.stats.get(key)}, run_id=self.run_id)
 
     def message(self, text: str, level: str = "info"):

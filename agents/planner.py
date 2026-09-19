@@ -21,7 +21,7 @@ from core.memory import memory
 from core.run_log import get_tracker, CrossRunMemory
 from core.capabilities import SANDBOX_CAPABILITY_MANIFEST, check_plan_feasibility
 from core.verification import preregister_power
-from core.datasets import list_datasets
+from core.datasets import list_datasets, get_dataset_info, download_hf_dataset, load_local_dataset
 
 
 class PlannerAgent:
@@ -123,12 +123,75 @@ class PlannerAgent:
             raise ValueError("Plan rejected by sandbox capability manifest: " + "; ".join(plan["feasibility_errors"]))
 
         self._store_plan(plan, topic)
+
+        # Resolve datasets for each experiment: get info, download if small
+        plan["dataset_resolutions"] = self._resolve_experiment_datasets(plan)
+
         log_agent_action("PlannerAgent", "plan_created", {
             "sections": len(plan.get("sections", [])),
             "experiments": len(plan.get("experiments", [])),
             "unfalsifiable": len(plan["unfalsifiable_flags"]),
         })
         return plan
+
+    def _resolve_experiment_datasets(self, plan: Plan) -> List[Dict[str, Any]]:
+        """Resolve datasets for each experiment: get metadata, download if small.
+
+        Called during plan creation so datasets are ready before Engineer phase.
+        Returns a list of resolution records for each experiment.
+        """
+        resolutions = []
+        for exp in plan.get("experiments") or []:
+            if not isinstance(exp, dict):
+                continue
+            dataset = exp.get("dataset") or {}
+            dataset_name = dataset.get("name", "") if isinstance(dataset, dict) else str(dataset)
+            if not dataset_name:
+                resolutions.append({"experiment": exp.get("name", ""), "dataset": None, "status": "no_dataset"})
+                continue
+
+            # Try local catalog first
+            try:
+                local = load_local_dataset(dataset_name)
+                if local and local.get("row_count", 0) > 0:
+                    resolutions.append({
+                        "experiment": exp.get("name", ""),
+                        "dataset": dataset_name,
+                        "status": "local_loaded",
+                        "rows": local["row_count"],
+                    })
+                    log_agent_action("PlannerAgent", "dataset_resolved_local", {
+                        "experiment": exp.get("name", ""), "dataset": dataset_name, "rows": local["row_count"],
+                    })
+                    continue
+            except Exception:
+                pass
+
+            # Get info (metadata only — no download yet)
+            info = get_dataset_info(dataset_name)
+            if info:
+                resolutions.append({
+                    "experiment": exp.get("name", ""),
+                    "dataset": dataset_name,
+                    "status": "info_resolved",
+                    "source": info.get("source"),
+                    "size_info": info.get("size_info"),
+                    "license": info.get("license"),
+                })
+                log_agent_action("PlannerAgent", "dataset_resolved_info", {
+                    "experiment": exp.get("name", ""), "dataset": dataset_name, "source": info.get("source"),
+                })
+            else:
+                resolutions.append({
+                    "experiment": exp.get("name", ""),
+                    "dataset": dataset_name,
+                    "status": "not_found",
+                })
+                log_agent_action("PlannerAgent", "dataset_not_found", {
+                    "experiment": exp.get("name", ""), "dataset": dataset_name,
+                })
+
+        return resolutions
 
     @staticmethod
     def _apply_capability_rescope(plan: Plan, topic: Topic, reasons: List[str]) -> None:

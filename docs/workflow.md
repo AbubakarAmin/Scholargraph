@@ -11,13 +11,13 @@ Defined in `core/workflow.py:create_research_graph()`:
 3. **`planning`** — Create a falsifiable plan with baselines, variants, metrics, dependencies, statistical tests, and a catalogued local dataset. Feasibility checked against `SandboxCapabilityManifest` before commitment. Invalid plans route to `terminal_planning_failure` → END.
 4. **`terminal_planning_failure`** — Records the failure reason and stops the run. No recovery path.
 5. **`data_validation`** — If the plan declares an explicit `dataset_path` or `dataset_file`, `DataAgent` validates schema, target, hash, and row count. Invalid data terminates the run. Plans without explicit datasets retain synthetic-data compatibility.
-6. **`writing_narrative`** — Draft Introduction, Related Work, Methods, and a provisional abstract. Receives an empty result set so it cannot report invented measurements.
+6. **`writing_narrative`** — Draft Introduction, Related Work, Methods, and a provisional abstract. Receives an empty result set so it cannot report invented measurements. On meta-continue, below-threshold narrative sections are re-drafted once with supervisor feedback (`narrative_revision_count` bound = 1).
 7. **`engineering`** — Build immutable experiment contracts via `core.evidence_gate`. Generate code, validate against AST sandbox, execute with multi-seed runs, run branch search over variants, auto-generate ablations. Plan revision requests bounce back to `planning`. Code-claim consistency checked against the capability manifest.
 8. **`independent_validation`** — Three-agent chain: `ExecutionAgent` (seeded replay + artifact creation) → `AnalysisAgent` (SciPy summaries, CIs, Welch tests, effect sizes) → `VerificationAgent` (hash integrity, statistical agreement with raw results). Blocking findings prevent editing.
-9. **`writing_results`** — Draft Results, Discussion, and final Abstract from `engineer_outputs`. Numeric claims are compared against recursively extracted recorded values. Unmatched claims trigger a redraft (max `results_redraft_count` retries).
-10. **`supervision`** — Hard citation + stats checks (`hard_verify_section`), MathChecker (SymPy), CodeChecker (compile/delimiters), then soft LLM reviewer. Hard failure caps section score at 4.0.
+9. **`writing_results`** — Draft Results, Discussion, and final Abstract from `engineer_outputs`. Numeric claims are compared against recursively extracted recorded values. Unmatched claims trigger a redraft (max `results_redraft_count` retries). Carries deterministic check failures + supervisor feedback into the writer prompt.
+10. **`supervision`** — Hard citation + stats checks (`hard_verify_section`), MathChecker (SymPy), CodeChecker (compile/delimiters), then soft LLM reviewer. Hard failure caps section score at 4.0. Requires explicit falsifiable-prediction verdict (supported/falsified/inconclusive) with controls/robustness evidence.
 11. **`meta_evaluation`** — Improve prose only for eligible evidence. Cannot override terminal technical failure or mutate a committed contract.
-12. **`editing`** — Add limitations from unresolved debate objections, resolve bibliography entries, run deterministic reviewer checklist and consistency referee, export paper + companion repo. Human approval required via `POST /api/release/approve`.
+12. **`editing`** — Add limitations from unresolved debate objections, resolve bibliography entries, run deterministic reviewer checklist and consistency referee, export paper + companion repo. Release-referee failures route to one bounded repair pass (`editor_repair_count >= 1`) instead of terminal failure. Human approval required via `POST /api/release/approve`.
 13. **`reset`** — Clear topic state and return to `topic_discovery` for the next iteration.
 
 ### QA-mode graph
@@ -25,7 +25,7 @@ Defined in `core/workflow.py:create_research_graph()`:
 Defined in `core/workflow.py:create_qa_graph()`:
 
 1. **`qa_literature_retrieval`** — Search OpenAlex/arXiv for the user query, build a literature context.
-2. **`qa_answer`** — Synthesize an answer with key findings and bibliography. Citation grounding enforced via `verify_citations()` inside the node.
+2. **`qa_answer`** — Synthesize an answer with key findings and bibliography. Citation grounding enforced via `verify_citations()` inside the node. Uses `call_llm_json` with parse-error re-ask.
 3. **`qa_verification`** — Check answer completeness and citation resolution before completion.
 
 The QA graph skips hypothesis debate, planning, engineering, and evidence-gate machinery entirely.
@@ -61,6 +61,7 @@ The QA graph skips hypothesis debate, planning, engineering, and evidence-gate m
 | `supervision` | `terminal_error` or `complete` | END |
 | `meta_evaluation` | `should_continue` | `writing_narrative` |
 | `meta_evaluation` | else | END |
+| `editing` | `editor_repair_count >= 1` | `writing_results` (repair loop) |
 | `editing` | always | END |
 | `reset` | always | `topic_discovery` |
 
@@ -85,6 +86,9 @@ Key state fields added since the initial design:
 | `qa_answer` | QA-mode synthesis answer |
 | `qa_citation_verification` | QA-mode citation verification result |
 | `user_query` | User query for QA mode |
+| `narrative_revision_count` | Tracks narrative revision attempts (v4, bound = 1) |
+| `editor_repair_count` | Tracks editor repair attempts (v4, bound = 1) |
+| `editor_repair_findings` | Findings from editor repair pass (v4) |
 
 During a real CLI or web run, `ResearchPipeline` activates one `RunContext` for the stream. Agents receive that context when constructed, giving them access to run configuration, vector memory, and the research ledger without reaching into process globals.
 
@@ -98,5 +102,6 @@ During a real CLI or web run, `ResearchPipeline` activates one `RunContext` for 
 - After commitment, changing data, requirements, metrics, baselines, or hypothesis is contract drift and requires a new experiment identity.
 - Results numeric grounding may trigger up to two redrafts.
 - Independent verification findings can block the editing route; Meta evaluates recovery options.
+- Editor release-referee failures route to one bounded repair pass before terminal failure (v4).
 - Durable checkpoints allow CLI resume with `python main.py --resume RUN_ID`.
 - `python replay_run.py PATH --clean-env` replays companion code in a fresh virtual environment; `historical_report.py` reconstructs the latest failed/completed run pair.

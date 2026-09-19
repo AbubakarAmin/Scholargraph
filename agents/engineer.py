@@ -23,6 +23,7 @@ from core.run_log import get_tracker, CrossRunMemory, emit_event
 from core.research_db import research_db
 from core.contracts import CodeClaimReport, ExperimentOutput, ExperimentSpec, RevisionRequest
 from core.known_answers import fixture_for
+from core.datasets import download_hf_dataset, get_dataset_info, load_local_dataset
 
 
 def _effectively_empty_code(code: str) -> bool:
@@ -59,6 +60,55 @@ class EngineerAgent:
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.raw_dir, exist_ok=True)
         self._plan_revision_requests: List[Dict[str, Any]] = []
+
+    def prepare_dataset(self, dataset_plan: str, max_samples: int = 1000, dataset_resolutions: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+        """Prepare a dataset for experiment execution.
+
+        Checks Planner's pre-resolved info first, then local catalog, then downloads from HuggingFace.
+        Returns dataset dict with 'rows', 'row_count', 'features' or None.
+        """
+        if not dataset_plan or not dataset_plan.strip():
+            return None
+        plan = dataset_plan.strip()
+
+        # Check if Planner already resolved this dataset
+        if dataset_resolutions:
+            for res in dataset_resolutions:
+                if isinstance(res, dict) and res.get("dataset") == plan:
+                    if res.get("status") == "local_loaded":
+                        # Already loaded by Planner — reload from local
+                        try:
+                            local = load_local_dataset(plan)
+                            if local and local.get("row_count", 0) > 0:
+                                return local
+                        except Exception:
+                            pass
+                    # Info was resolved — proceed to download
+
+        # Try local catalog
+        try:
+            local = load_local_dataset(plan)
+            if local and local.get("row_count", 0) > 0:
+                log_agent_action("Engineer", "dataset_loaded_local", {
+                    "name": plan, "rows": local["row_count"],
+                })
+                return local
+        except Exception:
+            pass
+        # Try HuggingFace download
+        hf_result = download_hf_dataset(plan, max_samples=max_samples)
+        if hf_result:
+            log_agent_action("Engineer", "dataset_downloaded_hf", {
+                "name": plan, "rows": hf_result.get("row_count", 0),
+            })
+            return hf_result
+        # Fallback: get info only (no download)
+        info = get_dataset_info(plan)
+        if info:
+            log_agent_action("Engineer", "dataset_info_only", {
+                "name": plan, "source": info.get("source"),
+            })
+        return None
 
     @property
     def runtime_config(self):

@@ -39,4 +39,4 @@ To add a dataset, add an entry to `DATASET_CATALOG` with:
 
 ## Capability integration
 
-TopicHunter v2 checks `dataset_plan` against the catalog before bridge validation. Uncatalogued datasets are rejected early with `reason_code="dataset_not_catalogued"`.
+TopicHunter checks `dataset_plan` against the catalog before bridge validation. Uncatalogued datasets are rejected early with `reason_code="dataset_not_catalogued"`.

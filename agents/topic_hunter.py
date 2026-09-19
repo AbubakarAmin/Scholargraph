@@ -62,11 +62,6 @@ from core.sparsity_matrix import find_sparse_cells
 from core.contradiction_mining import find_contradictions
 
 
-from core.structural_gaps import find_coupling_gaps
-from core.sparsity_matrix import find_sparse_cells
-from core.contradiction_mining import find_contradictions
-
-
 logger = logging.getLogger(__name__)
 
 # arXiv access policy (v3):
@@ -115,23 +110,8 @@ _MIN_SURVIVING_KEYWORDS = 1
 
 # Known public ML datasets — if a gap's dataset_plan contains any of these
 # substrings, it passes admissibility without checking the local catalog.
-_KNOWN_PUBLIC_DATASETS = frozenset({
-    "mnist", "cifar", "imagenet", "fashion", "svhn", "stl10",
-    "glue", "superglue", "squad", "mnli", "mrpc", "qnli", "rte", "wnli", "cola", "stsb", "sst", "qqp",
-    "commonsense", "piqa", "hellaswag", "winogrande", "arc",
-    "openbookqa", "boolq", "commitmentbank", "swag",
-    "imdb", "yelp", "ag news", "20newsgroups", "reuters",
-    "iris", "wine", "breast cancer", "diabetes", "california housing",
-    "boston housing", " Ames Housing",
-    "librispeech", "common voice", "voxceleb",
-    "coco", "pascal voc", "ade20k", "cityscapes", "gta5",
-    "kitti", "waymo", "nuscenes",
-    "omniglot", "miniimagenet", "tiered imagenet",
-    "ptb", "wikitext", "text8",
-    "mmlu", "humaneval", "mbpp", "gsm8k", "math",
-    "pubmed", "arxiv", "reddit", "bookcorpus",
-    "tabular", "csv", "uci",
-})
+# Moved to core.datasets to fix circular import; re-export for backward compat
+from core.datasets import KNOWN_PUBLIC_DATASETS as _KNOWN_PUBLIC_DATASETS
 
 # Fix #3: the similarity level at which a candidate topic's contribution gets
 # compared against prior work by an LLM (rather than judged on cosine sim
@@ -1333,8 +1313,8 @@ Return JSON:
 
     def _dataset_plan_admissible(self, gap: Dict[str, Any]) -> bool:
         """Feature 1: string check — reject gaps whose dataset_plan names
-        a dataset not in the local catalog, unless it's synthetic/bundled/known-public.
-        Fail-open: catalog errors or empty catalog → always True."""
+        a dataset not in the local catalog, unless it's synthetic/bundled/known-public
+        or available on HuggingFace. Fail-open: catalog errors or empty catalog → always True."""
         if not getattr(self.runtime_config, "capability_first_dataset_scoping_enabled", True):
             return True
         dataset_plan = str(gap.get("dataset_plan", "")).strip()
@@ -1342,7 +1322,7 @@ Return JSON:
             return True
         if dataset_plan.startswith("synthetic") or dataset_plan.startswith("bundled"):
             return True
-        # Accept common public ML benchmarks by name pattern
+        # Check known public datasets (fast path, no API call)
         plan_lower = dataset_plan.lower()
         for kw in _KNOWN_PUBLIC_DATASETS:
             if kw in plan_lower:
@@ -1353,6 +1333,14 @@ Return JSON:
             return True
         catalog_names = {d["name"].lower() for d in catalog}
         if dataset_plan.lower() in catalog_names:
+            return True
+        # Check HuggingFace (works without token for public datasets)
+        from core.datasets import dataset_is_admissible
+        if dataset_is_admissible(dataset_plan, local_catalog=catalog):
+            log_agent_action("TopicHunter", "dataset_admitted_hf", {
+                "title": gap.get("title"),
+                "dataset_plan": dataset_plan,
+            })
             return True
         log_agent_action("TopicHunter", "dataset_plan_rejected", {
             "title": gap.get("title"),
@@ -1469,6 +1457,8 @@ Return JSON:
 
         # --- Phase 2: full contract (strong tier, easier task) ---
         required_fields = ("hypothesis", "falsification_condition", "dependent_variables", "research_question")
+        # Phase 2 new fields — validate at least some are present
+        phase2_fields = ("independent_variables", "baselines", "metrics", "minimum_viable_experiment")
 
         base_prompt = f"""
 Build a complete experimental contract around this validated hypothesis core.
@@ -1540,7 +1530,7 @@ Return the COMPLETE JSON with ALL fields (core + new):
 """
         prompt = base_prompt
         last_parsed: Dict[str, Any] = {}
-        max_attempts = 2
+        max_attempts = 3
         for attempt in range(max_attempts):
             temp = 0.1 if attempt > 0 else 0.3
             raw = call_llm(prompt, temperature=temp, tier="strong")
@@ -1548,6 +1538,8 @@ Return the COMPLETE JSON with ALL fields (core + new):
             if isinstance(parsed, dict):
                 last_parsed = parsed
                 missing = [f for f in required_fields if not parsed.get(f)]
+                # Also check Phase 2 new fields (soft check — warn but don't block)
+                missing_phase2 = [f for f in phase2_fields if not parsed.get(f)]
                 if not missing:
                     parsed["gap_report"] = gap_report
                     parsed["novelty_report"] = novelty_report
@@ -1569,6 +1561,14 @@ Return the FULL corrected JSON, fixing ONLY the listed field(s).
                     "missing_fields": missing,
                     "title": candidate.get("title"),
                 })
+
+        # Final validation: ensure core fields are present in last_parsed
+        if last_parsed:
+            core_fields_ok = all(last_parsed.get(f) for f in required_fields)
+            if core_fields_ok:
+                last_parsed["gap_report"] = gap_report
+                last_parsed["novelty_report"] = novelty_report
+                return last_parsed
 
         return None
 
@@ -1707,6 +1707,23 @@ Return JSON:
                 old_mve = new_hyp.get("minimum_viable_experiment") or {}
                 old_mve.update({k: v for k, v in strengthened_mve.items() if v})
                 new_hyp["minimum_viable_experiment"] = old_mve
+
+            # Quality gate: validate strengthened hypothesis is not worse
+            orig_hyp = str(structured_hyp.get("hypothesis", ""))
+            if len(strengthened_hyp) < len(orig_hyp) * 0.5:
+                # Strengthened version is significantly shorter — likely degraded
+                log_agent_action("TopicHunter", "pre_debate_critique_degraded", {
+                    "title": topic.get("title"),
+                    "reason": "strengthened_too_short",
+                })
+                return topic
+            if not any(kw in strengthened_hyp.lower() for kw in ["test", "measure", "evaluate", "compare", "experiment"]):
+                # Strengthened version lost testability keywords
+                log_agent_action("TopicHunter", "pre_debate_critique_degraded", {
+                    "title": topic.get("title"),
+                    "reason": "lost_testability_keywords",
+                })
+                return topic
 
             topic["structured_hypothesis"] = new_hyp
             topic["falsifiable_prediction"] = new_hyp.get("falsification_condition", "")
@@ -2314,6 +2331,34 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 log_agent_action("TopicHunter", "llm_budget_exhausted", {"seed": seed_hint, "at": "generation", "used": _llm_calls_used["count"]})
                 gaps = []
 
+        # Quality gate: filter out degenerate LLM outputs
+        quality_gaps = []
+        for g in gaps:
+            title = (g.get("title") or "").strip()
+            description = (g.get("description") or "").strip()
+            # Reject degenerate outputs
+            if len(title) < 5:
+                log_agent_action("TopicHunter", "gap_quality_rejected", {
+                    "title": title, "reason": "title_too_short",
+                })
+                continue
+            if title.lower() in ("...", "none", "n/a", "test", ""):
+                log_agent_action("TopicHunter", "gap_quality_rejected", {
+                    "title": title, "reason": "degenerate_title",
+                })
+                continue
+            if len(description) < 15:
+                log_agent_action("TopicHunter", "gap_quality_rejected", {
+                    "title": title, "reason": "description_too_short",
+                })
+                continue
+            quality_gaps.append(g)
+        if len(quality_gaps) < len(gaps):
+            log_agent_action("TopicHunter", "gap_quality_filtered", {
+                "before": len(gaps), "after": len(quality_gaps),
+            })
+        gaps = quality_gaps
+
         kept = []
         for gap in gaps:
             # Budget guard: skip expensive gate chain if LLM budget exhausted
@@ -2639,6 +2684,21 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
 
         kept = []
         for gap in gaps[:2]:
+            # Quality gate for second-pass topics (same as first pass)
+            title = (gap.get("title") or "").strip()
+            description = (gap.get("description") or "").strip()
+            if len(title) < 5 or title.lower() in ("...", "none", "n/a", "test", ""):
+                self._reject(gap, "second_pass_quality_rejected", {"reason": "degenerate_title"})
+                continue
+            if len(description) < 15:
+                self._reject(gap, "second_pass_quality_rejected", {"reason": "description_too_short"})
+                continue
+            # Dataset admissibility check for second-pass
+            if not self._dataset_plan_admissible(gap):
+                self._reject(gap, "second_pass_dataset_not_catalogued", {
+                    "dataset_plan": gap.get("dataset_plan"),
+                })
+                continue
             gap["literature_evidence"] = [
                 {"title": p.get("title", ""), "abstract": p.get("abstract", "")[:3000],
                  "doi": p.get("doi"), "arxiv_id": p.get("arxiv_id")}

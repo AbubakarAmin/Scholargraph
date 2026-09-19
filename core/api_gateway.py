@@ -239,6 +239,7 @@ class APIGateway:
         "s2_bulk":   (1.0,  2),   # 1 req/s, burst 2 (Semantic Scholar bulk)
         "crossref":  (1.0,  1),   # polite pool w/ mailto
         "openreview": (0.5, 1),
+        "huggingface": (2.0, 2),  # 2 req/s, burst 2 (HF API polite pool)
     }
 
     def __init__(

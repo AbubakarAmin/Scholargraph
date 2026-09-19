@@ -240,6 +240,10 @@ def call_llm(
     """Primary LLM entry point used by all agents."""
     llm = client if isinstance(client, LLMClient) else get_llm_client()
     model_id = model or config.resolve_model(tier)
+    # Estimate input tokens (~4 chars per token)
+    input_tokens_est = len(prompt) // 4
+    if system:
+        input_tokens_est += len(system) // 4
     result = llm.chat(
         prompt,
         temperature=temperature,
@@ -247,12 +251,16 @@ def call_llm(
         max_tokens=max_tokens,
         system=system,
     )
+    # Estimate output tokens (~4 chars per token)
+    output_tokens_est = len(result) // 4 if result else 0
     try:
         from .run_log import get_tracker
 
         tracker = get_tracker()
         if tracker:
             tracker.bump("llm_calls")
+            tracker.bump("llm_tokens_in", amount=input_tokens_est)
+            tracker.bump("llm_tokens_out", amount=output_tokens_est)
     except Exception:
         pass
     return result

@@ -1,5 +1,6 @@
 .env
 memory/keys.json
+memory/dataset_cache/
 __pycache__/
 *.py[cod]
 .venv/

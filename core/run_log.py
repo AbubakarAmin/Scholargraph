@@ -71,6 +71,7 @@ class RunTracker:
             "plan_revisions": 0,
             "hard_check_fails": 0,
             "llm_calls": 0,
+            "llm_failures": 0,
             "cost_estimate_usd": 0.0,
         }
         self.phase = "idle"

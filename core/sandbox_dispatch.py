@@ -7,10 +7,18 @@ based on ``config.sandbox_backend``.
 All callers that need to respect the backend switch should call these
 functions instead of importing from ``core.sandbox`` or
 ``core.container_sandbox`` directly.
+
+Robustness (v3): when the Docker backend is configured but the daemon is
+unreachable (e.g. Docker Desktop not running), dispatch falls back to the
+AST sandbox with a one-time warning instead of failing every run.
 """
 
 from __future__ import annotations
 
+import logging
+import shutil
+import subprocess
+import threading
 from typing import Any, Dict, List, Optional
 
 from .config import config
@@ -21,9 +29,47 @@ from .sandbox import (
     run_known_answer_check,
 )
 
+logger = logging.getLogger(__name__)
+
+_docker_probe_result: bool | None = None
+_docker_probe_lock = threading.Lock()
+_docker_fallback_warned = False
+
+
+def _docker_daemon_reachable() -> bool:
+    """Probe the Docker daemon once per process; cache the verdict."""
+    global _docker_probe_result, _docker_fallback_warned
+    if _docker_probe_result is not None:
+        return _docker_probe_result
+    with _docker_probe_lock:
+        if _docker_probe_result is not None:
+            return _docker_probe_result
+        docker_exe = shutil.which("docker")
+        if not docker_exe:
+            _docker_probe_result = False
+        else:
+            try:
+                probe = subprocess.run(
+                    [docker_exe, "info", "--format", "{{.ServerVersion}}"],
+                    capture_output=True,
+                    timeout=5,
+                )
+                _docker_probe_result = probe.returncode == 0
+            except Exception:
+                _docker_probe_result = False
+        if not _docker_probe_result and not _docker_fallback_warned:
+            _docker_fallback_warned = True
+            logger.warning(
+                "SANDBOX_BACKEND=docker but the Docker daemon is unreachable — "
+                "falling back to the AST sandbox for this process."
+            )
+    return _docker_probe_result
+
 
 def _use_docker() -> bool:
-    return (config.sandbox_backend or "ast").lower() == "docker"
+    if (config.sandbox_backend or "ast").lower() != "docker":
+        return False
+    return _docker_daemon_reachable()
 
 
 def execute(

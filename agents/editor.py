@@ -52,7 +52,7 @@ class EditorAgent:
         if "Limitations" not in sections or len(sections.get("Limitations", "")) < 80:
             sections["Limitations"] = self._limitations_from_debate(debate_results, plan)
 
-        referee = final_manuscript_referee(sections, plan, engineer_outputs)
+        referee = final_manuscript_referee(sections, plan, engineer_outputs, topic=topic)
         if not referee["passed"]:
             raise RuntimeError("Cannot assemble manuscript: release referee failed: " + json.dumps(referee["findings"], default=str))
 

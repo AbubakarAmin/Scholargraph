@@ -623,9 +623,47 @@ class EngineerAgent:
             return "PIVOT" if alternatives else "REFINE"
         return "REFINE" if attempt < 3 else ("PIVOT" if alternatives else "REFINE")
 
+    def _error_category_hint(error: str) -> str:
+        """Deterministic hint for the most common execution failure categories
+        (Critic-Experience-Bank style: recurring failures become reusable guidance)."""
+        lowered = str(error or "").lower()
+        if any(token in lowered for token in ("timeout", "timed out", "too long")):
+            return (
+                "The previous run exceeded the time budget. Shrink the workload: "
+                "smaller n_samples (<=200), fewer iterations, no heavy plots."
+            )
+        if any(token in lowered for token in ("memory", "memoryerror", "allocation")):
+            return "Reduce memory usage: smaller arrays, avoid storing full result matrices."
+        if any(token in lowered for token in ("import", "module", "nameerror")):
+            return (
+                "Only these imports are allowed: numpy, pandas, matplotlib, sklearn, "
+                "scipy, math, statistics, random, json, re, collections, seaborn, networkx, sympy."
+            )
+        if any(token in lowered for token in ("forbidden", "sandbox", "blocked", "open(")):
+            return "The sandbox forbids file/subprocess access. Keep all data synthetic and in-memory."
+        if "json" in lowered or "metrics" in lowered:
+            return "The final stdout line must be a single JSON object: {\"metrics\": {...}, \"raw\": {...}}."
+        return ""
+
     def _generate_experiment_code(self, experiment: Dict[str, Any]) -> str:
         cheap = experiment.get("cheap_mode")
         seeds_note = f"Use at least deterministic seeding. Report metrics as JSON on last stdout line."
+        try:
+            tags = CrossRunMemory().get_prompt_context(limit=6)
+        except Exception:
+            tags = []
+        lessons_lines = []
+        for tag in tags:
+            label = tag.get("item") or tag.get("experiment") or ""
+            category = tag.get("rejection_reason") or tag.get("failure_category") or tag.get("revision_reason") or "unknown"
+            if label:
+                lessons_lines.append(f"- {tag.get('kind', tag.get('category', 'issue'))} {label}: {category}")
+        lessons_block = (
+            "\nKnown failure patterns from prior runs (avoid repeating them):\n"
+            + "\n".join(lessons_lines)[:900] + "\n"
+            if lessons_lines
+            else ""
+        )
         prompt = f"""
 Generate COMPLETE runnable Python for this experiment.
 Allowed imports ONLY: numpy, pandas, matplotlib, sklearn, scipy, math, statistics, random, json, re, collections, seaborn, networkx, sympy.
@@ -642,7 +680,7 @@ Falsifiable prediction: {experiment.get('falsifiable_prediction', 'N/A')}
 Statistical test: {experiment.get('statistical_test', 'N/A')}
 {'CHEAP MODE: small n_samples (<=200), fast model, no plots.' if cheap else 'Full mode: reasonable sample size.'}
 Refine feedback: {experiment.get('refine_feedback', 'none')}
-
+{lessons_block}
 {seeds_note}
 Print a single JSON line: {{"metrics": {{...}}, "raw": {{...optional arrays...}}}}
 Return ONLY Python code.
@@ -658,6 +696,8 @@ Return ONLY Python code.
         context_block = ""
         if local_context:
             context_block = f"\nDebugging context (traceback + implicated custom functions):\n{local_context}\n"
+        hint = self._error_category_hint(error)
+        hint_block = f"\nFix hint for this failure category:\n{hint}\n" if hint else ""
         prompt = f"""
 Fix this experiment code. Error:
 {error}
@@ -668,6 +708,7 @@ Code:
 ```
 
 Constraints: no subprocess/os/exit/eval. Print JSON metrics line.
+{hint_block}
 Return ONLY fixed Python code.
 """
         fixed = call_llm(prompt, temperature=0.1, tier="cheap")

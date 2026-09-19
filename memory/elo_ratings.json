@@ -1,0 +1,26 @@
+{
+  "general": {
+    "rating": 1471.9208993909692,
+    "raw_rating": 1426.99433841652,
+    "observations": 5,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-19T07:56:08.115914"
+  },
+  "strategy:kind_bias": {
+    "rating": 1493.7472613587045,
+    "raw_rating": 1468.736306793522,
+    "observations": 2,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-15T03:55:32.344049"
+  },
+  "strategy:generic_fallback": {
+    "rating": 1463.274750066171,
+    "raw_rating": 1414.307750154399,
+    "observations": 6,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-19T07:56:08.116598"
+  }
+}

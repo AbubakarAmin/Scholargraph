@@ -16,7 +16,7 @@ import requests
 
 from .config import config
 from .llm import call_llm
-from .utils import parse_json_from_llm
+from .utils import call_llm_json, parse_json_from_llm
 
 
 # ---------------------------------------------------------------------------
@@ -306,11 +306,89 @@ def validate_reviewer_checklist(sections: Dict[str, str], engineer_outputs: Opti
     return {"passed": all(checks.values()), "checks": checks, "failed": [name for name, passed in checks.items() if not passed]}
 
 
+def novelty_overlap_check(
+    sections: Dict[str, str],
+    topic: Optional[Dict[str, Any]] = None,
+    threshold: float = 0.65,
+) -> Dict[str, Any]:
+    """Deterministic novelty-plagiarism screen (Gupta & Pruthi, ACL 2025).
+
+    ~24% of AI-generated research documents borrow heavily from prior work
+    without acknowledgment. This compares the manuscript's framing text
+    (Abstract + Introduction) against the closest prior work and retrieved
+    literature evidence using a content-word overlap coefficient.
+    Overlap coefficient = |shared| / min(|draft|, |prior|), which is more
+    sensitive than Jaccard to a small draft closely paraphrasing one source.
+    """
+    prior_sources: List[Dict[str, str]] = []
+    structured = (topic or {}).get("structured_hypothesis") or {}
+    closest = structured.get("closest_prior_work") if isinstance(structured, dict) else None
+    if isinstance(closest, dict):
+        text = " ".join(str(closest.get(key) or "") for key in ("title", "abstract", "summary", "contribution") if closest.get(key))
+        if text.strip():
+            prior_sources.append({"source": "closest_prior_work", "text": text})
+    elif isinstance(closest, str) and closest.strip():
+        prior_sources.append({"source": "closest_prior_work", "text": closest})
+    for paper in (topic or {}).get("literature_evidence") or []:
+        if not isinstance(paper, dict):
+            continue
+        text = " ".join(
+            str(paper.get(key) or "") for key in ("title", "abstract")
+        ).strip()
+        if text:
+            prior_sources.append({"source": paper.get("title") or paper.get("doi") or paper.get("arxiv_id") or "literature", "text": text})
+
+    framing = "\n".join(
+        sections.get(name, "") for name in ("Abstract", "Introduction")
+        if isinstance(sections.get(name), str)
+    )
+    if not prior_sources or not framing.strip():
+        return {
+            "passed": True,
+            "max_overlap": 0.0,
+            "threshold": threshold,
+            "overlaps": [],
+            "findings": [],
+            "note": "no prior sources to compare against",
+        }
+
+    def content_tokens(text: str) -> set:
+        return {word for word in re.findall(r"[a-z]{4,}", (text or "").lower())}
+
+    draft_tokens = content_tokens(framing)
+    overlaps: List[Dict[str, Any]] = []
+    for source in prior_sources:
+        source_tokens = content_tokens(source["text"])
+        if not source_tokens:
+            continue
+        shared = draft_tokens & source_tokens
+        denominator = min(len(draft_tokens), len(source_tokens))
+        coefficient = (len(shared) / denominator) if denominator else 0.0
+        overlaps.append({"source": source["source"], "overlap_coefficient": round(coefficient, 3), "shared_terms": len(shared)})
+    max_overlap = max((item["overlap_coefficient"] for item in overlaps), default=0.0)
+    flagged = [item for item in overlaps if item["overlap_coefficient"] > threshold]
+    return {
+        "passed": not flagged,
+        "max_overlap": max_overlap,
+        "threshold": threshold,
+        "overlaps": sorted(overlaps, key=lambda item: item["overlap_coefficient"], reverse=True)[:5],
+        "note": (
+            f"Max framing overlap {max_overlap:.2f} vs threshold {threshold}"
+            if overlaps else "no prior sources to compare against"
+        ),
+        "findings": [
+            {"source": item["source"], "overlap_coefficient": item["overlap_coefficient"]}
+            for item in overlaps if item["overlap_coefficient"] > threshold
+        ],
+    }
+
+
 def consistency_referee(
     sections: Dict[str, str],
     plan: Optional[Dict[str, Any]] = None,
     engineer_outputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Use one isolated model pass to find contradictions in the full draft."""
     """Use one isolated model pass to find contradictions in the full draft."""
     prompt = f"""
 Read this assembled research manuscript as a consistency referee.
@@ -326,7 +404,14 @@ Assembled sections:
 {json.dumps(sections, sort_keys=True, default=str)[:30000]}
 """
     try:
-        parsed = parse_json_from_llm(call_llm(prompt, temperature=0.0, tier="judge", max_tokens=2500))
+        parsed = call_llm_json(
+            prompt,
+            temperature=0.0,
+            tier="judge",
+            max_tokens=2500,
+            attempts=2,
+            call_fn=call_llm,
+        )
     except Exception as exc:
         return {"passed": False, "findings": [{"category": "referee_error", "message": "Consistency referee failed to execute", "blocking": True, "error_type": type(exc).__name__}]}
     if not isinstance(parsed, dict) or not isinstance(parsed.get("findings"), list):
@@ -340,6 +425,7 @@ def final_manuscript_referee(
     sections: Dict[str, str],
     plan: Optional[Dict[str, Any]] = None,
     engineer_outputs: Optional[Dict[str, Any]] = None,
+    topic: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run release-blocking checks over the assembled manuscript as one document."""
     text = "\n".join(sections.values())
@@ -347,6 +433,7 @@ def final_manuscript_referee(
     citation = verify_citations(text)
     checklist = validate_reviewer_checklist(sections, engineer_outputs, plan)
     model_referee = consistency_referee(sections, plan, engineer_outputs)
+    novelty = novelty_overlap_check(sections, topic)
     findings = []
     if not citation["passed"]:
         findings.append({"check": "citations", "details": citation.get("failed", [])})
@@ -356,6 +443,8 @@ def final_manuscript_referee(
         findings.append({"check": "reviewer_checklist", "details": checklist["failed"]})
     if not model_referee["passed"]:
         findings.append({"check": "consistency_referee", "details": model_referee["findings"]})
+    if not novelty["passed"]:
+        findings.append({"check": "novelty_overlap", "details": novelty["findings"]})
     prohibited = [phrase for phrase in PROHIBITED_MANUSCRIPT_TEXT if phrase in text.lower()]
     if prohibited:
         findings.append({"check": "harness_diagnostics", "details": prohibited})
@@ -380,6 +469,7 @@ def final_manuscript_referee(
         "numeric": numeric,
         "checklist": checklist,
         "consistency_referee": model_referee,
+        "novelty": novelty,
     }
 
 

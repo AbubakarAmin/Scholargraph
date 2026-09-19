@@ -42,10 +42,33 @@ class WriterAgent:
     def vector_memory(self):
         return self.context.memory if self.context else memory
     
+class WriterAgent:
+    """Agent for drafting research paper sections."""
+
+    def __init__(self, context: Optional[RunContext] = None):
+        self.context = context or get_active_context()
+        self.client = get_llm_client()
+        self._active_revision_feedback: Optional[str] = None
+
+    @property
+    def runtime_config(self):
+        return self.context.config if self.context else config
+
+    @property
+    def vector_memory(self):
+        return self.context.memory if self.context else memory
+
     def draft_section(self, section_name: str, topic: Topic,
-                     plan: Plan, engineer_outputs: Dict[str, ExperimentOutput]) -> str:
-        """Draft a specific section of the research paper."""
+                      plan: Plan, engineer_outputs: Dict[str, ExperimentOutput],
+                      revision_feedback: Optional[str] = None) -> str:
+        """Draft a specific section of the research paper.
+
+        revision_feedback carries deterministic check failures / reviewer
+        feedback from a prior draft so revision passes repair specific
+        defects instead of re-rolling the same prompt blind.
+        """
         log_agent_action("WriterAgent", "start_drafting", {"section": section_name})
+        self._active_revision_feedback = revision_feedback
         
         # Released exemplars only — cold-start returns empty until runs clear the release gate.
         exemplars = self._released_exemplars(section_name)
@@ -75,13 +98,46 @@ class WriterAgent:
         
         # Store in memory
         self._store_section(section_name, content, topic)
-        
+        self._active_revision_feedback = None
+
         log_agent_action("WriterAgent", "section_complete", {
             "section": section_name,
-            "content_length": len(content)
+            "content_length": len(content),
+            "revised": bool(revision_feedback),
         })
-        
+
         return content
+
+    def _revision_block(self) -> str:
+        """Prompt block injecting prior check failures / reviewer feedback."""
+        feedback = getattr(self, "_active_revision_feedback", None)
+        if not feedback:
+            return ""
+        return (
+            "\n\nREVISION REQUIRED — a previous draft of this section failed deterministic checks "
+            "or review. Repair every issue below in the new draft; keep what already passed intact:\n"
+            + str(feedback)[:2400]
+            + "\n"
+        )
+
+    def _literature_block(self, topic: Topic, max_papers: int = 6, snippet_chars: int = 400) -> str:
+        """Render retrieved literature evidence for prompt grounding."""
+        papers = topic.get("literature_evidence") or []
+        slim = []
+        for paper in papers[:max_papers]:
+            if not isinstance(paper, dict):
+                continue
+            slim.append({
+                "title": paper.get("title", ""),
+                "abstract": (paper.get("abstract") or "")[:snippet_chars],
+                "doi": paper.get("doi"),
+                "arxiv_id": paper.get("arxiv_id"),
+                "year": paper.get("year"),
+            })
+        slim = [p for p in slim if p["title"] or p["abstract"]]
+        if not slim:
+            return "No retrieved literature evidence is available. Do not cite any paper by DOI, arXiv ID, or author-year."
+        return json.dumps(slim, default=str)[:8000]
 
     def _released_exemplars(self, section_name: str) -> List[Dict[str, Any]]:
         """Only released structured exemplars may enter Writer prompts."""
@@ -113,9 +169,10 @@ class WriterAgent:
         """Call the LLM once, retry on empty/garbled stubs, then fall back."""
         last_content = ""
         min_chars = self._min_body_chars(section_name)
+        full_prompt = prompt + self._revision_block()
         for attempt in range(2):
             try:
-                raw = call_llm(prompt, temperature=temperature, tier="strong")
+                raw = call_llm(full_prompt, temperature=temperature, tier="strong")
                 formatted = self._format_section_content(raw, section_name)
                 body = strip_markdown_headers(formatted)
                 if not is_degenerate_llm_output(formatted, min_chars=min_chars) and len(body) >= min_chars:
@@ -145,23 +202,30 @@ class WriterAgent:
         """Draft the abstract section."""
         prompt = f"""
         Write a concise abstract for the following research paper:
-        
+
         Topic: {topic['title']}
         Description: {topic['description']}
         Research Questions: {plan.get('research_questions', [])}
         Expected Contributions: {plan.get('expected_contributions', [])}
         Released exemplar signals (metadata only): {json.dumps(exemplars or [])[:800]}
-        
+
+        Retrieved literature evidence (grounding context):
+        {self._literature_block(topic, max_papers=4, snippet_chars=250)}
+
         Key Results (if available):
         {self._format_engineer_outputs(engineer_outputs)}
-        
+
         The abstract should:
         1. State the problem clearly
         2. Describe the approach/methodology
-        3. Summarize key results
+        3. Summarize key results — only numbers copied exactly from Key Results above
         4. Highlight contributions and impact
         5. Be 150-250 words
-        
+
+        Citation policy: only cite sources that appear in the retrieved literature evidence
+        above (by DOI or arXiv ID). If the evidence does not support a claim, omit the claim.
+        Never invent DOIs, arXiv IDs, author-year pairs, or paper titles.
+
         Write a professional, academic abstract suitable for a research paper.
         """
         
@@ -177,7 +241,7 @@ class WriterAgent:
         """Draft the introduction section."""
         prompt = f"""
         Write an introduction section for the following research paper:
-        
+
         Topic: {topic['title']}
         Description: {topic['description']}
         Rationale: {topic.get('rationale', 'N/A')}
@@ -185,16 +249,23 @@ class WriterAgent:
         Research Questions: {plan.get('research_questions', [])}
         Expected Contributions: {plan.get('expected_contributions', [])}
         Released exemplar signals (metadata only): {json.dumps(exemplars or [])[:800]}
-        
+
+        Retrieved literature evidence (use these sources for background and gap claims):
+        {self._literature_block(topic)}
+
         The introduction should include:
-        1. Background and motivation
+        1. Background and motivation, grounded in the retrieved literature evidence
         2. Problem statement
-        3. Challenges and limitations of existing work
+        3. Challenges and limitations of existing work (reference the specific papers above)
         4. Our approach and contributions
         5. Paper organization
-        
+
+        Citation policy: every citation must come from the retrieved literature evidence
+        above, cited by DOI (doi:10.XXXX/...) or arXiv ID (arXiv:XXXX.XXXXX). Never invent
+        DOIs, arXiv IDs, author-year pairs, or paper titles. If the evidence is insufficient
+        for a claim, state that explicitly instead of citing.
+
         Write 2-3 pages of professional academic content.
-        Include proper citations where appropriate.
         """
         
         return self._draft_with_retry(
@@ -244,7 +315,7 @@ class WriterAgent:
         
         Topic: {topic['title']}
         Methodology: {plan.get('methodology', 'N/A')}
-        Experiments: {json.dumps(plan.get('experiments', []), indent=2)}
+        Experiments: {json.dumps(plan.get('experiments', []), indent=2)[:6000]}
         
         Implementation Details:
         {self._format_engineer_outputs(engineer_outputs)}
@@ -273,7 +344,7 @@ class WriterAgent:
         Write an experiments section for the following research:
         
         Topic: {topic['title']}
-        Experiments: {json.dumps(plan.get('experiments', []), indent=2)}
+        Experiments: {json.dumps(plan.get('experiments', []), indent=2)[:6000]}
         
         Experimental Results:
         {self._format_engineer_outputs(engineer_outputs)}
@@ -300,21 +371,30 @@ class WriterAgent:
         """Draft the results section."""
         prompt = f"""
         Write a results section for the following research:
-        
+
         Topic: {topic['title']}
         Expected Contributions: {plan.get('expected_contributions', [])}
-        
-        Experimental Results:
+
+        Experimental Results (single source of truth):
         {self._format_engineer_outputs(engineer_outputs)}
-        
+
         The results section should:
         1. Analyze experimental results
         2. Compare against baselines
         3. Conduct ablation studies
         4. Provide insights and analysis
         5. Discuss implications
-        
-        Write 3-4 pages of detailed results analysis.
+
+        Number policy (deterministic checks enforce this):
+        - Copy every number EXACTLY from the Experimental Results source of truth above.
+        - Every quantitative sentence must include n= (seed/sample count) and the
+          standard deviation or a confidence interval for the reported metric.
+        - Report the statistical test outcome (test name and p-value) for each comparison
+          where the source of truth provides one.
+        - Do not estimate, round, extrapolate, or invent any number. If a measurement is
+          absent from the source of truth, describe it qualitatively instead.
+        - For each comparison, state whether it supports or falsifies the hypothesis's
+          falsifiable prediction; report negative or inconclusive outcomes honestly.
         """
         
         return self._draft_with_retry(
@@ -375,7 +455,7 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
     
     def _draft_generic_section(self, section_name: str, topic: Topic,
                               plan: Plan, engineer_outputs: Dict[str, ExperimentOutput]) -> str:
-        """Draft a generic section."""
+        """Draft a generic section via _draft_with_retry for revision feedback and min-char guards."""
         prompt = f"""
         Write a {section_name} section for the following research:
         
@@ -385,9 +465,9 @@ or introduce a new number. If a measurement is absent, describe it qualitatively
         The {section_name} should be appropriate for a research paper and cover relevant content for this section.
         Write professional academic content suitable for publication.
         """
-        
+
         try:
-            content = call_llm(prompt, temperature=0.6, tier="strong")
+            content = self._draft_with_retry(section_name, prompt, temperature=0.6)
             return self._format_section_content(content, section_name)
         except Exception as e:
             log_agent_action("WriterAgent", "generic_section_error", {"error": str(e)})

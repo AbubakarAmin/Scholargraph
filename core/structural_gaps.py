@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -20,31 +19,41 @@ def find_coupling_gaps(
     """Find bibliographic coupling gaps: pairs of papers that share many
     references but do not cite each other directly.
 
-    Fail-open: any API error or <2 resolvable papers → return [].
+    All S2 calls route through the API gateway (pacing + breaker + adaptive
+    rate). Fail-open: any API error or <2 resolvable papers → return [].
     """
     if not papers or len(papers) < 2:
         return []
+
+    from .api_gateway import get_gateway, RateLimitError
+
+    def _s2_get(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[requests.Response]:
+        """Single gateway-managed attempt; gateway owns retries and pacing."""
+
+        def _do_fetch():
+            r = requests.get(url, headers=s2_headers, params=params or {}, timeout=15)
+            if r.status_code == 429:
+                raise RateLimitError("s2", float(r.headers.get("Retry-After", "3")))
+            return r
+
+        try:
+            if not get_gateway().is_available("s2"):
+                return None
+            return get_gateway().request("s2", _do_fetch, retries=1, backoff_base=2.0)
+        except Exception as e:
+            logger.debug("find_coupling_gaps: S2 fetch error for %s: %s", url, e)
+            return None
 
     candidate_papers = papers[:20]
     paper_refs: Dict[str, List[str]] = {}
     paper_titles: Dict[str, str] = {}
 
-    def _s2_get_with_retry(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[requests.Response]:
-        for attempt in range(3):
-            try:
-                r = requests.get(url, headers=s2_headers, params=params or {}, timeout=15)
-                if r.status_code == 429 and attempt < 2:
-                    retry_after = float(r.headers.get("Retry-After", "3"))
-                    wait = min(30.0, max(retry_after, 3.0 * (2 ** attempt)))
-                    time.sleep(wait)
-                    continue
-                return r
-            except requests.RequestException:
-                if attempt < 2:
-                    time.sleep(2.0 * (2 ** attempt))
-                    continue
-                return None
-        return None
+    # Skip the whole loop when the S2 breaker is open — nothing will resolve.
+    try:
+        if not get_gateway().is_available("s2"):
+            return []
+    except Exception:
+        pass
 
     for p in candidate_papers:
         raw_doi = (p.get("doi") or "").replace("https://doi.org/", "").strip()
@@ -61,12 +70,12 @@ def find_coupling_gaps(
             continue
         title = p.get("title", "unknown")
         paper_titles[paper_id] = title
+        url = f"{base_url}/paper/{paper_id}"
+        r = _s2_get(url, params={"fields": "references.paperId,citations.paperId"})
+        if r is None or r.status_code != 200:
+            paper_refs[paper_id] = []
+            continue
         try:
-            url = f"{base_url}/paper/{paper_id}"
-            r = _s2_get_with_retry(url, params={"fields": "references.paperId,citations.paperId"})
-            if r is None or r.status_code != 200:
-                paper_refs[paper_id] = []
-                continue
             data = r.json()
             ref_ids = set()
             for ref in data.get("references") or []:
@@ -75,9 +84,8 @@ def find_coupling_gaps(
                     ref_ids.add(rid)
             paper_refs[paper_id] = list(ref_ids)
             paper_titles[paper_id] = data.get("title") or title
-            time.sleep(1.0)
         except Exception as e:
-            logger.debug("find_coupling_gaps: S2 fetch error for %s: %s", paper_id, e)
+            logger.debug("find_coupling_gaps: S2 parse error for %s: %s", paper_id, e)
             paper_refs[paper_id] = []
 
     resolved_ids = [pid for pid, refs in paper_refs.items() if refs]

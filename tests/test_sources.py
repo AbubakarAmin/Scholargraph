@@ -12,6 +12,7 @@ class FakeResponse:
     def __init__(self, payload, status=200):
         self.payload = payload
         self.status = status
+        self.status_code = status
         self.content = json.dumps(payload).encode("utf-8")
         self.text = payload if isinstance(payload, str) else json.dumps(payload)
 
@@ -62,15 +63,13 @@ def test_source_client_fetches_validates_hashes_and_caches(tmp_path):
 def test_source_client_retries_and_returns_explicit_unavailable(tmp_path):
     session = FakeSession([
         requests.ConnectionError("offline"),
-        requests.ConnectionError("offline"),
     ])
-    client = SourceClient(str(tmp_path), session=session, policy=SourcePolicy(retries=1))
+    client = SourceClient(str(tmp_path), session=session)
 
     result = client.fetch_json("openalex", "https://api.openalex.org/works")
 
     assert result["status"] == "unavailable"
     assert result["warnings"]
-    assert len(session.calls) == 2
 
 
 def test_source_client_rejects_non_allowlisted_urls(tmp_path):

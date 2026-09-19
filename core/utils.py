@@ -121,8 +121,12 @@ def calculate_similarity(text1: str, text2: str) -> float:
 
 
 def parse_json_from_llm(response: str) -> Optional[Any]:
-    """Extract JSON object/array from an LLM response."""
-    if not response:
+    """Extract JSON object/array from an LLM response.
+
+    Returns dict OR list — callers must type-check the result before calling
+    dict-only methods like ``.get`` (a bare JSON array is a valid model output).
+    """
+    if not isinstance(response, str) or not response:
         return None
     try:
         if "[" in response and response.find("[") < (response.find("{") if "{" in response else 10**9):
@@ -131,8 +135,68 @@ def parse_json_from_llm(response: str) -> Optional[Any]:
         if "{" in response:
             start, end = response.find("{"), response.rfind("}") + 1
             return json.loads(response[start:end])
-    except json.JSONDecodeError:
+    except Exception:
         return None
+    return None
+
+
+def call_llm_json(
+    prompt: str,
+    *,
+    attempts: int = 3,
+    temperature: float = 0.3,
+    tier: str = "default",
+    client: Any = None,
+    model: Any = None,
+    system: Optional[str] = None,
+    max_tokens: int = 8192,
+    call_fn: Optional[Any] = None,
+) -> Optional[Any]:
+    """Self-correcting structured-output call.
+
+    Parses the LLM response as JSON; when parsing fails, re-asks with the
+    parse error and the offending response excerpt appended so the model can
+    repair its own malformed output (control-data flow separation: the parse
+    protocol stays deterministic, only the content is re-generated).
+    Returns None only after exhausting attempts.
+    """
+    if call_fn is None:
+        from .llm import call_llm as call_fn
+
+    last_response = ""
+    last_error = "empty response"
+    for attempt in range(max(1, attempts)):
+        if attempt == 0:
+            current_prompt = prompt
+        else:
+            current_prompt = (
+                f"{prompt}\n\nYour previous response could not be parsed as JSON."
+                f"\nParse problem: {last_error}"
+                f"\nPrevious response (truncated): {str(last_response)[:400]}"
+                "\nReturn ONLY the valid JSON object or array now — no prose, no markdown fences."
+            )
+        try:
+            last_response = call_fn(
+                prompt=current_prompt,
+                client=client,
+                temperature=max(0.0, temperature - 0.1 * attempt),
+                model=model,
+                tier=tier,
+                system=system,
+                max_tokens=max_tokens,
+            )
+        except TypeError:
+            # Injectable stubs may not accept the full keyword set.
+            last_response = call_fn(current_prompt)
+        try:
+            parsed = parse_json_from_llm(last_response)
+        except Exception as exc:  # defensive: parse must never raise
+            parsed = None
+            last_error = str(exc)
+        else:
+            if parsed is not None:
+                return parsed
+            last_error = "no JSON object or array found in response"
     return None
 
 

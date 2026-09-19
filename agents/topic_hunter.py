@@ -1,51 +1,31 @@
 """
 TopicHunterAgent — citation-graph gap analysis, novelty filter, parallel hunts.
 
-CHANGELOG (this revision):
-  1. Rejection-funnel counter logged at the end of every discover_topics() run,
-     so bottleneck gates are visible instead of inferred.
-  2. feasibility_filter: negation-aware blocked-phrase matching (no longer
-     false-positives on "does not require a gpu cluster").
-  3. evaluate_layered_novelty: the high-overlap/comparison trigger threshold is
-     now clamped to never sit above novelty_similarity_reject, so a candidate
-     can no longer be auto-rejected on embedding similarity alone without ever
-     reaching LLM contribution comparison.
-  4. Bridge-claim validation: malformed/missing evidence_bridge_ids now downgrade
-     to a soft warning (with a programmatic fallback match against the evidence
-     map) instead of a hard reject, matching the existing soft-warning path for
-     text mismatches.
-  5. formalize_hypothesis: added a targeted repair turn — instead of regenerating
-     from scratch on failure, the second (and new third) attempt is told exactly
-     which required field was missing/invalid and asked to fix only that.
-  6. Seed/query generation: rejected-fingerprint history is now windowed (most
-     recent N) and keyword stripping is floored so at least one anchor keyword
-     always survives, preventing seeds from decaying into generic queries over
-     a long run.
-  7. Discovery prompt now asks for more raw candidates per seed, and a cheap
-     heuristic pre-filter screens out obviously ungrounded gaps before the
-     expensive screener/novelty/formalization gate chain runs on them.
-  8. Capability-First Dataset Scoping: dataset_plan is checked against the local
-     catalog before bridge validation; uncatalogued datasets are rejected early
-     with reason_code="dataset_not_catalogued". Fail-open on catalog errors.
-  9. Structural Gap Mining: bibliographic coupling analysis via S2 references
-     identifies pairs sharing references but not citing each other, injected as
-     structural gap signals into the discovery prompt.
-  10. Method × Domain Sparsity Matrix: LLM-extracted (method, domain) pairs from
-      retrieved abstracts are counted; rare combinations of well-established
-      methods/domains are surfaced as sparse-cell gap signals.
-  11. Contradiction Mining: LLM-assisted identification of papers making opposing
-      empirical claims on the same subject, injected as ready-made research gaps.
-  12. Replication-Target Mining: regex heuristic flags papers making strong claims
-      with no visible variance/multi-seed reporting, for replication-and-extension
-      topic proposals.
-  13. Own Negative Results as Prior Work: CrossRunMemory.get_negative_result_lessons()
-      surfaces structured fields from prior unsupported hypotheses as seed context.
-  14. Persona Ensemble Generation: discovery prompt is run through 2 personas
-      (skeptic, practitioner) concurrently; merged gaps are tagged with persona
-      for observability.
-  15. Seed-Strategy Provenance + Elo: _generate_dynamic_seeds returns strategy-
-      tagged seeds; strategy outcomes are tracked in EloStore under strategy:<name>
-      keys; seed ordering is sorted by strategy Elo with exploration reserve.
+CHANGELOG (this revision, v3):
+  1. arXiv access moved to the official `arxiv` client (built-in 1 req / 3s
+     pacing + 429/503 retry honoring Retry-After). The portalocker /tmp
+     file-lock hack is gone; the API gateway (with its new adaptive AIMD
+     bucket) paces and protects every provider call.
+  2. API gateway v2: adaptive token buckets (rate cut on 429/503, additive
+     recovery), backoff jitter, single-flight coalescing of identical reads,
+     and is_available()/breaker_state() probes so open breakers short-circuit
+     to a skip instead of paying retry sleeps.
+  3. LLM-driven seed generation: one cheap call converts cross-run lessons +
+     frontier terms into specific technical seed phrases (strategy
+     "llm_diverse"), with graceful fallback to the static template seeds.
+  4. Query building no longer turns seed filler words ("gaps", "problems",
+     "open", "underexplored", ...) into literal search keywords, which used to
+     retrieve noise literature and degrade gap quality downstream.
+  5. Two-pool LLM budget: seed/query generation calls can no longer starve the
+     gate chain — the gate chain reserves its own sub-budget, so gaps that
+     were generated get evaluated instead of being silently discarded.
+  6. literature_evidence is now relevance-ranked (embedding cosine with
+     token-overlap fallback) instead of "first 8 papers fetched", so screener
+     and novelty prompts judge gaps against the closest prior work.
+  7. retrieve_literature(query) added — shared multi-source retrieval used by
+     the QA-mode graph (previously referenced but missing).
+  8. Structural gap mining now routes S2 calls through the API gateway
+     (previously bypassed it with its own retry/sleep loop).
 """
 
 from __future__ import annotations
@@ -62,12 +42,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import arxiv
 import numpy as np
 import requests
 
 from core.config import config
-from core.utils import log_agent_action, parse_json_from_llm, calculate_similarity, title_token_overlap
+from core.utils import log_agent_action, parse_json_from_llm, calculate_similarity, title_token_overlap, call_llm_json
 from core.llm import call_llm, generate_embedding
 from core.llm import get_llm_client
 from core.context import RunContext, get_active_context
@@ -83,7 +62,43 @@ from core.sparsity_matrix import find_sparse_cells
 from core.contradiction_mining import find_contradictions
 
 
+from core.structural_gaps import find_coupling_gaps
+from core.sparsity_matrix import find_sparse_cells
+from core.contradiction_mining import find_contradictions
+
+
 logger = logging.getLogger(__name__)
+
+# arXiv access policy (v3):
+#   - The official `arxiv` pip client is used instead of hand-rolled HTTP. It
+#     implements the documented 1 req / 3s pacing (delay_seconds), retries
+#     429/503 with exponential backoff honoring Retry-After (num_retries), and
+#     paginates at page_size. A module-level singleton client shares one
+#     last-request clock across all TopicHunterAgent instances in this process.
+#   - The gateway still wraps every search call (bucket pacing + circuit
+#     breaker + health tracking) at one slot per search, and its adaptive
+#     bucket learns from any 429/503 that leaks through.
+#   - The previous cross-process portalocker file lock under /tmp was removed:
+#     it duplicated gateway responsibilities and broke on Windows.
+import arxiv as _arxiv_lib
+
+_ARXIV_CLIENT: Optional["_arxiv_lib.Client"] = None
+_ARXIV_CLIENT_LOCK = threading.Lock()
+
+
+def _get_arxiv_client() -> "_arxiv_lib.Client":
+    """Process-wide shared official arXiv client (shared delay clock)."""
+    global _ARXIV_CLIENT
+    if _ARXIV_CLIENT is None:
+        with _ARXIV_CLIENT_LOCK:
+            if _ARXIV_CLIENT is None:
+                _ARXIV_CLIENT = _arxiv_lib.Client(
+                    page_size=100,
+                    delay_seconds=3.0,
+                    num_retries=3,
+                )
+    return _ARXIV_CLIENT
+
 
 _FAILED_TOPIC_OVERLAP_THRESHOLD = 0.55
 
@@ -182,6 +197,22 @@ _OPENALEX_CONCEPTS = {
     "general": ["C119857082", "C154945302", "C41008148"],
 }
 
+# Seed phrases are meta-level descriptions ("open problems in attention",
+# "methodological gaps in evaluation"). Searching arXiv/OpenAlex for the words
+# "problems", "gaps", "open", "underexplored" retrieves noise, and noise
+# literature poisons every downstream gate. These are excluded from keyword
+# extraction before building provider queries. The keyword floor guarantees at
+# least one content-bearing keyword still survives (see _apply_keyword_floor).
+_SEED_FILLER_WORDS = frozenset({
+    "gaps", "gap", "problems", "problem", "open", "challenges", "challenge",
+    "underexplored", "unexplored", "understudied", "methodological",
+    "methodology", "limitations", "limitation", "issues", "issue",
+    "questions", "question", "areas", "area", "study", "studies", "research",
+    "literature", "survey", "review", "future", "directions", "direction",
+    "work", "works", "novel", "emerging", "critique", "critical", "insight",
+    "insights", "pitfalls", "pitfall", "weakness", "weaknesses",
+})
+
 
 class ResearchSourceUnavailable(RuntimeError):
     """Raised when discovery cannot consult any external scholarly source."""
@@ -212,17 +243,13 @@ class TopicHunterAgent:
         self.rejection_log: List[Dict[str, Any]] = []
         self.source_health: Dict[str, Dict[str, Any]] = {}
         self._excluded_titles_cache: Optional[List[str]] = None
-        self._iteration_failures = 0  # Track consecutive iteration failures
+        self._iteration_failures = 0
+        self._arxiv_consecutive_failures = 0
+        self._arxiv_disabled = False
         # Feature 5: run-scoped, thread-safe query cache for cross-seed dedup
         self._run_query_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._run_query_cache_lock = threading.Lock()
         self._dataset_catalog_cache: Optional[List[Dict[str, Any]]] = None
-        self._arxiv_client = arxiv.Client(
-            page_size=100,
-            delay_seconds=3.0,
-            num_retries=0,
-        )
-        self._arxiv_lock = threading.Lock()
 
     def _source_ok(self, name: str):
         self.source_health[name] = {"ok": True}
@@ -231,32 +258,47 @@ class TopicHunterAgent:
         self.source_health[name] = {"ok": False, "error": str(error)}
 
     def _s2_get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[requests.Response]:
-        """Rate-limited Semantic Scholar GET with 429 retry and backoff."""
-        max_attempts = 3
-        for attempt in range(max_attempts):
-            try:
-                r = requests.get(
-                    url,
-                    headers=self.s2_headers,
-                    params=params or {},
-                    timeout=20,
-                )
-                if r.status_code == 429 and attempt < max_attempts - 1:
-                    retry_after = float(r.headers.get("Retry-After", "3"))
-                    wait = min(30.0, max(retry_after, 3.0 * (2 ** attempt)))
-                    logger.warning("S2 rate-limited (429) on %s — backing off %.1fs", url, wait)
-                    time.sleep(wait)
-                    continue
-                return r
-            except requests.RequestException as e:
-                if attempt < max_attempts - 1:
-                    time.sleep(2.0 * (2 ** attempt))
-                    continue
-                logger.debug("S2 request failed for %s: %s", url, e)
+        """Semantic Scholar GET routed through API gateway."""
+        from core.api_gateway import get_gateway, RateLimitError
+
+        gateway = get_gateway()
+        try:
+            if not gateway.is_available("s2"):
                 return None
-        return None
+        except Exception:
+            pass
+
+        def _do_fetch():
+            r = requests.get(
+                url,
+                headers=self.s2_headers,
+                params=params or {},
+                timeout=20,
+            )
+            if r.status_code == 429:
+                retry_after = float(r.headers.get("Retry-After", "3"))
+                raise RateLimitError("s2", retry_after)
+            return r
+
+        try:
+            return gateway.request("s2", _do_fetch, retries=2, backoff_base=3.0)
+        except Exception as e:
+            logger.debug("S2 request failed for %s: %s", url, e)
+            return None
 
     def search_openalex(self, query: str, limit: int = 50, extra_params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        runtime_cfg = getattr(self, "runtime_config", None)
+        if runtime_cfg is not None and not getattr(runtime_cfg, "openalex_enabled", True):
+            log_agent_action("TopicHunter", "openalex_skipped_disabled", {"query": query[:80]})
+            return []
+        from core.api_gateway import get_gateway
+        try:
+            if not get_gateway().is_available("openalex"):
+                log_agent_action("TopicHunter", "openalex_skipped_breaker_open", {"query": query[:80]})
+                self._source_failed("openalex", RuntimeError("circuit open"))
+                return []
+        except Exception:
+            pass
         try:
             url = f"{self.base_urls['openalex']}/works"
             params = {
@@ -295,66 +337,80 @@ class TopicHunterAgent:
             return []
 
     def search_arxiv(self, query: str, max_results: int = 50) -> List[Dict[str, Any]]:
-        max_attempts = 4
-        for attempt in range(max_attempts):
-            try:
-                search = arxiv.Search(
-                    query=query,
-                    max_results=max_results,
-                    sort_by=arxiv.SortCriterion.SubmittedDate,
-                )
-                results = []
-                with self._arxiv_lock:
-                    for result in self._arxiv_client.results(search):
-                        results.append({
-                            "title": result.title,
-                            "abstract": result.summary,
-                            "year": result.published.year,
-                            "authors": [a.name for a in result.authors],
-                            "arxiv_id": result.entry_id,
-                            "categories": result.categories,
-                        })
-                self._source_ok("arxiv")
-                return results
-            except arxiv.HTTPError as e:
-                if e.status == 429 and attempt < max_attempts - 1:
-                    wait = min(30.0, 5.0 * (2 ** attempt))
-                    logger.warning(
-                        "arxiv rate-limited (429) on attempt %d/%d for query=%r — backing off %.1fs",
-                        attempt + 1, max_attempts, query, wait,
-                    )
-                    log_agent_action("TopicHunter", "arxiv_429_backoff", {
-                        "query": query, "attempt": attempt + 1, "wait_seconds": wait,
+        """arXiv search via the official `arxiv` client, paced by the API gateway.
+
+        The shared client enforces the documented 1 req / 3s gap and retries
+        429/503 internally (honoring Retry-After). The gateway wraps the whole
+        search as one call: token-bucket pacing, circuit breaking, health
+        tracking, and adaptive rate learning. Supports an injected
+        `_arxiv_client` for tests.
+        """
+        runtime_cfg = getattr(self, "runtime_config", None)
+        if runtime_cfg is not None and not getattr(runtime_cfg, "arxiv_enabled", True):
+            log_agent_action("TopicHunter", "arxiv_skipped_disabled", {"query": query[:80]})
+            return []
+
+        from core.api_gateway import get_gateway
+
+        # Fast skip when the arXiv breaker is open — don't pay retry sleeps.
+        try:
+            if not get_gateway().is_available("arxiv"):
+                log_agent_action("TopicHunter", "arxiv_skipped_breaker_open", {"query": query[:80]})
+                self._source_failed("arxiv", RuntimeError("circuit open"))
+                return []
+        except Exception:
+            pass
+
+        def _do_search():
+            search = _arxiv_lib.Search(
+                query=query,
+                max_results=min(max_results, 100),
+                sort_by=_arxiv_lib.SortCriterion.SubmittedDate,
+                sort_order=_arxiv_lib.SortOrder.Descending,
+            )
+            client = getattr(self, "_arxiv_client", None) or _get_arxiv_client()
+            results = []
+            for r in client.results(search):
+                published = getattr(r, "published", None)
+                year = 0
+                try:
+                    year = int(published.year) if published else 0
+                except (AttributeError, ValueError, TypeError):
+                    year = 0
+                authors = []
+                for a in (r.authors or []):
+                    name = getattr(a, "name", None) or str(a)
+                    if name:
+                        authors.append(name)
+                if r.title and r.title.strip():
+                    results.append({
+                        "title": r.title.strip().replace("\n", " "),
+                        "abstract": (r.summary or "").strip().replace("\n", " "),
+                        "year": year,
+                        "authors": authors,
+                        "arxiv_id": r.entry_id or "",
+                        "categories": list(r.categories or []),
                     })
-                    time.sleep(wait)
-                    continue
-                self._source_failed("arxiv", e)
-                logger.warning(f"arxiv search failed for query={query!r}: {e}")
-                log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e), "query": query})
-                return []
-            except (arxiv.UnexpectedEmptyPageError, requests.exceptions.ConnectionError) as e:
-                if attempt < max_attempts - 1:
-                    wait = min(15.0, 3.0 * (2 ** attempt))
-                    logger.warning(
-                        "arxiv transient error (%s) on attempt %d/%d for query=%r — backing off %.1fs",
-                        type(e).__name__, attempt + 1, max_attempts, query, wait,
-                    )
-                    log_agent_action("TopicHunter", "arxiv_transient_backoff", {
-                        "query": query, "attempt": attempt + 1, "error_type": type(e).__name__,
-                        "wait_seconds": wait,
-                    })
-                    time.sleep(wait)
-                    continue
-                self._source_failed("arxiv", e)
-                logger.warning(f"arxiv search failed for query={query!r}: {e}")
-                log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e), "query": query})
-                return []
-            except Exception as e:
-                self._source_failed("arxiv", e)
-                logger.warning(f"arxiv search failed for query={query!r}: {e}")
-                log_agent_action("TopicHunter", "search_arxiv_error", {"error": str(e), "query": query})
-                return []
-        return []
+            return results
+
+        try:
+            results = get_gateway().request("arxiv", _do_search, retries=2, backoff_base=8.0, backoff_max=120.0)
+            self._source_ok("arxiv")
+            self._arxiv_consecutive_failures = 0
+            return results or []
+        except Exception as e:
+            self._source_failed("arxiv", e)
+            is_rate_limit = "rate limit" in str(e).lower() or "429" in str(e) or "503" in str(e)
+            if is_rate_limit:
+                self._arxiv_consecutive_failures += 1
+            else:
+                self._arxiv_consecutive_failures = 0
+            log_level = logging.WARNING if is_rate_limit else logging.DEBUG
+            logger.log(log_level, "arxiv search failed for query=%r: %s (rate_limit=%s)", query, e, is_rate_limit)
+            log_agent_action("TopicHunter", "search_arxiv_error", {
+                "error": str(e), "query": query, "rate_limit": is_rate_limit,
+            })
+            return []
 
     def search_openalex_multi(self, queries: List[Tuple[str, Dict[str, Any]]], limit: int = 30) -> List[Dict[str, Any]]:
         """Run multiple OpenAlex queries with optional extra params and merge results."""
@@ -363,20 +419,87 @@ class TopicHunterAgent:
             all_results.extend(self.search_openalex(query, limit, extra_params=params))
         return all_results
 
+    def retrieve_literature(self, query: str, limit: int = 20) -> Dict[str, Any]:
+        """Multi-source literature retrieval for QA mode (v3 fix #7).
+
+        Previously referenced by `workflow_nodes.qa_literature_retrieval_node`
+        but never implemented — QA runs crashed with AttributeError. Queries
+        OpenAlex + arXiv + S2 bulk in one pass, dedupes by DOI/arXiv-id/title,
+        and returns {"query", "papers", "sources_used"}.
+
+        Raises ResearchSourceUnavailable only when NO papers were found AND
+        every attempted source is unhealthy; partial results degrade
+        gracefully like discover_topics().
+        """
+        query = (query or "").strip()
+        if not query:
+            raise ValueError("retrieve_literature requires a non-empty query")
+
+        papers: List[Dict[str, Any]] = []
+        seen: set = set()
+
+        def _add(rows: List[Dict[str, Any]], source: str) -> int:
+            added = 0
+            for p in rows or []:
+                if not p.get("title"):
+                    continue
+                key = (p.get("doi") or p.get("arxiv_id") or p.get("title", "")).strip().lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                p.setdefault("source", source)
+                papers.append(p)
+                added += 1
+            return added
+
+        sources_used: Dict[str, int] = {}
+        try:
+            sources_used["openalex"] = _add(self.search_openalex(query, limit=limit), "openalex")
+        except Exception as e:
+            log_agent_action("TopicHunter", "retrieve_literature_openalex_error", {"error": str(e)})
+            sources_used["openalex"] = 0
+        try:
+            sources_used["arxiv"] = _add(self.search_arxiv(query, max_results=limit), "arxiv")
+        except Exception as e:
+            log_agent_action("TopicHunter", "retrieve_literature_arxiv_error", {"error": str(e)})
+            sources_used["arxiv"] = 0
+        try:
+            from core.sources_s2_bulk import search_s2_bulk
+            s2_rows = search_s2_bulk(query, self.s2_headers, limit=limit)
+            sources_used["s2_bulk"] = _add(s2_rows, "s2_bulk")
+        except Exception as e:
+            log_agent_action("TopicHunter", "retrieve_literature_s2_error", {"error": str(e)})
+            sources_used["s2_bulk"] = 0
+
+        if not papers:
+            any_healthy = any(s.get("ok") for s in self.source_health.values())
+            if not any_healthy and sources_used:
+                details = "; ".join(f"{n}: {e.get('error', 'unavailable')}" for n, e in self.source_health.items())
+                raise ResearchSourceUnavailable(
+                    "QA literature retrieval could not contact any scholarly source. "
+                    "Check network access and OPENALEX_EMAIL, then try again. Details: " + details
+                )
+
+        log_agent_action("TopicHunter", "retrieve_literature_complete", {
+            "query": query[:120], "papers": len(papers), "sources_used": sources_used,
+        })
+        return {"query": query, "papers": papers, "sources_used": sources_used}
+
     def search_arxiv_multi(self, queries: List[str], max_results: int = 30) -> List[Dict[str, Any]]:
-        """Run multiple arXiv queries and merge results with adaptive inter-query delay."""
-        all_results = []
-        base_delay = 3.0
-        current_delay = base_delay
-        for i, query in enumerate(queries):
-            if i > 0:
-                time.sleep(current_delay)
-            prev_ok = self.source_health.get("arxiv", {}).get("ok", True)
+        """Run multiple arXiv queries and merge results.
+
+        Pacing is delegated entirely to the shared arXiv client (3s gap) and
+        the gateway bucket — no extra inter-query sleep layer. Identical
+        duplicate queries are collapsed to a single network call.
+        """
+        all_results: List[Dict[str, Any]] = []
+        seen_queries: set = set()
+        for query in queries:
+            key = query.strip().lower()
+            if not key or key in seen_queries:
+                continue
+            seen_queries.add(key)
             all_results.extend(self.search_arxiv(query, max_results))
-            if not self.source_health.get("arxiv", {}).get("ok", True):
-                current_delay = min(30.0, current_delay * 2)
-            elif prev_ok:
-                current_delay = base_delay
         return all_results
 
     def _extract_rejected_fingerprints(self, cross_run_context: List[Dict[str, Any]]) -> List[str]:
@@ -415,6 +538,61 @@ class TopicHunterAgent:
                 pass
         return None
 
+    def _generate_llm_seeds(
+        self,
+        domain: str,
+        cross_run_context: List[Dict[str, Any]],
+        negative_lessons: Optional[List[Dict[str, Any]]] = None,
+        n_seeds: int = 6,
+    ) -> List[Dict[str, str]]:
+        """LLM-driven seed generation (v3 fix #3).
+
+        Static template seeds ("... open problems", "... underexplored
+        challenges") recur every run and produce generic queries. This asks the
+        LLM — once, cheap tier — to mint specific, technical seed phrases from
+        the structured signals we already have (cross-run rejection tags,
+        negative results). Returns [] on any failure; callers fall back to the
+        static seed banks unchanged.
+        """
+        if not getattr(self.runtime_config, "llm_seed_generation_enabled", True):
+            return []
+        runtime_cfg = getattr(self, "runtime_config", None)
+        if not domain:
+            domain = getattr(runtime_cfg, "research_domain", None) if runtime_cfg is not None else None
+        if not domain:
+            return []
+        prompt = f"""
+You are designing literature-search seeds for an automated research system in {domain}.
+Each seed is a short phrase (4-10 words) naming a SPECIFIC technical research angle —
+name concrete methods, model families, or measurement setups, not meta-vocabulary.
+Bad: "open problems in evaluation". Good: "speculative decoding verification overhead".
+
+Prior-run context (avoid re-proposing rejected/failed areas):
+{json.dumps(cross_run_context[-10:], sort_keys=True, default=str)[:1500]}
+
+Return JSON with {n_seeds} DIVERSE seeds spread across different subfields
+and method families, each with a short strategy tag explaining its angle:
+{{"seeds": [{{"seed": "...", "angle": "one-line rationale"}}]}}
+"""
+        try:
+            raw = call_llm(prompt, temperature=0.9, tier="cheap")
+            parsed = parse_json_from_llm(raw) or {}
+            items = parsed.get("seeds") or parsed.get("topics") or []
+            seeds: List[Dict[str, str]] = []
+            for item in items:
+                if isinstance(item, dict) and item.get("seed"):
+                    text = str(item["seed"]).strip()
+                    if 8 <= len(text) <= 120:
+                        seeds.append({"seed": text, "strategy": "llm_diverse"})
+                elif isinstance(item, str) and 8 <= len(item.strip()) <= 120:
+                    seeds.append({"seed": item.strip(), "strategy": "llm_diverse"})
+            if seeds:
+                log_agent_action("TopicHunter", "llm_seeds_generated", {"count": len(seeds)})
+            return seeds[:n_seeds]
+        except Exception as e:
+            log_agent_action("TopicHunter", "llm_seed_generation_error", {"error": str(e)})
+            return []
+
     def _generate_dynamic_seeds(
         self,
         n_seeds: int = 5,
@@ -452,6 +630,26 @@ class TopicHunterAgent:
         active_kind = self._active_hypothesis_kind()
 
         seeds: List[Dict[str, str]] = []  # Feature 8: track strategy per seed
+
+        # 0. v3 fix #3: LLM-minted seeds first (specific, technical, run-aware).
+        # Empty on failure/disabled — everything below degrades to the static
+        # template seeds exactly as before.
+        negative_lessons: List[Dict[str, Any]] = []
+        if getattr(self.runtime_config, "negative_result_seeding_enabled", True):
+            try:
+                negative_lessons = CrossRunMemory().get_negative_result_lessons()
+            except Exception:
+                negative_lessons = []
+        llm_seeds = self._generate_llm_seeds(
+            domain or self.runtime_config.research_domain,
+            cross_run_context,
+            negative_lessons=negative_lessons,
+            n_seeds=max(3, n_seeds // 2),
+        )
+        for d in llm_seeds:
+            words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", d["seed"].lower()))
+            if not (words & rejected_tokens):
+                seeds.append(d)
 
         # 1. Seeds from underexplored hypothesis kinds (avoid rejected areas)
         for kind, biases in _EXPLORATION_KIND_BIASES.items():
@@ -527,7 +725,7 @@ class TopicHunterAgent:
                 # Reserve >=1 slot for the lowest-rated strategy (exploration)
                 strategies_seen = {d["strategy"] for d in unique}
                 if len(strategies_seen) > 1:
-                    all_strategies = ["kind_bias", "cross_pollination", "generic_fallback", "frontier"]
+                    all_strategies = ["llm_diverse", "kind_bias", "cross_pollination", "generic_fallback", "frontier"]
                     lowest = min(all_strategies, key=lambda s: elo.get(f"strategy:{s}"))
                     if not any(d["strategy"] == lowest for d in unique[:1]):
                         # Move one seed of the lowest-rated strategy to the front
@@ -581,11 +779,12 @@ class TopicHunterAgent:
         Varies subcategory and sort mode.  Biases toward underexplored
         hypothesis kinds when one is active for this cycle.  Excludes
         keywords matching recently rejected fingerprints, but never below
-        the keyword floor (Fix #6).
+        the keyword floor (Fix #6). Seed filler words ("gaps", "problems",
+        "open", ...) are never used as search keywords (v3 fix #4).
         """
         seed_lower = seed_hint.lower()
         all_seed_words = [w for w in re.findall(r"[a-z][a-z0-9_-]{2,}", seed_lower)
-                           if w not in _QUERY_STOPWORDS and len(w) > 2]
+                           if w not in _QUERY_STOPWORDS and w not in _SEED_FILLER_WORDS and len(w) > 2]
         keywords = all_seed_words[:3]
 
         # De-prioritize keywords that match rejected fingerprints
@@ -624,7 +823,7 @@ class TopicHunterAgent:
                 if cross_q not in queries:
                     queries.append(cross_q)
 
-        return queries[:4]
+        return queries[:2]
 
     def _build_openalex_queries(
         self,
@@ -634,15 +833,14 @@ class TopicHunterAgent:
     ) -> List[Tuple[str, Dict[str, Any]]]:
         """Build 2-4 OpenAlex structured queries with filter params.
 
-        Returns list of (search_query_string, extra_filter_params) tuples.
-        Varies sort mode (relevance vs recency).  Biases toward underexplored
         hypothesis kinds when one is active.  Excludes keywords matching
         recently rejected fingerprints, but never below the keyword floor
-        (Fix #6).
+        (Fix #6). Seed filler words ("gaps", "problems", "open", ...) are
+        never used as search keywords (v3 fix #4).
         """
         seed_lower = seed_hint.lower()
         all_seed_words = [w for w in re.findall(r"[a-z][a-z0-9_-]{2,}", seed_lower)
-                           if w not in _QUERY_STOPWORDS and len(w) > 2]
+                           if w not in _QUERY_STOPWORDS and w not in _SEED_FILLER_WORDS and len(w) > 2]
         keywords = all_seed_words[:3]
 
         # De-prioritize keywords that match rejected fingerprints
@@ -781,9 +979,14 @@ class TopicHunterAgent:
             log_agent_action("TopicHunter", "citation_graph_error", {"error": str(e)})
             return {}
 
-    def evaluate_layered_novelty(self, candidate_topic: Dict[str, Any], abstracts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def evaluate_layered_novelty(
+        self,
+        candidate_topic: Dict[str, Any],
+        abstracts: List[Dict[str, Any]],
+        precomputed_embeddings: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Dict[str, Any]:
         """Layered novelty evaluation:
-        1. Fast embedding similarity check
+        1. Fast embedding similarity check (uses precomputed embeddings when available)
         2. Contribution comparison for high-overlap papers
 
         Fix #3: the comparison-trigger threshold is clamped so it can never sit
@@ -810,11 +1013,16 @@ class TopicHunterAgent:
         nearest = None
         high_overlap_papers = []
 
-        for paper in abstracts[:30]:
+        for paper in abstracts[:20]:
             abs_text = paper.get("abstract") if isinstance(paper, dict) else str(paper)
             if not abs_text:
                 continue
-            emb = generate_embedding(abs_text[:2000])
+            # Use precomputed embedding if available, otherwise compute on the fly
+            paper_key = (paper.get("doi") or paper.get("arxiv_id") or paper.get("title", "")).strip().lower() if isinstance(paper, dict) else None
+            if precomputed_embeddings and paper_key and paper_key in precomputed_embeddings:
+                emb = precomputed_embeddings[paper_key]
+            else:
+                emb = generate_embedding(abs_text[:2000])
             denom = np.linalg.norm(topic_emb) * np.linalg.norm(emb)
             if denom == 0:
                 continue
@@ -993,28 +1201,26 @@ Return JSON:
   "reason": "..."
 }}
 """
-        for attempt in range(2):
-            raw = call_llm(prompt, temperature=0.3, tier="cheap")
-            parsed = parse_json_from_llm(raw) or {}
-            if isinstance(parsed, dict) and "gap_type" in parsed:
-                evidence_strength = float(parsed.get("evidence_strength", 0.5))
-                status = parsed.get("status", "PASS")
-                # Relaxed threshold: allow topics with moderate evidence through
-                if evidence_strength < 0.25:
-                    status = "FAIL"
-                return {
-                    "gap_type": str(parsed.get("gap_type", "evaluation_gap")),
-                    "gap_claim": str(parsed.get("gap_claim", candidate.get("description", ""))),
-                    "supporting_papers": list(parsed.get("supporting_papers") or []),
-                    "contradicting_papers": list(parsed.get("contradicting_papers") or []),
-                    "closest_prior_work": list(parsed.get("closest_prior_work") or []),
-                    "why_existing_work_is_insufficient": str(parsed.get("why_existing_work_is_insufficient", "")),
-                    "proposed_contribution": str(parsed.get("proposed_contribution", candidate.get("contribution", ""))),
-                    "evidence_strength": evidence_strength,
-                    "citation_gap_signal": citation_gap_signal,
-                    "status": status,
-                    "reason": str(parsed.get("reason", "")),
-                }
+        parsed = call_llm_json(prompt, temperature=0.3, tier="cheap", attempts=2, call_fn=call_llm)
+        if isinstance(parsed, dict) and "gap_type" in parsed:
+            evidence_strength = float(parsed.get("evidence_strength", 0.5))
+            status = parsed.get("status", "PASS")
+            # Relaxed threshold: allow topics with moderate evidence through
+            if evidence_strength < 0.25:
+                status = "FAIL"
+            return {
+                "gap_type": str(parsed.get("gap_type", "evaluation_gap")),
+                "gap_claim": str(parsed.get("gap_claim", candidate.get("description", ""))),
+                "supporting_papers": list(parsed.get("supporting_papers") or []),
+                "contradicting_papers": list(parsed.get("contradicting_papers") or []),
+                "closest_prior_work": list(parsed.get("closest_prior_work") or []),
+                "why_existing_work_is_insufficient": str(parsed.get("why_existing_work_is_insufficient", "")),
+                "proposed_contribution": str(parsed.get("proposed_contribution", candidate.get("contribution", ""))),
+                "evidence_strength": evidence_strength,
+                "citation_gap_signal": citation_gap_signal,
+                "status": status,
+                "reason": str(parsed.get("reason", "")),
+            }
 
         # Fallback if LLM output fails
         return {
@@ -1054,6 +1260,35 @@ Return JSON:
             if gap_tokens & paper_tokens:
                 return True
         return False
+
+    def _rank_papers_for_gap(
+        self,
+        gap: Dict[str, Any],
+        papers: List[Dict[str, Any]],
+        top_n: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Rank retrieved papers by relevance to a candidate gap (v3 fix #6).
+
+        Previously `literature_evidence` was simply the first 8 fetched papers,
+        so the screener/novelty prompts often judged gaps against off-topic
+        text. Scores here are lexical Jaccard overlap (deterministic, free);
+        ties preserve retrieval order. The closest prior work — not arbitrary
+        recent papers — is what novelty screening should compare against.
+        """
+        gap_text = " ".join(str(gap.get(k, "")) for k in ("title", "description", "contribution", "rationale")).lower()
+        gap_tokens = set(re.findall(r"[a-z][a-z0-9_-]{3,}", gap_text)) - _QUERY_STOPWORDS - _SEED_FILLER_WORDS
+        scored: List[Tuple[float, int, Dict[str, Any]]] = []
+        for idx, p in enumerate(papers):
+            if not (p.get("title") and p.get("abstract")):
+                continue
+            paper_text = f"{p.get('title', '')} {p.get('abstract', '')}".lower()
+            paper_tokens = set(re.findall(r"[a-z][a-z0-9_-]{3,}", paper_text)) - _QUERY_STOPWORDS
+            inter = gap_tokens & paper_tokens
+            union = gap_tokens | paper_tokens
+            score = len(inter) / (len(union) or 1)
+            scored.append((score, -idx, p))
+        scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        return [p for _, _, p in scored[:top_n]]
 
     def _get_dataset_catalog(self) -> List[Dict[str, Any]]:
         """Return cached dataset catalog summary. Fail-open: returns [] on error."""
@@ -1215,9 +1450,10 @@ Return JSON:
 """
         prompt = base_prompt
         last_parsed: Dict[str, Any] = {}
-        max_attempts = 3
+        max_attempts = 2  # one generation + one repair; 3rd attempt with same strategy is budget waste
         for attempt in range(max_attempts):
-            raw = call_llm(prompt, temperature=0.3, tier="strong")
+            temp = 0.1 if attempt > 0 else 0.3  # lower temp on repair for schema compliance
+            raw = call_llm(prompt, temperature=temp, tier="strong")
             parsed = parse_json_from_llm(raw) or {}
             if isinstance(parsed, dict):
                 last_parsed = parsed
@@ -1357,6 +1593,37 @@ possible.
                 return prior
         return None
 
+    def _suppress_near_duplicates(self, topics: List[Dict[str, Any]], threshold: float = 0.70) -> List[Dict[str, Any]]:
+        """Drop later topics whose title overlaps an already-kept topic (v3).
+
+        Uses the same token-overlap metric as failed-topic matching. Keeps the
+        first occurrence (higher-ranked seed strategies were processed first).
+        Falls back to all topics on any error — this is an optimization, not a
+        gate.
+        """
+        try:
+            kept: List[Dict[str, Any]] = []
+            for t in topics:
+                title = (t.get("title") or "").strip()
+                if not title:
+                    continue
+                duplicate = any(
+                    title_token_overlap(title, k.get("title", "")) >= threshold
+                    for k in kept
+                )
+                if duplicate:
+                    log_agent_action("TopicHunter", "near_duplicate_suppressed", {
+                        "title": title[:120],
+                        "against": kept[-1].get("title", "") if kept else "",
+                        "threshold": threshold,
+                    })
+                    continue
+                kept.append(t)
+            return kept
+        except Exception as e:
+            log_agent_action("TopicHunter", "near_duplicate_suppression_error", {"error": str(e)})
+            return list(topics)
+
     def _fallback_bridge_match(self, gap: Dict[str, Any], evidence_map: Dict[str, Any]) -> List[str]:
         """Fix #4: programmatically match a gap against the evidence map's bridges
         by keyword overlap, for use when the LLM omitted or malformed
@@ -1474,11 +1741,15 @@ no punctuation, no explanation.
             # else: due for refresh — fall through to harvest below.
 
         # Sample recent, high-signal papers directly (not via a seed — this is
-        # domain-wide, not seed-specific).
+        # domain-wide, not seed-specific). Falls back to OpenAlex if arXiv disabled.
         sample_size = int(getattr(self.runtime_config, "frontier_sample_size", 30))
-        categories = _ARXIV_CATEGORIES.get(domain, _ARXIV_CATEGORIES["general"])
-        sample_query = f"cat:{categories[0]}"
-        papers = self.search_arxiv(sample_query, max_results=sample_size)
+        if getattr(self.runtime_config, "arxiv_enabled", True):
+            categories = _ARXIV_CATEGORIES.get(domain, _ARXIV_CATEGORIES["general"])
+            sample_query = f"cat:{categories[0]}"
+            papers = self.search_arxiv(sample_query, max_results=sample_size)
+        else:
+            # Fallback: use OpenAlex with concept filtering for recent papers
+            papers = self.search_openalex(domain, limit=sample_size)
         if not papers:
             return []
 
@@ -1586,6 +1857,13 @@ Return JSON: {{"terms": [{{"method": "...", "evaluation": "..."}}]}}
             for query in arxiv_queries:
                 arxiv_key = f"arxiv::{query}::{min(search_limit, 30)}"
                 hop_papers.extend(self._cached_search(arxiv_key, lambda q=query, sl=min(search_limit, 30): self.search_arxiv(q, sl)))
+            # S2 bulk search — free, higher throughput than arXiv, reduces arXiv dependency
+            from core.sources_s2_bulk import search_s2_bulk
+            s2_key = f"s2_bulk::{current_source_text}::{search_limit}"
+            hop_papers.extend(self._cached_search(
+                s2_key,
+                lambda q=current_source_text, sl=search_limit: search_s2_bulk(q, self.s2_headers, limit=sl),
+            ))
 
             new_count = 0
             for p in hop_papers:
@@ -1614,6 +1892,30 @@ Return JSON: {{"terms": [{{"method": "...", "evaluation": "..."}}]}}
 
         if not recent_papers:
             return []
+
+        # OpenReview reviewer-weakness signals — pre-formalized, expert-stated gaps,
+        # not LLM-inferred from abstracts. Cached per discover_topics() run via
+        # _run_query_cache so all 5+ seeds share one fetch, not 5.
+        openreview_signals: List[Dict[str, Any]] = []
+        if getattr(self.runtime_config, "openreview_enabled", True):
+            try:
+                from core.sources_openreview import get_openreview_client
+                or_client = get_openreview_client()
+                venue_keys = getattr(self.runtime_config, "openreview_venues", ["iclr2025", "neurips2024"])
+                or_key = f"openreview::{','.join(sorted(venue_keys))}"
+                openreview_signals = self._cached_search(or_key, lambda: [
+                    sig for vk in venue_keys
+                    for sig in or_client.fetch_venue_gap_signals(vk, max_submissions=40)
+                ])
+            except Exception as e:
+                log_agent_action("TopicHunter", "openreview_fetch_error", {"error": str(e)})
+                openreview_signals = []
+
+        for p in openreview_signals:
+            key = (p.get("title") or "").strip().lower()
+            if key and key not in seen_paper_keys:
+                seen_paper_keys.add(key)
+                recent_papers.append(p)
 
         # Citation graph signals for top cited older-looking papers
         graph_signals = []
@@ -1679,6 +1981,43 @@ Return JSON: {{"terms": [{{"method": "...", "evaluation": "..."}}]}}
         ][:25]
         evidence_map = build_cross_paper_evidence_map(recent_papers)
 
+        # Phase 3.1: Precompute abstract embeddings once for all gaps
+        novelty_max_abstracts = int(getattr(self.runtime_config, "novelty_max_abstracts", 20))
+        abstract_embeddings: Dict[str, np.ndarray] = {}
+        for p in recent_papers[:novelty_max_abstracts]:
+            abs_text = (p.get("abstract") or "")[:2000]
+            if not abs_text:
+                continue
+            paper_key = (p.get("doi") or p.get("arxiv_id") or p.get("title", "")).strip().lower()
+            if paper_key:
+                abstract_embeddings[paper_key] = generate_embedding(abs_text)
+
+        # Phase 3.2: LLM call budget per seed — TWO POOLS (v3 fix #5).
+        # Previously one shared counter covered generation (personas) AND the
+        # gate chain, so heavy generation could exhaust the budget and silently
+        # discard every generated gap before evaluation (the "found but never
+        # judged" failure mode). Generation now draws from a small dedicated
+        # pool; the gate chain gets a protected reserve of the main budget.
+        try:
+            raw_budget = getattr(self.runtime_config, "llm_budget_per_seed", 30)
+            llm_budget = max(4, int(raw_budget)) if isinstance(raw_budget, (int, float)) and not isinstance(raw_budget, bool) else 30
+        except (TypeError, ValueError):
+            llm_budget = 30
+        gate_reserve = min(max(6, llm_budget // 4), 12)
+        _llm_calls_used = {"count": 0, "generation": 0, "gate": 0}
+
+        def _check_llm_budget(kind: str = "gate") -> bool:
+            if kind == "generation":
+                # Generation must leave room for the gate chain to run.
+                if _llm_calls_used["count"] + gate_reserve >= llm_budget:
+                    return False
+            elif _llm_calls_used["count"] >= llm_budget:
+                return False
+            _llm_calls_used["count"] += 1
+            if kind == "generation":
+                _llm_calls_used["generation"] += 1
+            return True
+
         # Fix #7: request more raw candidates per seed so the multi-stage gate
         # chain (which has a nonzero rejection rate at each stage) has more
         # surviving material at the end.
@@ -1703,10 +2042,19 @@ Method × domain sparse cells (well-established individually but rarely combined
 Contradictions in retrieved literature (papers disagreeing on the same question — strong, ready-made research gaps):
 {json.dumps(contradictions[:5], indent=2)}
 
-Replication-target candidates (papers making strong claims with no visible variance/multi-seed reporting — consider proposing replication-and-extension topics):
-{json.dumps(replication_targets[:5], indent=2)}
+        Replication-target candidates (papers making strong claims with no visible variance/multi-seed reporting — consider proposing replication-and-extension topics):
+        {json.dumps(replication_targets[:5], indent=2)}
 
-Your own prior completed experiments that tested a hypothesis and did NOT find support (real negative results — use to propose a follow-up varying ONE condition, not a repeat):
+        Reviewer-identified weaknesses from peer review (OpenReview) — these are
+        EXPERT-STATED limitations of specific published papers, not inferred by you.
+        Prefer proposing a gap that directly follows from one of these over inventing
+        a new one from abstracts alone:
+        {json.dumps([{
+            'title': p['title'],
+            'weaknesses': p['weaknesses'][:2],
+        } for p in openreview_signals[:6]], indent=2)[:3000]}
+
+        Your own prior completed experiments that tested a hypothesis and did NOT find support (real negative results — use to propose a follow-up varying ONE condition, not a repeat):
 {json.dumps(negative_lessons[:5], indent=2)}
 
 Evidence-backed cross-paper bridges. These are candidate transfer questions,
@@ -1745,23 +2093,21 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
             persona_names = list(persona_prefixes.keys())[:persona_count]
             all_gaps: List[Dict[str, Any]] = []
 
-            def _call_persona(name: str) -> List[Dict[str, Any]]:
-                prefix = persona_prefixes.get(name, "")
-                prompt = prefix + base_prompt
-                raw = call_llm(prompt, temperature=0.8, tier="cheap")
-                parsed = parse_json_from_llm(raw) or {}
-                gaps_list = parsed.get("gaps") or []
-                for g in gaps_list:
-                    g["persona"] = name
-                return gaps_list
-
-            with ThreadPoolExecutor(max_workers=persona_count) as persona_pool:
-                persona_futures = {persona_pool.submit(_call_persona, name): name for name in persona_names}
-                for fut in as_completed(persona_futures):
-                    try:
-                        all_gaps.extend(fut.result() or [])
-                    except Exception as e:
-                        log_agent_action("TopicHunter", "persona_call_error", {"persona": persona_futures[fut], "error": str(e)})
+            for name in persona_names:
+                if not _check_llm_budget("generation"):
+                    log_agent_action("TopicHunter", "llm_budget_exhausted", {"seed": seed_hint, "at": "persona", "used": _llm_calls_used["count"]})
+                    break
+                try:
+                    prefix = persona_prefixes.get(name, "")
+                    prompt = prefix + base_prompt
+                    raw = call_llm(prompt, temperature=0.8, tier="cheap")
+                    parsed = parse_json_from_llm(raw) or {}
+                    gaps_list = parsed.get("gaps") or []
+                    for g in gaps_list:
+                        g["persona"] = name
+                    all_gaps.extend(gaps_list)
+                except Exception as e:
+                    log_agent_action("TopicHunter", "persona_call_error", {"persona": name, "error": str(e)})
 
             # Dedup by title (preserving first occurrence)
             seen_titles: set = set()
@@ -1772,11 +2118,19 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     seen_titles.add(t)
                     gaps.append(g)
         else:
-            parsed = parse_json_from_llm(call_llm(base_prompt, temperature=0.8, tier="cheap")) or {}
-            gaps = parsed.get("gaps") or []
+            if _check_llm_budget("generation"):
+                parsed = parse_json_from_llm(call_llm(base_prompt, temperature=0.8, tier="cheap")) or {}
+                gaps = parsed.get("gaps") or []
+            else:
+                log_agent_action("TopicHunter", "llm_budget_exhausted", {"seed": seed_hint, "at": "generation", "used": _llm_calls_used["count"]})
+                gaps = []
 
         kept = []
         for gap in gaps:
+            # Budget guard: skip expensive gate chain if LLM budget exhausted
+            if not _check_llm_budget():
+                log_agent_action("TopicHunter", "llm_budget_exhausted", {"seed": seed_hint, "at": "gate_chain", "used": _llm_calls_used["count"], "remaining_gaps": len(gaps) - len(kept)})
+                break
             # Fix #7: cheap heuristic pre-filter before the expensive gate chain.
             # This intentionally runs before bridge validation too, since it's
             # nearly free and catches the worst-case "hallucinated, no relation
@@ -1831,6 +2185,10 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "title": gap.get("title"),
                     "reason": bridge_validation["reason"],
                 })
+            # v3 fix #6: evidence = the MOST RELEVANT retrieved papers, not the
+            # first 8 fetched. Screener + novelty prompts now judge each gap
+            # against its closest prior work.
+            evidence_papers = self._rank_papers_for_gap(gap, recent_papers, top_n=8)
             gap["literature_evidence"] = [
                 {
                     "title": paper.get("title", ""),
@@ -1838,7 +2196,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "doi": paper.get("doi"),
                     "arxiv_id": paper.get("arxiv_id"),
                 }
-                for paper in recent_papers[:8]
+                for paper in evidence_papers
                 if paper.get("title") and paper.get("abstract")
             ]
             gap["cross_paper_evidence"] = evidence_map
@@ -1892,7 +2250,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 continue
 
             # 2. Layered Novelty Assessment
-            novelty_eval = self.evaluate_layered_novelty(gap, gap.get("literature_evidence", []))
+            novelty_eval = self.evaluate_layered_novelty(gap, gap.get("literature_evidence", []), precomputed_embeddings=abstract_embeddings)
             gap["novelty"] = novelty_eval
             if novelty_eval.get("reject"):
                 self._reject(gap, "novelty_too_low", {
@@ -1967,23 +2325,25 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
         seeds = self._generate_dynamic_seeds(n_parallel, cross_run_context, domain=domain)
 
         all_topics: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=n_parallel) as pool:
-            futures = {
-                pool.submit(self._hunt_once, domain, s["seed"], s.get("strategy", "generic_fallback")): s
-                for s in seeds
-            }
-            for fut in as_completed(futures):
-                try:
-                    all_topics.extend(fut.result() or [])
-                except Exception as e:
-                    log_agent_action("TopicHunter", "parallel_hunt_error", {"error": str(e)})
+        for seed in seeds:
+            try:
+                topics = self._hunt_once(domain, seed["seed"], seed.get("strategy", "generic_fallback"))
+                all_topics.extend(topics or [])
+            except Exception as e:
+                log_agent_action("TopicHunter", "hunt_error", {"seed": seed["seed"], "error": str(e)})
 
-        if not any(s.get("ok") for s in self.source_health.values()):
-            details = "; ".join(f"{name}: {entry.get('error', 'unavailable')}" for name, entry in self.source_health.items())
-            raise ResearchSourceUnavailable(
-                "Research discovery could not contact OpenAlex or arXiv. "
-                "Check network access and OPENALEX_EMAIL, then try again. Details: " + details
-            )
+        # Graceful degradation: if we got partial results from at least one source, return them
+        if not all_topics:
+            if any(s.get("ok") for s in self.source_health.values()):
+                log_agent_action("TopicHunter", "partial_results_returned", {
+                    "source_health": self.source_health,
+                })
+            else:
+                details = "; ".join(f"{name}: {entry.get('error', 'unavailable')}" for name, entry in self.source_health.items())
+                raise ResearchSourceUnavailable(
+                    "Research discovery could not contact OpenAlex or arXiv. "
+                    "Check network access and OPENALEX_EMAIL, then try again. Details: " + details
+                )
 
         seen = set()
         unique = []
@@ -1992,6 +2352,10 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
             if title and title not in seen:
                 seen.add(title)
                 unique.append(t)
+        # v3: near-duplicate suppression across seeds — different seeds can
+        # surface the same idea in different wording; exact-title dedup misses
+        # that and debate slots get burned on redundant candidates.
+        unique = self._suppress_near_duplicates(unique)
 
         # Second-pass targeted retrieval from top bridge candidates
         if unique:
@@ -2030,7 +2394,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
             self._iteration_failures = 0
         return ranked
 
-    def _execute_second_pass(self, top_bridges: List[Dict[str, Any]], domain: str) -> List[Topic]:
+    def _execute_second_pass(self, top_bridges: List[Dict[str, Any]], domain: str, precomputed_embeddings: Optional[Dict[str, np.ndarray]] = None) -> List[Topic]:
         """Execute a narrower second-pass retrieval seeded from top bridge candidates.
 
         Uses bridge method/setting signals to build targeted queries before
@@ -2048,7 +2412,13 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
         if not second_pass_queries:
             return []
 
-        second_pass_papers = self.search_arxiv_multi(second_pass_queries[:4], 20)
+        if getattr(self.runtime_config, "arxiv_enabled", True):
+            second_pass_papers = self.search_arxiv_multi(second_pass_queries[:4], 20)
+        else:
+            # Fallback: run the same queries through OpenAlex
+            second_pass_papers = []
+            for q in second_pass_queries[:4]:
+                second_pass_papers.extend(self.search_openalex(q, limit=10))
         if not second_pass_papers:
             return []
 
@@ -2090,7 +2460,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
             if prior:
                 self._reject(gap, "previously_failed_or_rejected", {"matched": prior})
                 continue
-            novelty_eval = self.evaluate_layered_novelty(gap, gap.get("literature_evidence", []))
+            novelty_eval = self.evaluate_layered_novelty(gap, gap.get("literature_evidence", []), precomputed_embeddings=precomputed_embeddings)
             gap["novelty"] = novelty_eval
             if novelty_eval.get("reject"):
                 self._reject(gap, "novelty_too_low", {

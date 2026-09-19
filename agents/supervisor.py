@@ -10,7 +10,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.config import config
-from core.utils import log_agent_action, validate_math_expression, verify_math_derivation, parse_json_from_llm
+from core.utils import log_agent_action, validate_math_expression, verify_math_derivation, parse_json_from_llm, call_llm_json
 from core.llm import call_llm
 from core.llm import get_llm_client
 from core.context import RunContext, get_active_context
@@ -25,6 +25,8 @@ REVIEW_CHECKLIST = (
     "every quantitative claim has a traceable artifact and uncertainty",
     "baselines and datasets match the committed experiment contract",
     "negative or inconclusive outcomes are reported",
+    "the falsifiable prediction is explicitly evaluated and its verdict "
+    "(supported / falsified / inconclusive) is stated with controls and robustness evidence",
     "limitations and reproducibility details are disclosed",
     "literature claims are supported by retrieved source text",
 )
@@ -169,7 +171,7 @@ Score 1-10 for unsupported generalizations (not already caught by DOI checks).
 JSON: {{"score": 8, "issues": [], "recommendations": []}}
 """
         try:
-            result = parse_json_from_llm(call_llm(prompt, temperature=0.2, tier="judge")) or {}
+            result = call_llm_json(prompt, temperature=0.2, tier="judge", attempts=2, call_fn=call_llm) or {}
             return float(result.get("score", 5)), json.dumps(result)[:500]
         except Exception as e:
             return 5.0, str(e)
@@ -287,7 +289,7 @@ JSON:
     "overall_score": 7.2, "checklist": {{"item": true}}, "strengths": [], "weaknesses": [], "suggestions": []}}
 """
         try:
-            result = parse_json_from_llm(call_llm(prompt, temperature=0.3, tier="judge")) or {}
+            result = call_llm_json(prompt, temperature=0.3, tier="judge", attempts=2, call_fn=call_llm) or {}
             score = float(result.get("overall_score", 5.0))
             fb = f"Peer review score: {score}/10"
             if result.get("weaknesses"):

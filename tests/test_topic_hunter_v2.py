@@ -49,6 +49,11 @@ def _make_agent(tmp_path=None) -> TopicHunterAgent:
     cfg.frontier_sample_size = 30
     cfg.frontier_terms_extracted = 8
     cfg.cross_seed_paper_cache_enabled = True
+    cfg.llm_seed_generation_enabled = False
+    cfg.openreview_enabled = False
+    cfg.arxiv_enabled = True
+    cfg.llm_budget_per_seed = 30
+    cfg.novelty_max_abstracts = 20
     agent.runtime_config = cfg
     agent.vector_memory = MagicMock()
     agent.client = MagicMock()
@@ -65,7 +70,6 @@ def _make_agent(tmp_path=None) -> TopicHunterAgent:
     agent._run_query_cache = {}
     agent._run_query_cache_lock = threading.Lock()
     agent._arxiv_client = MagicMock()
-    agent._arxiv_lock = threading.Lock()
     return agent
 
 
@@ -306,6 +310,7 @@ class TestFrontierSeeding:
         agent = _make_agent(tmp_path)
         agent.runtime_config.frontier_seeding_enabled = True
         agent.runtime_config.frontier_refresh_every_n_runs = 5
+        agent.runtime_config.llm_seed_generation_enabled = False
         cache_path = Path(tmp_path) / "source_cache" / "frontier_terms.json"
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps({
@@ -315,12 +320,13 @@ class TestFrontierSeeding:
         }))
         # Request many seeds so frontier terms aren't truncated
         seeds = agent._generate_dynamic_seeds(20, [], domain="machine_learning")
-        frontier_seed = [s for s in seeds if "state space models" in s]
+        frontier_seed = [s for s in seeds if "state space models" in s["seed"]]
         assert len(frontier_seed) > 0, "Frontier terms not included in seeds"
 
     def test_generate_dynamic_seeds_without_domain_skips_frontier(self, tmp_path):
         agent = _make_agent(tmp_path)
         agent.runtime_config.frontier_seeding_enabled = True
+        agent.runtime_config.llm_seed_generation_enabled = False
         seeds_with_domain = agent._generate_dynamic_seeds(5, [], domain="machine_learning")
         seeds_without = agent._generate_dynamic_seeds(5, [], domain=None)
         # Without domain, frontier terms are skipped, so with-domain should be >= without

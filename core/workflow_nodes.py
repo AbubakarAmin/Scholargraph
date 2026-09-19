@@ -14,7 +14,7 @@ from core.llm import call_llm
 from core.run_log import CrossRunMemory, get_tracker
 from core.research_db import research_db
 from core.state import ResearchState, initialize_state
-from core.utils import log_agent_action, parse_json_from_llm
+from core.utils import log_agent_action, parse_json_from_llm, call_llm_json
 from core.verification import reproducibility_dossier, validate_empirical_claims, verify_citations
 
 from agents.editor import EditorAgent
@@ -360,6 +360,59 @@ def verify_result_numbers(content: str, engineer_outputs: Dict[str, Any], rtol: 
     return {"passed": bool(allowed) and not mismatches, "claims": claims, "allowed_values": allowed, "mismatches": mismatches}
 
 
+def section_revision_feedback(
+    section_name: str,
+    check_result: Dict[str, Any],
+    supervisor_feedback: Optional[Dict[str, str]] = None,
+    editor_findings: Optional[str] = None,
+) -> Optional[str]:
+    """Build the revision prompt payload for one failing section (pure helper).
+
+    Combines the section's own numeric/empirical check failures with the
+    supervisor's review feedback and, when an editor repair round is active,
+    the release-referee findings. Returns None when nothing needs repair.
+    """
+    parts: List[str] = []
+    mismatches = check_result.get("mismatches") or []
+    if mismatches:
+        parts.append(
+            "Untraceable numeric claims — every number must be copied exactly from the "
+            "experiment source of truth; rewrite or remove these: "
+            + "; ".join(str(item) for item in mismatches[:12])
+        )
+    empirical = check_result.get("empirical_claims") or {}
+    if empirical.get("prohibited_text"):
+        parts.append(
+            "Remove leaked harness diagnostics entirely: "
+            + ", ".join(str(item) for item in empirical["prohibited_text"][:5])
+        )
+    elif not empirical.get("passed", True):
+        parts.append(
+            "Empirical claims must be grounded in completed experiment outputs; "
+            "remove unsupported performance language."
+        )
+    prior = (supervisor_feedback or {}).get(section_name)
+    if prior:
+        parts.append("Prior supervisor feedback on this section: " + str(prior)[:1500])
+    if editor_findings:
+        parts.append("Editor release-referee findings to fix: " + str(editor_findings)[:1200])
+    return "\n".join(parts) if parts else None
+
+
+def editor_repair_route(error_message: str, repair_count: int, max_repairs: int = 1) -> str:
+    """Decide whether an editor failure is repairable or terminal (pure helper).
+
+    Only release-referee failures are repairable by re-drafting sections;
+    structural failures (e.g. failed experiments) remain terminal.
+    """
+    message = str(error_message or "")
+    if "release referee failed" not in message:
+        return "terminal"
+    if int(repair_count) >= max_repairs:
+        return "terminal"
+    return "repair"
+
+
 def write_narrative_sections(state: ResearchState) -> ResearchState:
     log_agent_action("Orchestrator", "start_writing_narrative", {})
     tracker = get_tracker()
@@ -377,11 +430,53 @@ def write_narrative_sections(state: ResearchState) -> ResearchState:
         return state
     try:
         writer = _create_agent(WriterAgent)
+        supervisor_scores = state.get("supervisor_scores") or {}
+        supervisor_feedback = state.get("supervisor_feedback") or {}
+        revision_allowed = (
+            state["iteration"] > 0
+            and state["narrative_revision_count"] < 1
+            and bool(supervisor_scores)
+        )
         for section_name in _plan_section_names(state["plan"]):
-            if section_name.lower() in NARRATIVE_SECTION_NAMES and section_name not in state["draft_sections"]:
-                state["draft_sections"][section_name] = writer.draft_section(section_name, state["selected_topic"], state["plan"], {})
+            if section_name.lower() not in NARRATIVE_SECTION_NAMES:
+                continue
+            if section_name not in state["draft_sections"]:
+                state["draft_sections"][section_name] = writer.draft_section(
+                    section_name, state["selected_topic"], state["plan"], {}
+                )
                 state["current_section"] = section_name
                 log_agent_action("Orchestrator", "section_written", {"section": section_name})
+                continue
+            # Meta-continue pass: re-draft below-threshold narrative sections with
+            # the supervisor's feedback injected into the prompt so the revision
+            # repairs specific defects (reviewer-guided revision >> blind re-roll).
+            if not revision_allowed:
+                continue
+            score = supervisor_scores.get(section_name)
+            if score is None or score >= config.supervisor_threshold:
+                continue
+            revision_feedback = section_revision_feedback(
+                section_name,
+                {},
+                supervisor_feedback=supervisor_feedback,
+                editor_findings=state.get("editor_repair_findings"),
+            )
+            if not revision_feedback:
+                continue
+            state["draft_sections"][section_name] = writer.draft_section(
+                section_name,
+                state["selected_topic"],
+                state["plan"],
+                state.get("engineer_outputs") or {},
+                revision_feedback,
+            )
+            state["current_section"] = section_name
+            log_agent_action("Orchestrator", "narrative_section_revised_with_feedback", {
+                "section": section_name,
+                "prior_score": score,
+            })
+        if revision_allowed:
+            state["narrative_revision_count"] += 1
         state["current_phase"] = "engineering"
         return state
     except Exception as exc:
@@ -474,7 +569,27 @@ def write_results_sections(state: ResearchState) -> ResearchState:
             return state
         if failures and state["results_redraft_count"] < 2:
             state["results_redraft_count"] += 1
+            # Targeted artifact repair: re-draft only the failing sections and
+            # feed their specific check failures back into the writer prompt.
             state["meta_feedback"].append(f"Results numeric grounding failed: {failures}")
+            for name, result in failures.items():
+                feedback = section_revision_feedback(
+                    name,
+                    result,
+                    supervisor_feedback=state.get("supervisor_feedback") or {},
+                    editor_findings=state.get("editor_repair_findings"),
+                )
+                state["draft_sections"][name] = writer.draft_section(
+                    name,
+                    state["selected_topic"],
+                    state["plan"],
+                    state["engineer_outputs"],
+                    feedback,
+                )
+                log_agent_action("Orchestrator", "results_section_revised_with_feedback", {
+                    "section": name,
+                    "had_feedback": bool(feedback),
+                })
             state["current_phase"] = "writing_results"
             log_agent_action("Orchestrator", "results_numeric_grounding_failed", {"sections": list(failures)})
             return state
@@ -888,6 +1003,32 @@ def editing_node(state: ResearchState) -> ResearchState:
         state["current_phase"] = "complete"
         log_agent_action("Orchestrator", "editing_complete", {})
         return state
+    except RuntimeError as exc:
+        # WARA-style artifact repair: a release-referee failure routes the
+        # affected sections back for one bounded feedback-aware repair round
+        # instead of discarding the whole run.
+        route = editor_repair_route(str(exc), state.get("editor_repair_count", 0))
+        if route == "repair":
+            state["editor_repair_count"] = int(state.get("editor_repair_count", 0)) + 1
+            state["editor_repair_findings"] = str(exc)[:4000]
+            state["results_redraft_count"] = min(state.get("results_redraft_count", 0), 1)
+            state.setdefault("supervisor_feedback", {})["__editor_findings__"] = str(exc)[:4000]
+            state["current_phase"] = "writing_results"
+            state["meta_feedback"].append(
+                "Editor release referee failed; routing sections for one repair pass: "
+                + str(exc)[:1500]
+            )
+            log_agent_action("Orchestrator", "editor_referee_repair_routed", {
+                "repair_count": state["editor_repair_count"],
+            })
+            return state
+        message = f"Editing failed terminally: {exc}"
+        logger.error(message)
+        state["meta_feedback"].append(message)
+        state["terminal_error"] = state.get("terminal_error") or message
+        state["current_phase"] = "complete"
+        state["should_continue"] = False
+        return state
     except Exception as exc:
         logger.error(f"Editing failed: {exc}")
         state["meta_feedback"].append(f"Editing error: {exc}")
@@ -989,8 +1130,14 @@ Return JSON:
   "bibliography": [{{"title": "...", "doi": "...", "arxiv_id": "...", "year": 2024}}],
   "limitations": "what the literature does not cover"
 }}"""
-        raw = call_llm(prompt, temperature=0.3, tier="strong")
-        parsed = parse_json_from_llm(raw) or {}
+        raw = call_llm_json(
+            prompt,
+            temperature=0.3,
+            tier="strong",
+            attempts=2,
+            call_fn=call_llm,
+        ) or {}
+        parsed = raw if isinstance(raw, dict) else {}
         answer_text = parsed.get("answer", "")
         if not answer_text:
             state["terminal_error"] = "QA answer generation produced empty output"

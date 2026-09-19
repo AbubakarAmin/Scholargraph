@@ -8,7 +8,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import log_agent_action, parse_json_from_llm
+from core.utils import log_agent_action, parse_json_from_llm, call_llm_json
 from core.llm import call_llm
 from core.llm import get_llm_client
 from core.context import RunContext, get_active_context
@@ -240,7 +240,7 @@ Trends: {json.dumps(trends)}
 Dashboard: {json.dumps(dashboard)}
 JSON: {{"system_health": "good|medium|poor", "recommendations": [], "next_steps": "continue|reset|refine"}}
 """
-        parsed = parse_json_from_llm(call_llm(prompt, temperature=0.3, tier="cheap")) or {}
+        parsed = call_llm_json(prompt, temperature=0.3, tier="cheap", attempts=2, call_fn=call_llm) or {}
         recs = parsed.get("recommendations") or []
         return (
             f"Health: {parsed.get('system_health', 'unknown')}\n"

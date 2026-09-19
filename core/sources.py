@@ -1,4 +1,8 @@
-"""Reliable, replayable access to allowlisted scholarly sources."""
+"""Reliable, replayable access to allowlisted scholarly sources.
+
+Rate limiting and retries are handled by core.api_gateway.
+This module handles caching and single-attempt HTTP calls.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from .api_gateway import RateLimitError, get_gateway
 from .contracts import SourceArtifact
 
 logger = logging.getLogger(__name__)
@@ -30,13 +35,16 @@ DEFAULT_SOURCE_BASES = {
 @dataclass(frozen=True)
 class SourcePolicy:
     timeout_seconds: float = 15.0
-    retries: int = 2
     max_response_bytes: int = 5_000_000
     allow_full_text: bool = True
 
 
 class SourceClient:
-    """Fetch JSON from approved sources and preserve replayable raw responses."""
+    """Fetch JSON from approved sources and preserve replayable raw responses.
+
+    Rate limiting, 429 retries, and circuit breaking are delegated to APIGateway.
+    This class handles caching and single-attempt HTTP calls.
+    """
 
     def __init__(
         self,
@@ -61,6 +69,7 @@ class SourceClient:
         validator: Optional[Callable[[Any], bool]] = None,
         cache_key: Optional[str] = None,
     ) -> SourceArtifact:
+        """Fetch JSON from a source. Single attempt — gateway handles retries."""
         self._validate_url(source, url)
         key = cache_key or self._cache_key(source, url, params)
         cache_path = self.cache_dir / f"{key}.json"
@@ -69,41 +78,35 @@ class SourceClient:
             cached["status"] = "cached"
             return cached
 
-        last_error = "unavailable"
-        for attempt in range(self.policy.retries + 1):
-            try:
-                response = self.session.get(
-                    url,
-                    params=dict(params or {}),
-                    headers=dict(headers or {}),
-                    timeout=self.policy.timeout_seconds,
-                )
-                if response.status_code == 429:
-                    retry_after = float(response.headers.get("Retry-After", "5"))
-                    wait = min(30.0, max(retry_after, 5.0 * (2 ** attempt)))
-                    if attempt < self.policy.retries:
-                        logger.warning(
-                            "SourceClient 429 from %s — backing off %.1fs (attempt %d/%d)",
-                            source, wait, attempt + 1, self.policy.retries + 1,
-                        )
-                        time.sleep(wait)
-                        continue
-                response.raise_for_status()
-                content_length = len(response.content)
-                if content_length > self.policy.max_response_bytes:
-                    raise ValueError("response exceeds configured size limit")
-                content = response.json()
-                if validator and not validator(content):
-                    raise ValueError("response failed source validation")
-                artifact = self._artifact(source, url, content, "verified")
-                cache_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
-                return artifact
-            except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
-                last_error = str(exc)
-                if attempt == self.policy.retries:
-                    break
+        gateway = get_gateway()
 
-        return self._artifact(source, url, {}, "unavailable", [last_error])
+        def _do_fetch():
+            response = self.session.get(
+                url,
+                params=dict(params or {}),
+                headers=dict(headers or {}),
+                timeout=self.policy.timeout_seconds,
+            )
+            if response.status_code == 429:
+                retry_after = float(response.headers.get("Retry-After", "5"))
+                raise RateLimitError(source, retry_after)
+            response.raise_for_status()
+            content_length = len(response.content)
+            if content_length > self.policy.max_response_bytes:
+                raise ValueError("response exceeds configured size limit")
+            content = response.json()
+            if validator and not validator(content):
+                raise ValueError("response failed source validation")
+            return content
+
+        try:
+            content = gateway.request(source, _do_fetch, retries=3, backoff_base=5.0)
+            artifact = self._artifact(source, url, content, "verified")
+            cache_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
+            return artifact
+        except Exception as exc:
+            logger.warning("SourceClient fetch failed for %s: %s", source, exc)
+            return self._artifact(source, url, {}, "unavailable", [str(exc)])
 
     def fetch_text(self, source: str, url: str, *, headers: Optional[Mapping[str, str]] = None) -> SourceArtifact:
         """Fetch allowlisted text while preserving the same cache/provenance contract."""
@@ -114,15 +117,25 @@ class SourceClient:
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
             cached["status"] = "cached"
             return cached
-        try:
+
+        gateway = get_gateway()
+
+        def _do_fetch():
             response = self.session.get(url, headers=dict(headers or {}), timeout=self.policy.timeout_seconds)
+            if response.status_code == 429:
+                retry_after = float(response.headers.get("Retry-After", "5"))
+                raise RateLimitError(source, retry_after)
             response.raise_for_status()
             if len(response.content) > self.policy.max_response_bytes:
                 raise ValueError("response exceeds configured size limit")
-            artifact = self._artifact(source, url, {"text": response.text}, "verified")
+            return response.text
+
+        try:
+            text = gateway.request(source, _do_fetch, retries=3, backoff_base=5.0)
+            artifact = self._artifact(source, url, {"text": text}, "verified")
             cache_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
             return artifact
-        except (requests.RequestException, ValueError) as exc:
+        except Exception as exc:
             return self._artifact(source, url, {"text": ""}, "unavailable", [str(exc)])
 
     def fetch_open_access_text(

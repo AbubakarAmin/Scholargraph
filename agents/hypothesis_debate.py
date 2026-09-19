@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.config import config
-from core.utils import log_agent_action, parse_json_from_llm, is_degenerate_llm_output
+from core.utils import log_agent_action, parse_json_from_llm, is_degenerate_llm_output, call_llm_json
 from core.llm import call_llm
 from core.llm import get_llm_client
 from core.context import RunContext, get_active_context
@@ -264,12 +264,65 @@ def hypothesis_kind(title: str) -> str:
     return "general"
 
 
+def _as_dict(value: Any) -> Dict[str, Any]:
+    """Return value when it is a dict, else {} — guards .get against lists."""
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_objection_payload(parsed: Any) -> Dict[str, Any]:
+    """Coerce LLM objection payloads into the canonical envelope shape.
+
+    Models frequently return a bare array of objections or a single objection
+    object instead of the requested {"objections": [...]}. Both are valid
+    content in the wrong shape — coerce instead of crashing on ``.get``.
+    """
+    if isinstance(parsed, list):
+        parsed = {"objections": parsed}
+    if not isinstance(parsed, dict):
+        return {}
+    raw_objections = parsed.get("objections")
+    if isinstance(raw_objections, dict):
+        parsed["objections"] = [raw_objections]
+    return parsed
+
+
 class ProposerAgent:
     def __init__(self, context: Optional[RunContext] = None):
         self.context = context or get_active_context()
         self.client = get_llm_client()
+        self.vector_memory = self.context.memory if self.context else memory
+
+    def _prior_objection_tags(self) -> List[Dict[str, Any]]:
+        """Structured objection tags from prior debates so round-1 arguments
+        can preempt historically recurring failure modes."""
+        rows = self.vector_memory.get_prompt_context(namespace="debate_transcripts", k=8)
+        tags = []
+        for row in rows:
+            signal = row.get("signal") or {}
+            tags.append({
+                "objection_type": signal.get("objection_type") or signal.get("objection_types"),
+                "severity": signal.get("severity"),
+                "resolution_status": signal.get("resolution_status"),
+            })
+        return tags
+
+    def _evidence_context(self, topic: Dict[str, Any], max_papers: int = 5, snippet_chars: int = 350) -> str:
+        """Render the topic's retrieved literature evidence for grounded arguing."""
+        papers = topic.get("literature_evidence") or []
+        slim = []
+        for paper in papers[:max_papers]:
+            if not isinstance(paper, dict):
+                continue
+            slim.append({
+                "title": paper.get("title", ""),
+                "abstract": (paper.get("abstract") or "")[:snippet_chars],
+            })
+        slim = [p for p in slim if p["title"] or p["abstract"]]
+        return json.dumps(slim, default=str)[:4000] if slim else "none retrieved"
 
     def build_argument(self, topic: Dict[str, Any]) -> str:
+        prior_tags = self._prior_objection_tags()
+        structured_hyp = _as_dict(topic.get("structured_hypothesis"))
         prompt = f"""
 You are a research proposer. Build a compelling, realistic argument.
 Topic: {topic.get('title')}
@@ -278,6 +331,20 @@ Rationale: {topic.get('rationale', 'N/A')}
 Impact: {topic.get('impact', 'N/A')}
 Feasibility: {topic.get('feasibility', 5)}/10
 
+Structured Hypothesis Contract (authoritative):
+{json.dumps(topic.get('structured_hypothesis') or {}, indent=2, default=str)[:3000]}
+
+Retrieved literature evidence (ground every novelty/gap claim in this):
+{self._evidence_context(topic)}
+
+Historically recurring objection tags from prior debates (preempt these proactively):
+{json.dumps(self._prior_objection_tags(), default=str)[:1200]}
+
+Rules:
+- Ground every novelty claim in the retrieved evidence above; explicitly name the
+  closest prior work and state what remains untested.
+- Address the recurring objection types listed above before they are raised.
+- Do not claim evidence you do not have; describe what will be measured and how.
 Include: hypothesis, theory, evidence, novelty, methodology, expected outcomes, falsifiable prediction.
 """
         arg = ""
@@ -361,7 +428,7 @@ class ChallengerAgent:
             f"This is a {kind} hypothesis with historical Elo {rating:.0f}; still independently verify its claims."
         )
         prior_tags = self._prior_objection_tags()
-        structured_hyp = topic.get("structured_hypothesis") or {}
+        structured_hyp = _as_dict(topic.get("structured_hypothesis"))
         prompt = f"""
 You are an adversarial scientific reviewer. Your goal is to find the strongest legitimate reasons this hypothesis may be flawed, unfalsifiable, confounded, or unexecutable.
 
@@ -401,32 +468,42 @@ Return JSON:
 }}
 """
         self._challenger_invalid = False
-        parsed: Dict[str, Any] = {}
         objections: List[Dict[str, Any]] = []
         summary = ""
         raw = ""
-        for attempt in range(2):
-            raw = call_llm(prompt, temperature=0.5, tier="strong")
+        attempt_state = {"n": 0}
+
+        def _rebuttal_call(current_prompt: str, **kwargs: Any) -> str:
+            nonlocal raw
+            raw = call_llm(current_prompt, **kwargs)
+            attempt_state["n"] += 1
             if is_degenerate_llm_output(raw, min_chars=20):
                 log_agent_action("ChallengerAgent", "degenerate_rebuttal", {
-                    "attempt": attempt + 1,
+                    "attempt": attempt_state["n"],
                     "preview": str(raw)[:120],
                 })
-                continue
-            parsed = parse_json_from_llm(raw) or {}
-            raw_objections = parsed.get("objections")
-            if isinstance(raw_objections, list) and len(raw_objections) > 0:
-                for obj in raw_objections:
-                    if isinstance(obj, dict):
-                        obj.setdefault("status", "unresolved")
-                        obj.setdefault("source", "challenger_audit")
-                        objections.append(obj)
-                summary = str(parsed.get("summary_rebuttal") or raw)
-                break
-            log_agent_action("ChallengerAgent", "malformed_rebuttal_json", {
-                "attempt": attempt + 1,
-                "parsed_keys": list(parsed.keys()) if isinstance(parsed, dict) else [],
-            })
+                return ""
+            return raw
+
+        # Self-correcting parse: on malformed output the model is re-asked with
+        # the parse error and its own offending excerpt (same protocol as the
+        # screener/followup paths) instead of a parse-blind identical re-roll.
+        parsed = call_llm_json(
+            prompt,
+            temperature=0.5,
+            tier="strong",
+            attempts=2,
+            call_fn=_rebuttal_call,
+        )
+        parsed = _normalize_objection_payload(parsed)
+        raw_objections = parsed.get("objections")
+        if isinstance(raw_objections, list) and len(raw_objections) > 0:
+            for obj in raw_objections:
+                if isinstance(obj, dict):
+                    obj.setdefault("status", "unresolved")
+                    obj.setdefault("source", "challenger_audit")
+                    objections.append(obj)
+            summary = str(parsed.get("summary_rebuttal") or raw)
         else:
             # Fail closed: never treat empty/garbled challenger output as zero objections.
             self._challenger_invalid = True
@@ -439,7 +516,10 @@ Return JSON:
                 "source": "challenger_output_guard",
             }]
             summary = "CHALLENGER_OUTPUT_INVALID"
-            log_agent_action("ChallengerAgent", "rebuttal_invalid_after_retry", {"raw_preview": str(raw)[:200]})
+            log_agent_action("ChallengerAgent", "rebuttal_invalid_after_retry", {
+                "raw_preview": str(raw)[:200],
+                "parsed_shape": type(parsed).__name__,
+            })
 
         feasibility_errors = check_plan_feasibility(
             {"methodology": topic.get("description", ""), "experiments": [{"dataset": {"name": topic.get("dataset_plan", "")}}]},
@@ -476,7 +556,7 @@ Return JSON:
 
     def validate_minimum_experiment(self, topic: Dict[str, Any]) -> Dict[str, Any]:
         """Verify that the minimum viable experiment is both executable and scientifically discriminative."""
-        structured_hyp = topic.get("structured_hypothesis") or {}
+        structured_hyp = _as_dict(topic.get("structured_hypothesis"))
         mve = structured_hyp.get("minimum_viable_experiment") or {}
         notes: List[str] = []
         is_executable = True
@@ -544,11 +624,13 @@ Return JSON:
 }}
 """
         for attempt in range(2):
-            raw = call_llm(prompt, temperature=0.3, tier="judge")
-            if is_degenerate_llm_output(raw, min_chars=20):
+            parsed = call_llm_json(prompt, temperature=0.3, tier="judge", attempts=2, call_fn=call_llm)
+            # A bare array of objections is valid content in the wrong envelope.
+            if isinstance(parsed, list):
+                parsed = {"objections": parsed}
+            if not isinstance(parsed, dict):
                 log_agent_action("ChallengerAgent", "degenerate_followup", {"attempt": attempt + 1})
                 continue
-            parsed = parse_json_from_llm(raw) or {}
             raw_objs = parsed.get("objections")
             if isinstance(raw_objs, list) and len(raw_objs) > 0:
                 # Merge status onto prior objections to ensure no objection is dropped
@@ -560,6 +642,8 @@ Return JSON:
                         seen_texts.add(text.lower().strip())
                         updated.append(obj)
                 for prior in prior_objections:
+                    if not isinstance(prior, dict):
+                        prior = {"objection": str(prior), "severity": 3}
                     p_text = str(prior.get("objection", "")).lower().strip()
                     if p_text not in seen_texts:
                         # Prior objection was dropped by LLM; preserve as unresolved
@@ -569,7 +653,11 @@ Return JSON:
                 return updated
 
         # Fail closed: preserve all prior objections as unresolved
-        return [dict(obj, status="unresolved") for obj in prior_objections]
+        return [
+            dict(obj, status="unresolved") if isinstance(obj, dict)
+            else {"objection": str(obj), "severity": 3, "status": "unresolved"}
+            for obj in prior_objections
+        ]
 
 
 class ModeratorAgent:
@@ -591,16 +679,18 @@ class ModeratorAgent:
         valid_judge_responses = 0
         transcript = json.dumps(rounds, default=str)[:6000]
 
-        unresolved = [o for o in objections if o.get("status") != "resolved"]
+        unresolved = [
+            o for o in objections if isinstance(o, dict) and o.get("status") != "resolved"
+        ]
 
         # Hard Gates evaluation
         hard_gates = {
             "hypothesis_falsifiable": bool(
                 topic.get("falsifiable_prediction")
-                or (topic.get("structured_hypothesis") or {}).get("falsification_condition")
+                or _as_dict(topic.get("structured_hypothesis")).get("falsification_condition")
             ),
             "measurable_outcome_exists": bool(
-                (topic.get("structured_hypothesis") or {}).get("dependent_variables")
+                _as_dict(topic.get("structured_hypothesis")).get("dependent_variables")
                 or topic.get("rationale")
             ),
             "no_severe_unresolved_objections": not any(
@@ -726,7 +816,10 @@ class HypothesisDebateSystem:
             if tracker:
                 tracker.bump("debate_rounds")
 
-            unresolved_now = [o for o in current_objections if o.get("status") != "resolved"]
+            unresolved_now = [
+                o for o in current_objections
+                if isinstance(o, dict) and o.get("status") != "resolved"
+            ]
             # Early stop after min rounds if no severe unresolved
             if r >= min_r and not any(_coerce_int(u.get("severity"), 0) >= 3 for u in unresolved_now):
                 break
@@ -757,7 +850,10 @@ class HypothesisDebateSystem:
                 "reasoning": "Challenger output invalid after retry; debate fails closed.",
             }
 
-        unresolved_now = [o for o in current_objections if o.get("status") != "resolved"]
+        unresolved_now = [
+            o for o in current_objections
+            if isinstance(o, dict) and o.get("status") != "resolved"
+        ]
         delta = self.elo.update(topic.get("title", "general"), final["score"], final["passed"])
         # Feature 8: record seed-strategy outcome alongside kind-Elo
         # NOTE: outcome_status here is debate-derived (argument quality), NOT
@@ -793,7 +889,7 @@ class HypothesisDebateSystem:
             result.score,
             structured_signal={
                 "objection_type": (unresolved_now[0].get("criterion") if unresolved_now else "none"),
-                "objection_types": sorted({str(item.get("criterion")) for item in unresolved_now if item.get("criterion")}),
+                "objection_types": sorted({str(item.get("criterion")) for item in unresolved_now if isinstance(item, dict) and item.get("criterion")}),
                 "severity": max((_coerce_int(item.get("severity"), 0) for item in unresolved_now), default=0),
                 "resolution_status": "unresolved" if unresolved_now else "resolved",
             },
@@ -825,13 +921,16 @@ class HypothesisDebateSystem:
         """
         if not getattr(self, "runtime_config", None) or getattr(getattr(self, "challenger", None), "_challenger_invalid", False):
             return None
-        unresolved = [item for item in (result.objections or []) if item.get("status") != "resolved"]
+        unresolved = [
+            item for item in (result.objections or [])
+            if isinstance(item, dict) and item.get("status") != "resolved"
+        ]
         if not unresolved:
             return None
         repairable = {"baseline", "confounder", "evaluation", "statistical", "feasibility", "falsifiability", "soundness"}
         if not any(str(item.get("criterion")) in repairable for item in unresolved):
             return None
-        current = topic.get("structured_hypothesis") or {}
+        current = _as_dict(topic.get("structured_hypothesis"))
         if not current:
             return None
         prompt = f"""

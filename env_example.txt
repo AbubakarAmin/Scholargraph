@@ -31,6 +31,15 @@ OPENALEX_EMAIL=you@example.com
 SEMANTIC_SCHOLAR_API_KEY=
 SCITE_API_KEY=
 
+# OpenReview (for reviewer-weakness gap signals)
+OPENREVIEW_USERNAME=
+OPENREVIEW_PASSWORD=
+OPENREVIEW_ENABLED=true
+
+# Source toggles (disable individual sources without touching code)
+ARXIV_ENABLED=true
+OPENALEX_ENABLED=true
+
 # System
 RESEARCH_DOMAIN=computer_science
 MAX_ITERATIONS=10

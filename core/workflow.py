@@ -148,7 +148,19 @@ def create_research_graph(nodes: Mapping[str, Node]) -> StateGraph:
         nodes["should_continue"],
         {"continue": "writing_narrative", "end": END},
     )
-    workflow.add_edge("editing", END)
+    def _after_editing(state: ResearchState) -> str:
+        if (
+            state.get("current_phase") == "writing_results"
+            and (state.get("editor_repair_count") or 0) >= 1
+        ):
+            return "repair"
+        return "done"
+
+    workflow.add_conditional_edges(
+        "editing",
+        _after_editing,
+        {"repair": "writing_results", "done": END},
+    )
     workflow.add_edge("reset", "topic_discovery")
 
     return workflow

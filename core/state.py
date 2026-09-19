@@ -35,6 +35,9 @@ class ResearchState(TypedDict):
     plan_revision_requests: List[Dict[str, Any]]
     run_id: Optional[str]
     results_redraft_count: int
+    narrative_revision_count: int
+    editor_repair_count: int
+    editor_repair_findings: Optional[str]
     results_verification: Dict[str, VerificationReport]
     reproducibility: VerificationReport
     terminal_error: Optional[str]
@@ -80,6 +83,9 @@ def initialize_state(mode: str = "full_research") -> ResearchState:
         plan_revision_requests=[],
         run_id=None,
         results_redraft_count=0,
+        narrative_revision_count=0,
+        editor_repair_count=0,
+        editor_repair_findings=None,
         results_verification={},
         reproducibility={},
         terminal_error=None,

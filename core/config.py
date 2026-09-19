@@ -49,6 +49,14 @@ class Config(BaseSettings):
     semantic_scholar_api_key: Optional[str] = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
     openalex_email: str = os.getenv("OPENALEX_EMAIL", "researcher@example.com")
 
+    # OpenReview
+    openreview_username: str = os.getenv("OPENREVIEW_USERNAME", "")
+    openreview_password: str = os.getenv("OPENREVIEW_PASSWORD", "")
+    openreview_enabled: bool = os.getenv("OPENREVIEW_ENABLED", "true").lower() == "true"
+    openreview_venues: list = ["iclr2025", "iclr2026", "neurips2025"]
+    arxiv_enabled: bool = os.getenv("ARXIV_ENABLED", "true").lower() == "true"
+    openalex_enabled: bool = os.getenv("OPENALEX_ENABLED", "true").lower() == "true"
+
     # System
     research_domain: str = os.getenv("RESEARCH_DOMAIN", "computer_science")
     max_iterations: int = int(os.getenv("MAX_ITERATIONS", "10"))
@@ -113,6 +121,15 @@ class Config(BaseSettings):
     persona_ensemble_enabled: bool = os.getenv("PERSONA_ENSEMBLE_ENABLED", "true").lower() == "true"
     persona_count: int = int(os.getenv("PERSONA_COUNT", "2"))
     seed_strategy_elo_enabled: bool = os.getenv("SEED_STRATEGY_ELO_ENABLED", "true").lower() == "true"
+
+    # --- TopicHunter v3 ---
+    llm_seed_generation_enabled: bool = os.getenv("LLM_SEED_GENERATION_ENABLED", "true").lower() == "true"
+
+    # API gateway settings
+    seed_sequential: bool = os.getenv("SEED_SEQUENTIAL", "true").lower() == "true"
+    persona_sequential: bool = os.getenv("PERSONA_SEQUENTIAL", "true").lower() == "true"
+    llm_budget_per_seed: int = int(os.getenv("LLM_BUDGET_PER_SEED", "30"))
+    novelty_max_abstracts: int = int(os.getenv("NOVELTY_MAX_ABSTRACTS", "20"))
 
     # Web UI
     web_host: str = os.getenv("WEB_HOST", "127.0.0.1")
@@ -223,6 +240,12 @@ def apply_runtime_keys(keys: dict) -> None:
         "PERSONA_ENSEMBLE_ENABLED": "persona_ensemble_enabled",
         "PERSONA_COUNT": "persona_count",
         "SEED_STRATEGY_ELO_ENABLED": "seed_strategy_elo_enabled",
+        "LLM_SEED_GENERATION_ENABLED": "llm_seed_generation_enabled",
+        "OPENREVIEW_USERNAME": "openreview_username",
+        "OPENREVIEW_PASSWORD": "openreview_password",
+        "OPENREVIEW_ENABLED": "openreview_enabled",
+        "ARXIV_ENABLED": "arxiv_enabled",
+        "OPENALEX_ENABLED": "openalex_enabled",
     }
     for env_key, attr in mapping.items():
         if env_key in keys and keys[env_key] not in (None, ""):
@@ -314,6 +337,12 @@ def sync_env_file(keys: dict, env_path: Optional[Path] = None) -> Path:
         "PERSONA_ENSEMBLE_ENABLED",
         "PERSONA_COUNT",
         "SEED_STRATEGY_ELO_ENABLED",
+        "LLM_SEED_GENERATION_ENABLED",
+        "OPENREVIEW_USERNAME",
+        "OPENREVIEW_PASSWORD",
+        "OPENREVIEW_ENABLED",
+        "ARXIV_ENABLED",
+        "OPENALEX_ENABLED",
     }
     updates = {
         str(k): str(v)

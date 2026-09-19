@@ -125,9 +125,11 @@ def parse_json_from_llm(response: str) -> Optional[Any]:
 
     Returns dict OR list — callers must type-check the result before calling
     dict-only methods like ``.get`` (a bare JSON array is a valid model output).
+    Strips `` blocks before extraction to prevent thinking-trace contamination.
     """
     if not isinstance(response, str) or not response:
         return None
+    response = strip_thinking_tags(response)
     try:
         if "[" in response and response.find("[") < (response.find("{") if "{" in response else 10**9):
             start, end = response.find("["), response.rfind("]") + 1
@@ -209,6 +211,20 @@ _DEGENERATE_LLM_PATTERNS = (
 )
 
 
+_THINKING_TAG_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+
+
+def strip_thinking_tags(text: str) -> str:
+    """Remove LLM chain-of-thought `` blocks from output.
+
+    Models like Qwen/DeepSeek wrap internal reasoning in `` tags.
+    These leak into stored arguments and corrupt JSON extraction.
+    """
+    if not text:
+        return text
+    return _THINKING_TAG_RE.sub("", text).strip()
+
+
 def strip_markdown_headers(text: str) -> str:
     """Remove leading markdown headings so length checks measure body prose."""
     lines = []
@@ -225,6 +241,7 @@ def is_degenerate_llm_output(text: Any, *, min_chars: int = 40) -> bool:
         return True
     if not isinstance(text, str):
         text = str(text)
+    text = strip_thinking_tags(text)
     body = strip_markdown_headers(text)
     if len(body) < min_chars:
         return True

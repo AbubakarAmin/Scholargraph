@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any, Optional
 
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 _RETRY_BACKOFF = float(os.getenv("LLM_RETRY_BACKOFF", "2.0"))
+_THINKING_TAG_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 
 
 class LLMClient:
@@ -66,11 +68,14 @@ class LLMClient:
         model_id = model or config.resolve_model("default")
         gateway = get_gateway()
         try:
-            return gateway.request(
+            result = gateway.request(
                 "llm",
                 self._chat_raw,
                 prompt, temperature, model_id, max_tokens, system,
             )
+            if result:
+                result = _THINKING_TAG_RE.sub("", result).strip()
+            return result
         except Exception as e:
             logger.warning("LLM chat failed (%s/%s): %s", self.provider, model_id, e)
             try:

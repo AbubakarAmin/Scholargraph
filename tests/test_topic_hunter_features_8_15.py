@@ -119,8 +119,16 @@ class TestDatasetAdmissibility:
         agent._dataset_catalog_cache = [
             {"name": "sklearn_iris", "domain_tags": [], "n_samples": 150, "task_type": "classification"},
         ]
-        gap = {"title": "test", "dataset_plan": "imagenet"}
+        gap = {"title": "test", "dataset_plan": "proprietary_medical_scans_2024"}
         assert agent._dataset_plan_admissible(gap) is False
+
+    def test_known_public_dataset_passes(self):
+        agent = _make_agent()
+        agent._dataset_catalog_cache = [
+            {"name": "sklearn_iris", "domain_tags": [], "n_samples": 150, "task_type": "classification"},
+        ]
+        gap = {"title": "test", "dataset_plan": "imagenet"}
+        assert agent._dataset_plan_admissible(gap) is True
 
     def test_empty_catalog_fail_open(self):
         agent = _make_agent()

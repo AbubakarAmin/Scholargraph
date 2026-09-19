@@ -34,6 +34,7 @@ from core.run_log import (
     get_tracker,
     start_run,
     CrossRunMemory,
+    emit_event,
 )
 from core.memory import memory
 from core.research_db import research_db
@@ -362,6 +363,12 @@ def dashboard(run_id: Optional[str] = None):
         "status": release_status,
         "reason": release_reason,
     }
+    # Surface the current run error so the UI can display it prominently.
+    run_err = _get_run_error()
+    if run_err:
+        dash["release"]["error"] = run_err
+        if not release_reason:
+            dash["release"]["reason"] = run_err
     dash["capabilities"] = DEFAULT_MANIFESTS
     return dash
 
@@ -656,33 +663,43 @@ def _get_run_error() -> Optional[str]:
 
 def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = None,
                   mode: str = "full_research", query: Optional[str] = None):
-    global _run_error, _latest_state
+    global _run_error, _latest_state, _run_thread
     with _run_lock:
         _run_error = None
+        _latest_state = {}
+    tracker = None
     try:
         if domain:
             apply_runtime_keys({"RESEARCH_DOMAIN": domain})
         validate_config()
-        from main import create_checkpointer, create_research_graph, create_qa_mode_graph, initialize_state, save_results
+        from core.state import initialize_state
+        from main import create_checkpointer, create_research_graph, create_qa_mode_graph, save_results
         from core.context import create_run_context
         from core.pipeline import ResearchPipeline
 
         if resume_run_id:
+            # Delete stale checkpoints so the fresh run starts clean and
+            # old terminal_error / __end__ state never haunts a re-run.
+            research_db._delete_checkpoints(resume_run_id)
             tracker = start_run(resume_run_id)
             existing_state = _load_state_from_db(resume_run_id)
+            # Re-runs always start fresh: clear terminal_error and signal
+            # reset so the graph re-enters topic_discovery instead of
+            # terminating immediately from a stale checkpoint state.
+            if existing_state:
+                existing_state["terminal_error"] = None
+                existing_state["should_reset"] = True
+                existing_state["current_phase"] = None
+            state = existing_state if existing_state else initialize_state(mode=mode)
         else:
             tracker = start_run()
-            existing_state = None
+            state = initialize_state(mode=mode)
         pipeline = ResearchPipeline(
             create_research_graph,
             create_checkpointer,
             context=create_run_context(tracker),
             mode_graphs={"qa": create_qa_mode_graph},
         )
-        if resume_run_id and existing_state:
-            state = existing_state
-        else:
-            state = initialize_state(mode=mode)
         state["run_id"] = tracker.run_id
         if mode == "qa" and query:
             state["user_query"] = query
@@ -691,7 +708,9 @@ def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = N
             _set_latest_state(dict(node_output))
             tracker.message(f"{node_name} -> {node_output.get('current_phase')}")
 
-        result = pipeline.run(state, tracker.run_id, resume=bool(resume_run_id), on_node=on_node, finalize=save_results)
+        # Always start fresh (resume=False) to avoid the old checkpoint
+        # causing immediate termination via terminal_error or __end__.
+        result = pipeline.run(state, tracker.run_id, resume=False, on_node=on_node, finalize=save_results)
         last = result.state
         research_db.update_run_summary(tracker.run_id, {"workspace": _workspace_snapshot(last)})
         terminal_error = last.get("terminal_error")
@@ -700,10 +719,16 @@ def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = N
             tracker.message(terminal_error, level="error")
     except Exception as e:
         _set_run_error(str(e))
-        tracker = get_tracker()
         if tracker:
             tracker.message(f"ERROR: {e}", level="error")
             tracker.complete(success=False)
+        else:
+            # Emit error event even without a tracker so the UI surfaces it.
+            run_id_for_event = resume_run_id or "unknown"
+            emit_event("error", {"message": str(e)}, run_id=run_id_for_event, agent="system")
+    finally:
+        with _run_lock:
+            _run_thread = None
 
 
 @app.post("/api/run")
@@ -727,16 +752,30 @@ def start_research(payload: RunPayload = RunPayload()):
 
 @app.post("/api/run/resume/{run_id}")
 def resume_run(run_id: str):
-    """Resume a previous run from where it left off using checkpoint data."""
+    """Re-run a previous run from scratch, preserving its mode and query."""
     global _run_thread
     with _run_lock:
         if _run_thread and _run_thread.is_alive():
             raise HTTPException(status_code=409, detail="A run is already in progress")
+        # Detect mode and query from the previous run so the re-run uses
+        # the same parameters.
+        prev_mode = "full_research"
+        prev_query = None
+        runs = research_db.list_runs(limit=200)
+        prev = next((r for r in runs if r["run_id"] == run_id), None)
+        if not prev:
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+        try:
+            ws = json.loads(prev.get("summary_json") or "{}").get("workspace", {})
+            prev_mode = ws.get("mode", "full_research") or "full_research"
+            prev_query = ws.get("user_query")
+        except Exception:
+            pass
         _run_thread = threading.Thread(
-            target=_run_pipeline, args=(None, run_id), daemon=True
+            target=_run_pipeline, args=(None, run_id, prev_mode, prev_query), daemon=True
         )
         _run_thread.start()
-    return {"ok": True, "message": f"Resuming run {run_id} from checkpoint"}
+    return {"ok": True, "message": f"Re-running run {run_id} (mode={prev_mode})"}
 
 
 @app.get("/api/run/status")

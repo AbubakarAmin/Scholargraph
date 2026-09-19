@@ -113,6 +113,26 @@ _REJECTION_HISTORY_WINDOW = 20
 # out completely un-anchored.
 _MIN_SURVIVING_KEYWORDS = 1
 
+# Known public ML datasets — if a gap's dataset_plan contains any of these
+# substrings, it passes admissibility without checking the local catalog.
+_KNOWN_PUBLIC_DATASETS = frozenset({
+    "mnist", "cifar", "imagenet", "fashion", "svhn", "stl10",
+    "glue", "superglue", "squad", "mnli", "mrpc", "qnli", "rte", "wnli", "cola", "stsb", "sst", "qqp",
+    "commonsense", "piqa", "hellaswag", "winogrande", "arc",
+    "openbookqa", "boolq", "commitmentbank", "swag",
+    "imdb", "yelp", "ag news", "20newsgroups", "reuters",
+    "iris", "wine", "breast cancer", "diabetes", "california housing",
+    "boston housing", " Ames Housing",
+    "librispeech", "common voice", "voxceleb",
+    "coco", "pascal voc", "ade20k", "cityscapes", "gta5",
+    "kitti", "waymo", "nuscenes",
+    "omniglot", "miniimagenet", "tiered imagenet",
+    "ptb", "wikitext", "text8",
+    "mmlu", "humaneval", "mbpp", "gsm8k", "math",
+    "pubmed", "arxiv", "reddit", "bookcorpus",
+    "tabular", "csv", "uci",
+})
+
 # Fix #3: the similarity level at which a candidate topic's contribution gets
 # compared against prior work by an LLM (rather than judged on cosine sim
 # alone). This must never sit ABOVE the reject threshold, or a candidate can
@@ -1312,8 +1332,8 @@ Return JSON:
         return self._dataset_catalog_cache
 
     def _dataset_plan_admissible(self, gap: Dict[str, Any]) -> bool:
-        """Feature 1: cheap string check — reject gaps whose dataset_plan names
-        a dataset not in the local catalog, unless it's a synthetic:<desc> plan.
+        """Feature 1: string check — reject gaps whose dataset_plan names
+        a dataset not in the local catalog, unless it's synthetic/bundled/known-public.
         Fail-open: catalog errors or empty catalog → always True."""
         if not getattr(self.runtime_config, "capability_first_dataset_scoping_enabled", True):
             return True
@@ -1322,6 +1342,11 @@ Return JSON:
             return True
         if dataset_plan.startswith("synthetic") or dataset_plan.startswith("bundled"):
             return True
+        # Accept common public ML benchmarks by name pattern
+        plan_lower = dataset_plan.lower()
+        for kw in _KNOWN_PUBLIC_DATASETS:
+            if kw in plan_lower:
+                return True
         catalog = self._get_dataset_catalog()
         if not catalog:
             log_agent_action("TopicHunter", "dataset_admissibility_skip_empty_catalog", {})
@@ -1382,61 +1407,126 @@ Return JSON:
         gap_report: Dict[str, Any],
         novelty_report: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """Hypothesis Formalizer: converts candidate into a machine-checkable StructuredHypothesis.
+        """Hypothesis Formalizer: 2-phase approach for high reliability.
 
-        Fix #5: added a targeted repair turn. Previously, a failed attempt simply
-        regenerated the entire hypothesis from scratch with no feedback about what
-        was wrong. This is the most expensive gate in the chain (it runs after
-        screening + novelty comparison + citation fetches), so a bare retry with
-        no repair signal wastes the highest-cost failures. Now, on failure, the
-        next attempt is told exactly which required field(s) were missing/invalid
-        and asked to return a corrected full JSON with only that fixed.
+        Phase 1 (cheap tier): Generate ONLY the 4 core fields — research_question,
+        hypothesis, falsification_condition, dependent_variables. If this fails,
+        reject early without burning strong-tier calls.
+
+        Phase 2 (strong tier): Build the FULL experimental contract around the
+        validated core. This is a much easier task — the model just needs to
+        flesh out an existing hypothesis, not invent one from scratch.
         """
-        required_fields = ("hypothesis", "falsification_condition", "dependent_variables", "research_question")
+        # --- Phase 1: core fields (cheap tier, fast, high pass rate) ---
+        phase1_prompt = f"""
+Given this research gap, produce EXACTLY 4 fields. Be concrete and specific.
 
-        base_prompt = f"""
-Formalize this candidate research question into a precise, machine-checkable scientific hypothesis contract.
-
-Candidate:
 Title: {candidate.get('title')}
 Description: {candidate.get('description')}
 Rationale: {candidate.get('rationale')}
-Gap Report: {json.dumps(gap_report, default=str)[:1500]}
-Novelty: {json.dumps(novelty_report, default=str)[:1000]}
-Sandbox manifest: {json.dumps(SANDBOX_CAPABILITY_MANIFEST.as_dict())}
+Literature evidence: {json.dumps(novelty_report, default=str)[:800]}
 
-Requirements:
-1. Clearly stated research_question.
-2. Precise scientific hypothesis.
-3. Explicit independent_variables with test ranges/values (e.g. [{{"name": "...", "values": [...]}}]).
-4. Explicit dependent_variables (measurable metrics e.g. ["ECE", "accuracy", "Brier"]).
-5. Expected relationship / prediction under control conditions.
-6. Defined falsification_condition (what observation rejected the claim?).
-7. Minimum viable experiment (dataset from catalog or synthetic, models, conditions, metrics, seeds, baseline, falsification_test).
-8. Confounders and competing explanations identified.
-9. Required resources within sandbox limits.
+Generate:
+1. research_question: A precise, specific question (not a vague direction)
+2. hypothesis: A falsifiable claim in the form "X causes/improves Y over Z because W"
+3. falsification_condition: What specific observation would DISPROVE this hypothesis?
+4. dependent_variables: Specific measurable metrics (e.g. ["ECE", "accuracy", "F1"])
 
 Return JSON:
 {{
   "research_question": "...",
   "hypothesis": "...",
-  "independent_variables": [{{"name": "...", "values": [1, 2, 3]}}],
-  "dependent_variables": ["accuracy", "ECE"],
-  "expected_relationship": "...",
   "falsification_condition": "...",
+  "dependent_variables": ["..."]
+}}
+"""
+        core_fields = ("research_question", "hypothesis", "falsification_condition", "dependent_variables")
+        core_parsed: Dict[str, Any] = {}
+
+        for attempt in range(2):
+            temp = 0.3 if attempt == 0 else 0.1
+            raw = call_llm(phase1_prompt, temperature=temp, tier="cheap")
+            parsed = parse_json_from_llm(raw) or {}
+            if isinstance(parsed, dict):
+                missing = [f for f in core_fields if not parsed.get(f)]
+                if not missing:
+                    core_parsed = parsed
+                    break
+                if attempt == 0:
+                    phase1_prompt += f"\n\nYour previous response was missing: {', '.join(missing)}. Fix ONLY those fields."
+
+        if not core_parsed:
+            log_agent_action("TopicHunter", "formalize_phase1_failed", {
+                "title": candidate.get("title"),
+                "missing": [f for f in core_fields if not core_parsed.get(f)],
+            })
+            return None
+
+        log_agent_action("TopicHunter", "formalize_phase1_ok", {
+            "title": candidate.get("title"),
+            "core_fields": list(core_parsed.keys()),
+        })
+
+        # --- Phase 2: full contract (strong tier, easier task) ---
+        required_fields = ("hypothesis", "falsification_condition", "dependent_variables", "research_question")
+
+        base_prompt = f"""
+Build a complete experimental contract around this validated hypothesis core.
+
+VALIDATED CORE (do NOT change these — they are confirmed):
+{json.dumps(core_parsed, indent=2)}
+
+Candidate context:
+Title: {candidate.get('title')}
+Description: {candidate.get('description')}
+Gap Report: {json.dumps(gap_report, default=str)[:1500]}
+Sandbox manifest: {json.dumps(SANDBOX_CAPABILITY_MANIFEST.as_dict())}
+
+Now ADD the following fields to complete the contract:
+1. independent_variables: test ranges/values (e.g. [{{"name": "...", "values": [...]}}])
+2. expected_relationship: prediction under control conditions
+3. novelty_claim: what is new vs prior work
+4. closest_prior_work: [{{
+    "title": "...",
+    "difference": "..."
+  }}]
+5. baselines: specific named baselines (e.g. ["logistic_regression", "random_forest"])
+6. metrics: same as dependent_variables or additional
+7. confounders: factors that could confound results
+8. competing_explanations: alternative explanations the experiment must rule out
+9. minimum_viable_experiment: {{
+    "dataset": "bundled_synthetic" or specific public dataset name,
+    "models": ["specific_model_a", "specific_model_b"],
+    "conditions": ["controlled_seeds"],
+    "metrics": ["..."],
+    "seeds": 3,
+    "baseline": "specific_baseline",
+    "expected_result": "...",
+    "falsification_test": "Welch t-test p<0.05"
+  }}
+10. required_resources: {{"cpu": true, "gpu": false, "max_memory_mb": 4096, "max_runtime_seconds": 120}}
+
+Return the COMPLETE JSON with ALL fields (core + new):
+{{
+  "research_question": "{core_parsed.get('research_question', '')}",
+  "hypothesis": "{core_parsed.get('hypothesis', '')}",
+  "falsification_condition": "{core_parsed.get('falsification_condition', '')}",
+  "dependent_variables": {json.dumps(core_parsed.get('dependent_variables', []))},
+  "independent_variables": [{{"name": "...", "values": [...]}}],
+  "expected_relationship": "...",
   "novelty_claim": "...",
   "closest_prior_work": [{{"title": "...", "difference": "..."}}],
-  "baselines": ["logistic_regression", "random_forest"],
-  "metrics": ["accuracy"],
-  "confounders": ["model_capacity", "sample_size"],
-  "competing_explanations": ["training_instability"],
+  "baselines": ["..."],
+  "metrics": ["..."],
+  "confounders": ["..."],
+  "competing_explanations": ["..."],
   "minimum_viable_experiment": {{
     "dataset": "bundled_synthetic",
-    "models": ["model_a", "model_b"],
+    "models": ["..."],
     "conditions": ["controlled_seeds"],
-    "metrics": ["accuracy"],
+    "metrics": ["..."],
     "seeds": 3,
-    "baseline": "logistic_regression",
+    "baseline": "...",
     "expected_result": "...",
     "falsification_test": "Welch t-test p<0.05"
   }},
@@ -1450,9 +1540,9 @@ Return JSON:
 """
         prompt = base_prompt
         last_parsed: Dict[str, Any] = {}
-        max_attempts = 2  # one generation + one repair; 3rd attempt with same strategy is budget waste
+        max_attempts = 2
         for attempt in range(max_attempts):
-            temp = 0.1 if attempt > 0 else 0.3  # lower temp on repair for schema compliance
+            temp = 0.1 if attempt > 0 else 0.3
             raw = call_llm(prompt, temperature=temp, tier="strong")
             parsed = parse_json_from_llm(raw) or {}
             if isinstance(parsed, dict):
@@ -1466,17 +1556,13 @@ Return JSON:
                 missing = list(required_fields)
 
             if attempt < max_attempts - 1:
-                # Repair turn: hand back what we got and name exactly what's missing,
-                # instead of silently regenerating from scratch.
                 prompt = base_prompt + f"""
 
 Your previous response was missing or had an invalid value for: {', '.join(missing)}.
-Your previous response was:
+Your previous response:
 {json.dumps(last_parsed, default=str)[:2000]}
 
-Return the FULL corrected JSON object again, in the same schema, fixing ONLY the
-listed field(s) and leaving everything else as close to your previous answer as
-possible.
+Return the FULL corrected JSON, fixing ONLY the listed field(s).
 """
                 log_agent_action("TopicHunter", "formalize_hypothesis_repair_attempt", {
                     "attempt": attempt + 1,
@@ -1544,6 +1630,98 @@ possible.
         if phrase not in text:
             return False
         return not cls._is_negated(phrase, text)
+
+    def pre_debate_self_critique(self, topic: Dict[str, Any]) -> Dict[str, Any]:
+        """Reflection agent: identifies top 3 likely debate objections and rewrites
+        the hypothesis to preempt them. Burns 1 cheap-tier LLM call but
+        significantly strengthens the hypothesis before adversarial debate.
+
+        Returns the topic dict with strengthened structured_hypothesis,
+        or the original topic if self-critique fails.
+        """
+        structured_hyp = topic.get("structured_hypothesis")
+        if not structured_hyp or not isinstance(structured_hyp, dict):
+            return topic
+
+        prompt = f"""
+You are a hostile peer reviewer. Given this hypothesis, identify the top 3
+objections a reviewer would raise, then REWRITE the hypothesis to preempt them.
+
+Hypothesis: {structured_hyp.get('hypothesis', '')}
+Research question: {structured_hyp.get('research_question', '')}
+Falsification condition: {structured_hyp.get('falsification_condition', '')}
+Dependent variables: {json.dumps(structured_hyp.get('dependent_variables', []))}
+Baselines: {json.dumps(structured_hyp.get('baselines', []))}
+MVE: {json.dumps(structured_hyp.get('minimum_viable_experiment', {}), default=str)[:1000]}
+
+For each objection:
+1. What is the objection? (be specific)
+2. How severe is it? (1-5)
+3. How can the hypothesis be REWRITTEN to address it?
+
+Then provide a STRENGTHENED version of the hypothesis that preempts all 3 objections
+while preserving the core scientific claim.
+
+Return JSON:
+{{
+  "objections": [
+    {{"objection": "...", "severity": 3, "fix": "..."}}
+  ],
+  "strengthened_hypothesis": "...",
+  "strengthened_falsification": "...",
+  "strengthened_baselines": ["..."],
+  "strengthened_mve": {{
+    "dataset": "...",
+    "models": ["..."],
+    "baseline": "...",
+    "metrics": ["..."],
+    "seeds": 3,
+    "falsification_test": "..."
+  }}
+}}
+"""
+        try:
+            raw = call_llm(prompt, temperature=0.3, tier="cheap")
+            parsed = parse_json_from_llm(raw) or {}
+            if not isinstance(parsed, dict):
+                return topic
+
+            strengthened_hyp = parsed.get("strengthened_hypothesis")
+            if not strengthened_hyp:
+                return topic
+
+            # Apply strengthening to the structured hypothesis
+            new_hyp = dict(structured_hyp)
+            new_hyp["hypothesis"] = strengthened_hyp
+
+            strengthened_fals = parsed.get("strengthened_falsification")
+            if strengthened_fals:
+                new_hyp["falsification_condition"] = strengthened_fals
+
+            strengthened_baselines = parsed.get("strengthened_baselines")
+            if isinstance(strengthened_baselines, list) and strengthened_baselines:
+                new_hyp["baselines"] = strengthened_baselines
+
+            strengthened_mve = parsed.get("strengthened_mve")
+            if isinstance(strengthened_mve, dict) and strengthened_mve:
+                old_mve = new_hyp.get("minimum_viable_experiment") or {}
+                old_mve.update({k: v for k, v in strengthened_mve.items() if v})
+                new_hyp["minimum_viable_experiment"] = old_mve
+
+            topic["structured_hypothesis"] = new_hyp
+            topic["falsifiable_prediction"] = new_hyp.get("falsification_condition", "")
+
+            objections = parsed.get("objections") or []
+            log_agent_action("TopicHunter", "pre_debate_critique", {
+                "title": topic.get("title"),
+                "objections_found": len(objections),
+                "hypothesis_strengthened": True,
+            })
+            return topic
+
+        except Exception as e:
+            log_agent_action("TopicHunter", "pre_debate_critique_error", {"error": str(e)})
+            return topic
 
     def _reject(self, topic: Topic, reason: str, meta: Optional[Dict[str, Any]] = None):
         meta = meta or {}
@@ -2022,7 +2200,8 @@ Return JSON: {{"terms": [{{"method": "...", "evaluation": "..."}}]}}
         # chain (which has a nonzero rejection rate at each stage) has more
         # surviving material at the end.
         base_prompt = f"""
-Find research GAPS (not trendy saturated topics) in {domain}.
+Propose {_GAPS_PER_SEED_REQUEST} TESTABLE HYPOTHESES in {domain}.
+
 Seed angle: {seed_hint}
 Prior-run lessons (avoid repeats):
 {json.dumps(cross_run_context, sort_keys=True)}
@@ -2042,39 +2221,49 @@ Method × domain sparse cells (well-established individually but rarely combined
 Contradictions in retrieved literature (papers disagreeing on the same question — strong, ready-made research gaps):
 {json.dumps(contradictions[:5], indent=2)}
 
-        Replication-target candidates (papers making strong claims with no visible variance/multi-seed reporting — consider proposing replication-and-extension topics):
-        {json.dumps(replication_targets[:5], indent=2)}
+Replication-target candidates (papers making strong claims with no visible variance/multi-seed reporting):
+{json.dumps(replication_targets[:5], indent=2)}
 
-        Reviewer-identified weaknesses from peer review (OpenReview) — these are
-        EXPERT-STATED limitations of specific published papers, not inferred by you.
-        Prefer proposing a gap that directly follows from one of these over inventing
-        a new one from abstracts alone:
-        {json.dumps([{
-            'title': p['title'],
-            'weaknesses': p['weaknesses'][:2],
-        } for p in openreview_signals[:6]], indent=2)[:3000]}
+Reviewer-identified weaknesses from peer review (OpenReview) — EXPERT-STATED limitations:
+{json.dumps([{
+    'title': p['title'],
+    'weaknesses': p['weaknesses'][:2],
+} for p in openreview_signals[:6]], indent=2)[:3000]}
 
-        Your own prior completed experiments that tested a hypothesis and did NOT find support (real negative results — use to propose a follow-up varying ONE condition, not a repeat):
+Prior negative results (propose a follow-up varying ONE condition, not a repeat):
 {json.dumps(negative_lessons[:5], indent=2)}
 
-Evidence-backed cross-paper bridges. These are candidate transfer questions,
-not proof of a research gap. Use their cited excerpts when relevant; do not
-invent a relationship not present in the supplied evidence:
+Evidence-backed cross-paper bridges:
 {json.dumps(evidence_map.get('bridges', [])[:6], indent=2)[:6000]}
 
 Sample recent titles:
 {[p.get('title', '')[:100] for p in recent_papers[:8]]}
 
-A real gap: foundational work is cited but rarely extended lately.
-Propose {_GAPS_PER_SEED_REQUEST} topics executable with CPU sklearn/numpy synthetic or small public data.
-For each topic include an explicit "contribution" sentence for novelty checking.
+IMPORTANT: Each hypothesis MUST be a specific, falsifiable claim. NOT a vague research direction.
 
-For every proposed topic, include `evidence_bridge_ids` containing the bridge IDs
+Each hypothesis should follow this form:
+"Method/technique X applied to problem Y achieves Z improvement over baseline W because of mechanism M"
+
+Requirements for each hypothesis:
+- Named method (contrastive learning, dropout, ensemble, temperature scaling, specific architecture — NOT "a new approach")
+- Named baseline to compare against (logistic regression, random forest, ResNet-18, temperature scaling — NOT "existing methods")
+- Named metric (accuracy, ECE, F1, inference latency in ms — NOT "performance")
+- Named dataset OR "synthetic with N samples, K features, D classes"
+- Concrete prediction (e.g., "improves ECE by >15% over temperature scaling")
+- Why this hasn't been done before (grounded in the evidence above)
+
+BAD examples (will be rejected downstream):
+- "Evaluating the impact of domain shift on calibration" ← too vague, not falsifiable
+- "A study of interpretability methods under distribution shift" ← survey, not hypothesis
+- "Characterizing robustness boundaries" ← not a testable claim
+
+GOOD examples:
+- "Temperature scaling outperforms Platt scaling on CIFAR-10-C when corruption severity > 3, because temperature parameters capture output distribution shifts better than sigmoid transforms"
+- "Mixup training reduces ECE by >20% over standard training on synthetic data with Gaussian noise, because it smooths the decision boundary"
+- "Random forests achieve higher accuracy than XGBoost on tabular data with >30% missing values, because tree-based methods handle missingness natively without imputation"
+
+For every proposed hypothesis, include `evidence_bridge_ids` containing bridge IDs
 that support its cross-paper synthesis. Do not fabricate IDs.
-If a gap is grounded in one of the structural gap signals above, optionally include
-`structural_gap_ref` naming the two papers (paper_a and paper_b) from the signal.
-If a gap is grounded in one of the contradiction signals above, optionally include
-`contradiction_ref` naming the two papers (paper_a_title and paper_b_title) from the signal.
 JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "impact": "...",
 "feasibility": 7, "keywords": [], "anchor_paper": "...", "dataset_plan": "synthetic|public",
 "evidence_bridge_ids": ["bridge-..."], "structural_gap_ref": {{"paper_a": "...", "paper_b": "..."}},

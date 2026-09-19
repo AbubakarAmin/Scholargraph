@@ -115,6 +115,12 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
         if not state["topics"]:
             state["should_reset"] = True
             return state
+        # Pre-debate self-critique: strengthen hypotheses before adversarial debate
+        try:
+            _th_agent = _create_agent(TopicHunterAgent)
+            state["topics"] = [_th_agent.pre_debate_self_critique(t) for t in state["topics"]]
+        except Exception as critique_err:
+            log_agent_action("Orchestrator", "pre_debate_critique_error", {"error": str(critique_err)})
         topics_tried = 0
         debater = _create_agent(HypothesisDebateSystem)
         if len(state["topics"]) >= 3 and hasattr(debater, "conduct_tournament"):

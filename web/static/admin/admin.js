@@ -263,6 +263,7 @@ function renderOverview(){
   const qaAnswer=w.qa_answer;
   const qaCitation=w.qa_citation_verification;
   const qaReady=qaAnswer&&qaCitation?.passed;
+  const runError=dashboard.release?.error;
   const terminal=dashboard.release?.status==='blocked'||w.terminal_error||w.evidence_gate?.terminal;
   const ready=qaMode?(qaReady||!!qaAnswer):(!blocking.length && w.reproducibility?.passed && Object.keys(w.execution_artifacts||{}).length>0);
 
@@ -270,9 +271,10 @@ function renderOverview(){
   const hasRun=dashboard.run_id||w.plan||w.paper||qaAnswer;
   $('onboardingCard').style.display=hasRun?'none':'block';
 
-  $('readiness').textContent=terminal?'Blocked':qaMode?(qaReady?'Answer ready':qaAnswer?'Citations pending':dashboard.phase==='qa_literature_retrieval'?'Retrieving literature':dashboard.phase==='qa_answer'?'Generating answer':'Preparing'):(ready?'Ready':'Blocked');
-  $('readiness').className='metric-value '+(terminal?'bad':(qaReady||(ready&&!qaMode))?'good':qaAnswer?'warn':'bad');
-  $('readinessNote').textContent=terminal?(dashboard.release?.reason||w.terminal_error||'Terminal evidence failure'):(qaMode?(qaReady?'Citation-verified synthesis answer':qaAnswer?'Answer generated — some citations unverified':dashboard.phase==='qa_literature_retrieval'?'Searching for relevant papers and sources':'Synthesizing literature-backed answer'):(ready?'Evidence gate passed':'Verification or reproducibility incomplete'));
+  const readinessText=runError?'Error':terminal?'Blocked':qaMode?(qaReady?'Answer ready':qaAnswer?'Citations pending':dashboard.phase==='qa_literature_retrieval'?'Retrieving literature':dashboard.phase==='qa_answer'?'Generating answer':'Preparing'):(ready?'Ready':'Blocked');
+  $('readiness').textContent=readinessText;
+  $('readiness').className='metric-value '+(runError?'bad':terminal?'bad':(qaReady||(ready&&!qaMode))?'good':qaAnswer?'warn':'bad');
+  $('readinessNote').textContent=runError?runError:(terminal?(dashboard.release?.reason||w.terminal_error||'Terminal evidence failure'):(qaMode?(qaReady?'Citation-verified synthesis answer':qaAnswer?'Answer generated — some citations unverified':dashboard.phase==='qa_literature_retrieval'?'Searching for relevant papers and sources':'Synthesizing literature-backed answer'):(ready?'Evidence gate passed':'Verification or reproducibility incomplete')));
 
   $('phaseMetric').textContent=titleCase(dashboard.phase||'idle');
   $('phaseNote').textContent=dashboard.status||'idle';

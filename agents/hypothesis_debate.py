@@ -286,6 +286,27 @@ def _normalize_objection_payload(parsed: Any) -> Dict[str, Any]:
     return parsed
 
 
+def _ensure_objections_are_dicts(objections: List[Any]) -> List[Dict[str, Any]]:
+    """Defensive normalizer: ensure every item in an objections list is a dict.
+    LLMs occasionally return nested lists or bare strings inside objection lists.
+    This prevents 'list object has no attribute get' crashes downstream."""
+    out: List[Dict[str, Any]] = []
+    for item in objections:
+        if isinstance(item, dict):
+            out.append(item)
+        elif isinstance(item, list):
+            # Nested list — flatten: take first dict found, or wrap
+            for sub in item:
+                if isinstance(sub, dict):
+                    out.append(sub)
+                    break
+            else:
+                out.append({"objection": str(item), "severity": 3, "status": "unresolved"})
+        elif isinstance(item, str):
+            out.append({"objection": item, "severity": 3, "status": "unresolved"})
+    return out
+
+
 class ProposerAgent:
     def __init__(self, context: Optional[RunContext] = None):
         self.context = context or get_active_context()
@@ -791,6 +812,7 @@ class HypothesisDebateSystem:
         objections = getattr(self.challenger, "_last_objections", []) or [
             {"criterion": "soundness", "objection": rebuttal[:500], "severity": 3, "status": "unresolved"}
         ]
+        objections = _ensure_objections_are_dicts(objections)
         rounds.append({
             "round": 1,
             "proposer": argument,
@@ -806,6 +828,7 @@ class HypothesisDebateSystem:
         for r in range(2, max_r + 1):
             response = self.proposer.respond_to_objections(topic, argument, current_objections)
             current_objections = self.challenger.followup_objections(topic, response, current_objections)
+            current_objections = _ensure_objections_are_dicts(current_objections)
             rounds.append({
                 "round": r,
                 "proposer": response,
@@ -921,8 +944,9 @@ class HypothesisDebateSystem:
         """
         if not getattr(self, "runtime_config", None) or getattr(getattr(self, "challenger", None), "_challenger_invalid", False):
             return None
+        all_objections = _ensure_objections_are_dicts(result.objections or [])
         unresolved = [
-            item for item in (result.objections or [])
+            item for item in all_objections
             if isinstance(item, dict) and item.get("status") != "resolved"
         ]
         if not unresolved:

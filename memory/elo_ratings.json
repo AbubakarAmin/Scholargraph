@@ -1,0 +1,26 @@
+{
+  "general": {
+    "rating": 1485.180812246635,
+    "raw_rating": 1455.5424367399048,
+    "observations": 4,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-20T02:32:28.035943"
+  },
+  "strategy:llm_diverse": {
+    "rating": 1477.5302622247493,
+    "raw_rating": 1441.5786817843482,
+    "observations": 5,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-20T02:57:24.591593"
+  },
+  "attention": {
+    "rating": 1498.2222222222222,
+    "raw_rating": 1484.0,
+    "observations": 1,
+    "prior": 1500.0,
+    "shrinkage_k": 8.0,
+    "updated_at": "2026-09-20T02:57:24.590721"
+  }
+}

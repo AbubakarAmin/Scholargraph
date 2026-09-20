@@ -6,6 +6,7 @@ Sandbox lockdown, multi-seed, PIVOT/REFINE, ablations, code-claim checks.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime
@@ -24,6 +25,8 @@ from core.research_db import research_db
 from core.contracts import CodeClaimReport, ExperimentOutput, ExperimentSpec, RevisionRequest
 from core.known_answers import fixture_for
 from core.datasets import download_hf_dataset, get_dataset_info, load_local_dataset
+
+logger = logging.getLogger(__name__)
 
 
 def _effectively_empty_code(code: str) -> bool:
@@ -68,8 +71,10 @@ class EngineerAgent:
         Returns dataset dict with 'rows', 'row_count', 'features' or None.
         """
         if not dataset_plan or not dataset_plan.strip():
+            logger.info("prepare_dataset: no dataset plan provided, skipping")
             return None
         plan = dataset_plan.strip()
+        logger.info(f"prepare_dataset: preparing dataset '{plan}' (max_samples={max_samples})")
 
         # Check if Planner already resolved this dataset
         if dataset_resolutions:
@@ -80,24 +85,28 @@ class EngineerAgent:
                         try:
                             local = load_local_dataset(plan)
                             if local and local.get("row_count", 0) > 0:
+                                logger.info(f"prepare_dataset: loaded planner-resolved local dataset '{plan}', rows={local['row_count']}")
                                 return local
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("Local dataset reload failed: %s", e)
                     # Info was resolved — proceed to download
 
         # Try local catalog
         try:
             local = load_local_dataset(plan)
             if local and local.get("row_count", 0) > 0:
+                logger.info(f"prepare_dataset: loaded from local catalog '{plan}', rows={local['row_count']}, source=local")
                 log_agent_action("Engineer", "dataset_loaded_local", {
                     "name": plan, "rows": local["row_count"],
                 })
                 return local
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Local catalog load failed: %s", e)
         # Try HuggingFace download
+        logger.info(f"prepare_dataset: local catalog miss for '{plan}', attempting HuggingFace download")
         hf_result = download_hf_dataset(plan, max_samples=max_samples)
         if hf_result:
+            logger.info(f"prepare_dataset: downloaded from HuggingFace '{plan}', rows={hf_result.get('row_count', 0)}, source=HuggingFace")
             log_agent_action("Engineer", "dataset_downloaded_hf", {
                 "name": plan, "rows": hf_result.get("row_count", 0),
             })
@@ -105,9 +114,12 @@ class EngineerAgent:
         # Fallback: get info only (no download)
         info = get_dataset_info(plan)
         if info:
+            logger.info(f"prepare_dataset: no data obtained for '{plan}', info-only source={info.get('source')}")
             log_agent_action("Engineer", "dataset_info_only", {
                 "name": plan, "source": info.get("source"),
             })
+        else:
+            logger.warning(f"prepare_dataset: no dataset found for '{plan}' (local, HF, or info all failed)")
         return None
 
     @property
@@ -156,7 +168,10 @@ class EngineerAgent:
         alternatives: other designs from Planner for PIVOT.
         method_description is retained for callers/logging but is not used for claim checks.
         """
-        log_agent_action("EngineerAgent", "start_experiment", {"experiment": experiment.get("name")})
+        exp_name = experiment.get("name", "<unnamed>")
+        logger.info(f"run_experiment: starting experiment '{exp_name}'")
+        logger.info(f"run_experiment: config — seeds={self.runtime_config.experiment_seeds}, max_attempts=4, contract_hash={experiment.get('contract_hash', 'none')}")
+        log_agent_action("EngineerAgent", "start_experiment", {"experiment": exp_name})
         contract_hash = experiment.get("contract_hash")
         alternatives = [] if contract_hash else (alternatives or experiment.get("alternatives") or [])
         max_attempts = 4
@@ -181,11 +196,15 @@ class EngineerAgent:
             })
             if approach.get("_refined_code"):
                 code = approach.pop("_refined_code")
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt}/{max_attempts} — using pre-refined code ({len(code)} chars)")
             else:
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt}/{max_attempts} — generating code via LLM")
                 code = self._generate_experiment_code(approach)
+                logger.info(f"run_experiment: [{exp_name}] code generated — {len(code)} chars")
 
             if not (code or "").strip():
                 reason = "empty_code_generation"
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — code generation returned empty, requesting REFINE")
                 decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": reason})
                 self._progress("experiment_refine", {
                     "experiment": approach.get("name"),
@@ -207,6 +226,7 @@ class EngineerAgent:
 
             if (code or "").strip() and _effectively_empty_code(code):
                 reason = "empty_code_generation"
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — code contains only comments/docstrings, requesting REFINE")
                 decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": reason})
                 self._progress("experiment_refine", {
                     "experiment": approach.get("name"),
@@ -228,6 +248,7 @@ class EngineerAgent:
 
             ok, err = validate_code(code)
             if not ok:
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — sandbox validation failed: {err[:200]}")
                 decision_log.append({"attempt": attempt, "decision": "REFINE", "reason": err})
                 self._progress("experiment_refine", {
                     "experiment": approach.get("name"),
@@ -249,6 +270,7 @@ class EngineerAgent:
 
             known_answer = approach.get("known_answer") or fixture_for(approach) or {}
             if known_answer:
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — running known-answer check")
                 check = run_known_answer_check(code, known_answer.get("metrics") or {}, float(known_answer.get("tolerance", 1e-3)))
                 if not check.get("passed"):
                     detail = json.dumps(check.get("mismatches") or check.get("reason"), default=str)
@@ -268,6 +290,7 @@ class EngineerAgent:
                 detail = "; ".join(
                     consistency.get("notes") or ["generated code does not implement the committed claims"]
                 )
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — code-claim inconsistency: {detail[:300]}")
                 decision_log.append({
                     "attempt": attempt,
                     "decision": "REFINE",
@@ -301,9 +324,11 @@ class EngineerAgent:
                 "action": "multi_seed",
                 "seeds": self.runtime_config.experiment_seeds,
             })
+            logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — executing multi-seed run (n_seeds={self.runtime_config.experiment_seeds})")
             multi = execute_multi_seed(code, n_seeds=self.runtime_config.experiment_seeds)
 
             if multi.get("success") and multi.get("aggregate_metrics"):
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — execution succeeded, extracting metrics: {list(multi['aggregate_metrics'].keys())}")
                 self._progress("experiment_ablation", {
                     "experiment": approach.get("name"),
                     "attempt": attempt,
@@ -341,6 +366,7 @@ class EngineerAgent:
                     "metrics": output["aggregate_metrics"],
                     "raw_results_path": raw_path,
                 })
+                logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — experiment COMPLETE, metrics={output['aggregate_metrics']}, raw={raw_path}")
                 log_agent_action("EngineerAgent", "experiment_complete", {
                     "experiment": approach["name"],
                     "success": True,
@@ -351,6 +377,7 @@ class EngineerAgent:
             # Failure path: REFINE or PIVOT
             error = multi.get("error") or "underperformed / no metrics"
             decision = self._decide_pivot_or_refine(approach, error, alternatives, attempt)
+            logger.info(f"run_experiment: [{exp_name}] attempt {attempt} — execution failed ({error[:200]}), decision={decision}")
             decision_log.append({"attempt": attempt, "decision": decision, "reason": error})
             tracker = get_tracker()
             self._progress("experiment_decision", {
@@ -377,6 +404,7 @@ class EngineerAgent:
                     self.request_plan_revision("no_alternatives_after_pivot", approach, detail=error)
                     return self._fail(approach, error, decision_log, code, original_name=original_experiment_name)
 
+        logger.warning(f"run_experiment: [{exp_name}] max_attempts={max_attempts} exhausted, failing experiment")
         self.request_plan_revision("max_attempts_exhausted", approach, detail="bounded code-only repair attempts exhausted")
         return self._fail(approach, last_error or "max_attempts_exhausted", decision_log, code, failure_kind=last_failure_kind, original_name=original_experiment_name)
 
@@ -389,14 +417,18 @@ class EngineerAgent:
         Architecture 8.1: cheap parallel short runs, promote winner to full multi-seed.
         Each item may have 'variants' list; otherwise treat as single design.
         """
+        logger.info(f"run_branching_search: starting branching search with {len(contribution_experiments)} experiment(s)")
         candidates = []
         for exp in contribution_experiments:
             variants = exp.get("variants") or exp.get("alternatives") or [exp]
             for v in variants[: self.runtime_config.experiment_branch_count]:
                 candidates.append(v)
+        logger.info(f"run_branching_search: {len(candidates)} candidate variant(s) to probe (branch_count={self.runtime_config.experiment_branch_count})")
 
         cheap_scores = []
         for cand in candidates:
+            cand_name = cand.get("name", "<unnamed>")
+            logger.info(f"run_branching_search: probing variant '{cand_name}'")
             code = self._generate_experiment_code({**cand, "cheap_mode": True})
             # Single seed cheap probe
             probe = sandbox_execute(code, seed=42)
@@ -414,6 +446,7 @@ class EngineerAgent:
                     score = 0.0
                     probe_ok = False
             cheap_scores.append((score, cand, code, probe, probe_ok))
+            logger.info(f"run_branching_search: variant '{cand_name}' — score={score:.4f}, probe_ok={probe_ok}")
             tracker = get_tracker()
             if tracker:
                 tracker.scratch("EngineerAgent", "cheap_probe", {"name": cand.get("name"), "score": score, "probe_ok": probe_ok})
@@ -426,6 +459,7 @@ class EngineerAgent:
             })
 
         if not cheap_scores:
+            logger.warning("run_branching_search: no candidates to probe, returning failure")
             return {"success": False, "error": "no candidates"}
 
         # Sort by score descending, but only consider probes that actually
@@ -433,6 +467,7 @@ class EngineerAgent:
         # metrics get score 0 and are deprioritized — not promoted.
         cheap_scores.sort(key=lambda x: (x[4], x[0]), reverse=True)
         best_score, best_cand, _, _, _ = cheap_scores[0]
+        logger.info(f"run_branching_search: winner selected — '{best_cand.get('name', '<unnamed>')}' (probe_score={best_score:.4f})")
         # Full run on winner, passing remaining candidates as alternatives for PIVOT
         full = self.run_experiment(
             best_cand,
@@ -743,10 +778,12 @@ Return ONLY Python code.
             return self._generate_fallback_code(experiment)
 
     def _refine_code(self, code: str, error: str, experiment: Dict[str, Any], local_context: str = "") -> str:
+        exp_name = experiment.get("name", "<unnamed>")
+        hint = self._error_category_hint(error)
+        logger.info(f"_refine_code: [{exp_name}] starting refinement, error_category_hint='{hint[:100]}'")
         context_block = ""
         if local_context:
             context_block = f"\nDebugging context (traceback + implicated custom functions):\n{local_context}\n"
-        hint = self._error_category_hint(error)
         hint_block = f"\nFix hint for this failure category:\n{hint}\n" if hint else ""
         prompt = f"""
 Fix this experiment code. Error:
@@ -762,6 +799,10 @@ Constraints: no subprocess/os/exit/eval. Print JSON metrics line.
 Return ONLY fixed Python code.
 """
         fixed = call_llm(prompt, temperature=0.1, tier="cheap")
+        if fixed:
+            logger.info(f"_refine_code: [{exp_name}] refinement complete — {len(fixed)} chars")
+        else:
+            logger.warning(f"_refine_code: [{exp_name}] LLM returned empty refinement, keeping original code")
         return self._clean_code(fixed) if fixed else code
 
     def _auto_ablation(self, experiment: Dict[str, Any], full_code: str) -> Dict[str, Any]:

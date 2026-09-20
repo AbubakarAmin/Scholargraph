@@ -4,6 +4,7 @@ Handles abstract, introduction, methods, results, and conclusion sections.
 """
 
 import json
+import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
@@ -13,6 +14,8 @@ from core.llm import call_llm, generate_embedding, get_llm_client
 from core.context import RunContext, get_active_context
 from core.contracts import ExperimentOutput, Plan, PlanSection, Topic
 from core.memory import memory
+
+logger = logging.getLogger(__name__)
 
 
 _MIN_SECTION_BODY_CHARS = {
@@ -68,8 +71,11 @@ class WriterAgent:
         defects instead of re-rolling the same prompt blind.
         """
         log_agent_action("WriterAgent", "start_drafting", {"section": section_name})
+        logger.info("Drafting section: %s for topic: %s", section_name, topic.get("title", "unknown"))
+        if revision_feedback:
+            logger.info("Revision feedback present for section '%s': %.200s...", section_name, revision_feedback)
         self._active_revision_feedback = revision_feedback
-        
+
         # Released exemplars only — cold-start returns empty until runs clear the release gate.
         exemplars = self._released_exemplars(section_name)
 
@@ -99,6 +105,8 @@ class WriterAgent:
         # Store in memory
         self._store_section(section_name, content, topic)
         self._active_revision_feedback = None
+
+        logger.info("Section '%s' complete: %d characters", section_name, len(content))
 
         log_agent_action("WriterAgent", "section_complete", {
             "section": section_name,
@@ -167,6 +175,7 @@ class WriterAgent:
         fallback: Optional[str] = None,
     ) -> str:
         """Call the LLM once, retry on empty/garbled stubs, then fall back."""
+        logger.info("LLM call for section '%s' (max 2 attempts, min %d chars)", section_name, self._min_body_chars(section_name))
         last_content = ""
         min_chars = self._min_body_chars(section_name)
         full_prompt = prompt + self._revision_block()
@@ -178,6 +187,7 @@ class WriterAgent:
                 if not is_degenerate_llm_output(formatted, min_chars=min_chars) and len(body) >= min_chars:
                     return formatted
                 last_content = formatted
+                logger.warning("Degenerate output for section '%s' on attempt %d", section_name, attempt + 1)
                 log_agent_action("WriterAgent", "degenerate_section", {
                     "section": section_name,
                     "attempt": attempt + 1,

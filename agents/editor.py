@@ -6,6 +6,7 @@ Provides create_final_paper / generate_latex expected by main.py.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -21,6 +22,8 @@ from core.context import RunContext, get_active_context
 from core.contracts import ExperimentOutput, Paper, Plan, Topic
 from core.memory import memory
 from core.verification import extract_citation_ids, resolve_doi, resolve_arxiv, final_manuscript_referee
+
+logger = logging.getLogger(__name__)
 
 
 class EditorAgent:

@@ -3,11 +3,14 @@ Configuration module for the multi-agent research system.
 Handles environment variables, API keys, and system settings.
 """
 
+import logging
 import os
 from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables from project-root .env (cwd-independent)
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +43,7 @@ class Config(BaseSettings):
     llm_model_cheap: str = os.getenv("LLM_MODEL_CHEAP", "")
     llm_model_strong: str = os.getenv("LLM_MODEL_STRONG", "")
     llm_model_judge: str = os.getenv("LLM_MODEL_JUDGE", "")
+    llm_model_fallback: str = os.getenv("LLM_MODEL_FALLBACK", "")
 
     # Optional secondary judge models (comma-separated) for ensemble
     ensemble_judge_models: str = os.getenv("ENSEMBLE_JUDGE_MODELS", "")
@@ -181,6 +185,7 @@ def apply_runtime_keys(keys: dict) -> None:
         "LLM_MODEL_CHEAP": "llm_model_cheap",
         "LLM_MODEL_STRONG": "llm_model_strong",
         "LLM_MODEL_JUDGE": "llm_model_judge",
+        "LLM_MODEL_FALLBACK": "llm_model_fallback",
         "ENSEMBLE_JUDGE_MODELS": "ensemble_judge_models",
         "SEMANTIC_SCHOLAR_API_KEY": "semantic_scholar_api_key",
         "SCITE_API_KEY": "scite_api_key",
@@ -285,6 +290,7 @@ def sync_env_file(keys: dict, env_path: Optional[Path] = None) -> Path:
         "LLM_MODEL_CHEAP",
         "LLM_MODEL_STRONG",
         "LLM_MODEL_JUDGE",
+        "LLM_MODEL_FALLBACK",
         "ENSEMBLE_JUDGE_MODELS",
         "SEMANTIC_SCHOLAR_API_KEY",
         "SCITE_API_KEY",
@@ -410,8 +416,8 @@ def _auto_load_keys():
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict) and data:
                 apply_runtime_keys(data)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to auto-load keys from %s: %s", _resolve_keys_path(), e)
 
 
 _auto_load_keys()

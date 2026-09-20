@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -11,6 +12,8 @@ from core.capabilities import DEFAULT_MANIFESTS
 from core.context import RunContext, get_active_context
 from core.contracts import ExecutionArtifact, StatisticalReport, VerificationFinding
 from core.verification import verify_statistics
+
+logger = logging.getLogger(__name__)
 
 
 class VerificationAgent:

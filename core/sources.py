@@ -105,7 +105,7 @@ class SourceClient:
             cache_path.write_text(json.dumps(artifact, indent=2, default=str), encoding="utf-8")
             return artifact
         except Exception as exc:
-            logger.warning("SourceClient fetch failed for %s: %s", source, exc)
+            logger.warning("SourceClient fetch failed for %s: %s", source, exc, exc_info=True)
             return self._artifact(source, url, {}, "unavailable", [str(exc)])
 
     def fetch_text(self, source: str, url: str, *, headers: Optional[Mapping[str, str]] = None) -> SourceArtifact:

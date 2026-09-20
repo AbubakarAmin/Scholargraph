@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -13,6 +14,8 @@ import pandas as pd
 from core.capabilities import DEFAULT_MANIFESTS
 from core.contracts import DatasetArtifact, DatasetSpec
 from core.context import RunContext, get_active_context
+
+logger = logging.getLogger(__name__)
 
 
 class DataAgent:

@@ -51,10 +51,9 @@ from agents.supervisor import SupervisorAgent
 from agents.topic_hunter import ResearchSourceUnavailable, TopicHunterAgent
 from agents.writer import WriterAgent
 
-logging.basicConfig(
-    level=getattr(logging, config.log_level),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+from core.logging_config import setup_logging, attach_run_log, detach_run_log
+
+setup_logging(config.log_level)
 logger = logging.getLogger(__name__)
 
 
@@ -126,6 +125,9 @@ def save_results(state: ResearchState, output_dir: str = None):
 
 def main():
     """Run the research system from the command line."""
+    import signal
+    import atexit
+
     print("🤖 Multi-Agent AI Research System")
     print("=" * 50)
     try:
@@ -136,6 +138,19 @@ def main():
         os.makedirs("memory/vector_db", exist_ok=True)
         print("✅ Output directories created")
 
+        # Fix 10: Detect and clean stale 'running' runs from prior crashes
+        try:
+            from core.research_db import research_db
+            stale_runs = research_db.get_stale_running_runs()
+            if stale_runs:
+                print(f"⚠️  Found {len(stale_runs)} stale 'running' run(s) from prior sessions — marking as interrupted")
+                for sr in stale_runs:
+                    research_db.finish_run(sr["run_id"], "interrupted", "unknown", {
+                        "terminal_error": "Process terminated before completion",
+                    })
+        except Exception as e:
+            logger.debug("Stale run check failed: %s", e)
+
         parser = argparse.ArgumentParser(description="Run or resume a ScholarGraph research workflow")
         parser.add_argument("--resume", metavar="RUN_ID", help="resume a durable checkpoint by run id")
         parser.add_argument("--mode", choices=["full_research", "qa"], default="full_research",
@@ -145,6 +160,30 @@ def main():
         if args.mode == "qa" and not args.query:
             parser.error("--query is required when --mode=qa")
         tracker = start_run(args.resume)
+        attach_run_log(tracker.run_id)
+
+        # Fix 9: Graceful shutdown — mark run as interrupted on SIGINT/SIGTERM
+        _shutdown_marked = {"done": False}
+        def _shutdown_handler(signum, frame):
+            if _shutdown_marked["done"]:
+                return
+            _shutdown_marked["done"] = True
+            sig_name = signal.Signals(signum).name
+            logger.warning("Received %s — marking run as interrupted", sig_name)
+            try:
+                from core.research_db import research_db
+                research_db.update_run_summary(tracker.run_id, {
+                    "status": "interrupted",
+                    "terminal_error": f"Received {sig_name}",
+                })
+            except Exception:
+                pass
+            detach_run_log(tracker.run_id)
+            print(f"\n⚠️  Run interrupted by {sig_name}. State saved for resume.")
+            sys.exit(1)
+        signal.signal(signal.SIGINT, _shutdown_handler)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, _shutdown_handler)
         pipeline = ResearchPipeline(
             create_research_graph,
             create_checkpointer,
@@ -223,9 +262,12 @@ def main():
                 print(f"📊 Final average score: {average:.2f}")
             print(f"📁 All outputs saved to: {config.output_dir}")
     except Exception as exc:
-        logger.error(f"Research system failed: {exc}")
+        logger.error(f"Research system failed: {exc}", exc_info=True)
         print(f"❌ Error: {exc}")
         return 1
+    finally:
+        if tracker:
+            detach_run_log(tracker.run_id)
     return 0
 
 

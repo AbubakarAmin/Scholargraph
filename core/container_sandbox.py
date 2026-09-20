@@ -11,6 +11,7 @@ and ``core.sandbox.run_multi_seed`` so callers do not need to change.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -21,6 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import config
+
+logger = logging.getLogger(__name__)
 
 IMAGE_NAME = "scholargraph-sandbox:latest"
 

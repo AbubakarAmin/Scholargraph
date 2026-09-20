@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
@@ -14,6 +15,8 @@ from core.capabilities import DEFAULT_MANIFESTS
 from core.context import RunContext, get_active_context
 from core.contracts import AnalysisPlan, ExecutionArtifact, StatisticalReport
 from core.verification import preregister_power
+
+logger = logging.getLogger(__name__)
 
 
 class AnalysisAgent:

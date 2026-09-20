@@ -395,6 +395,7 @@ class APIGateway:
                 logger.warning(
                     "%s rate limited (429) — effective rate now %.2f req/s, sleeping %.1fs before retry %d/%d",
                     provider, bucket.current_rate() if bucket else -1, sleep_time, attempt + 1, retries + 1,
+                    exc_info=True,
                 )
                 time.sleep(sleep_time)
                 if attempt < retries:
@@ -410,6 +411,7 @@ class APIGateway:
                         logger.warning(
                             "%s transient error (attempt %d/%d): %s — retrying in %.1fs",
                             provider, attempt + 1, retries + 1, e, wait,
+                            exc_info=True,
                         )
                         time.sleep(wait)
                         continue

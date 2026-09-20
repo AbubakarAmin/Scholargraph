@@ -11,5 +11,6 @@ memory/checkpoints.sqlite
 memory/research_ledger.sqlite
 memory/vector_db/
 output/
+logs/
 *.sqlite-wal
 *.sqlite-shm

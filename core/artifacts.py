@@ -105,8 +105,7 @@ def save_results(state: ResearchState, output_dir: Optional[str] = None) -> None
             json.dump(summary, handle, indent=2)
         logger.info("Research summary saved to %s", summary_file)
     except Exception as exc:
-        logger.error("Error saving results: %s", exc)
-        print(f"Warning: Could not save results: {exc}")
+        logger.error("Error saving results: %s", exc, exc_info=True)
 
 
 def save_failure_dossier(state: ResearchState, output_dir: str) -> str:

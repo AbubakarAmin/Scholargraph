@@ -101,6 +101,9 @@ def free_port(port: int, host: str = "127.0.0.1") -> None:
 
 def main() -> None:
     from core.config import config
+    import os
+
+    os.makedirs("memory/vector_db", exist_ok=True)
 
     free_port(config.web_port, config.web_host)
     from web.app import main as run_app

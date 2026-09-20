@@ -222,7 +222,7 @@ def _hf_api_get(url: str, timeout: int = 15) -> HFResult:
             return HFResult(found=False, error="not_found")
         return HFResult(found=False, error=str(e))
     except Exception as exc:
-        logger.warning("HuggingFace API request failed: %s — %s", url, exc)
+        logger.warning("HuggingFace API request failed: %s — %s", url, exc, exc_info=True)
         return HFResult(found=False, error=str(exc))
 
 
@@ -240,7 +240,7 @@ def _hf_api_get_raw(url: str, timeout: int = 30) -> Optional[bytes]:
     try:
         return gateway.request("huggingface", _do_request)
     except Exception as exc:
-        logger.warning("HuggingFace download failed: %s — %s", url, exc)
+        logger.warning("HuggingFace download failed: %s — %s", url, exc, exc_info=True)
         return None
 
 
@@ -490,7 +490,7 @@ def download_hf_dataset(
         return result
 
     except Exception as exc:
-        logger.warning("Failed to download dataset %s: %s", dataset_id, exc)
+        logger.warning("Failed to download dataset %s: %s", dataset_id, exc, exc_info=True)
         return None
 
 

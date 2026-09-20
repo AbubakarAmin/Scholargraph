@@ -5,6 +5,7 @@ Hypothesis Debate — multi-round adversarial debate with ensemble judging + Elo
 from __future__ import annotations
 
 import json
+import logging
 import math
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from core.run_log import get_tracker
 from core.capabilities import SANDBOX_CAPABILITY_MANIFEST, check_plan_feasibility
 from core.evidence_synthesis import validate_topic_admission
 
+logger = logging.getLogger(__name__)
 
 REVIEWER_CHECKLIST = [
     "soundness",
@@ -91,7 +93,8 @@ class EloStore:
                 self.records = self._upgrade(raw)
                 if self._needs_migration(raw):
                     self._persist()
-            except Exception:
+            except Exception as e:
+                logger.warning("EloStore corrupted, resetting: %s", e)
                 self.records = {}
 
     @staticmethod
@@ -214,6 +217,8 @@ class EloStore:
             "updated_at": datetime.now().isoformat(),
         }
         self._persist()
+        logger.info("Elo updated: kind=%s score=%.1f passed=%s raw_rating=%.1f->%.1f shrunk=%.1f delta=%.1f observations=%d",
+                     kind, score, passed, ra, new_raw, shrunk, delta, observations)
         return delta
 
     def record_strategy_outcome(self, strategy: str, outcome_status: str) -> float:
@@ -252,6 +257,7 @@ class EloStore:
             "updated_at": datetime.now().isoformat(),
         }
         self._persist()
+        logger.info("Elo strategy outcome: strategy=%s outcome=%s delta=%.1f new_rating=%.1f", strategy, outcome_status, delta, shrunk)
         return delta
 
 
@@ -342,6 +348,7 @@ class ProposerAgent:
         return json.dumps(slim, default=str)[:4000] if slim else "none retrieved"
 
     def build_argument(self, topic: Dict[str, Any]) -> str:
+        logger.info("Proposer generating argument for: %s", topic.get("title", "<untitled>"))
         prior_tags = self._prior_objection_tags()
         structured_hyp = _as_dict(topic.get("structured_hypothesis"))
         prompt = f"""
@@ -390,6 +397,7 @@ Include: hypothesis, theory, evidence, novelty, methodology, expected outcomes, 
         objections: List[Dict[str, Any]],
     ) -> str:
         """Respond to EACH specific objection (not a global rebuttal)."""
+        logger.info("Proposer responding to %d objections for: %s", len(objections), topic.get("title", "<untitled>"))
         obj_text = "\n".join(
             f"- [{o.get('criterion')}] {o.get('objection')}" for o in objections
         )
@@ -440,6 +448,7 @@ class ChallengerAgent:
 
     def build_rebuttal(self, topic: Dict[str, Any], proposer_argument: str) -> str:
         """Checklist-grounded critique — attacks scientific validity, confounders, baselines, and feasibility."""
+        logger.info("Challenger generating rebuttal for: %s", topic.get("title", "<untitled>"))
         rating = float(topic.get("elo_rating", EloStore(context=self.context).get(hypothesis_kind(topic.get("title", "")))))
         kind = topic.get("hypothesis_kind") or hypothesis_kind(topic.get("title", ""))
         history_note = (
@@ -514,8 +523,14 @@ Return JSON:
             temperature=0.5,
             tier="strong",
             attempts=2,
+            max_tokens=16384,
             call_fn=_rebuttal_call,
         )
+        # Fallback: if structured parse failed, try raw JSON extraction on the
+        # last LLM response (reasoning models often emit valid JSON after
+        # chain-of-thought that call_llm_json's stricter path misses).
+        if parsed is None and raw:
+            parsed = parse_json_from_llm(raw)
         parsed = _normalize_objection_payload(parsed)
         raw_objections = parsed.get("objections")
         if isinstance(raw_objections, list) and len(raw_objections) > 0:
@@ -621,6 +636,8 @@ Return JSON:
         prior_objections: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Track objections across rounds with invariant: no objection may silently disappear."""
+        logger.info("Challenger evaluating followup objections for: %s (%d prior objections)",
+                     topic.get("title", "<untitled>"), len(prior_objections))
         prompt = f"""
 Given the proposer's point-by-point responses, evaluate each prior objection.
 Prior objections:
@@ -707,6 +724,9 @@ class ModeratorAgent:
         objections: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Ensemble judge: hard deterministic gates dominate; soft scores cannot rescue hard fails."""
+        logger.info("Moderator evaluating debate for: %s (%d rounds, %d unresolved objections)",
+                     topic.get("title", "<untitled>"), len(rounds),
+                     len([o for o in objections if isinstance(o, dict) and o.get("status") != "resolved"]))
         models = self._judge_models()
         scores: List[float] = []
         reasonings: List[str] = []
@@ -782,6 +802,9 @@ JSON: {{"score": 7.5, "passed": true, "reasoning": "...", "decision": "PASS|FAIL
         # Key rule: soft score cannot override hard FAIL
         passed = all_hard_passed and agreed and (mean >= self.runtime_config.debate_pass_threshold)
 
+        logger.info("Moderator decision: score=%.2f passed=%s disagreement=%.2f hard_gates=%s judge_responses=%d",
+                     mean, passed, disagreement, all_hard_passed, valid_judge_responses)
+
         return {
             "score": mean,
             "passed": passed,
@@ -818,10 +841,14 @@ class HypothesisDebateSystem:
         self.elo = EloStore(context=context)
 
     def conduct_debate(self, topic: Dict[str, Any]) -> DebateResult:
-        log_agent_action("HypothesisDebate", "start", {"topic": topic.get("title")})
+        title = topic.get("title", "<untitled>")
+        logger.info("=== Debate start: %s ===", title)
+        log_agent_action("HypothesisDebate", "start", {"topic": title})
         rounds: List[Dict[str, Any]] = []
         argument = self.proposer.build_argument(topic)
+        logger.info("Round 1 proposer argument generated (%d chars)", len(argument))
         rebuttal = self.challenger.build_rebuttal(topic, argument)
+        logger.info("Round 1 challenger rebuttal generated (%d chars)", len(rebuttal))
         objections = getattr(self.challenger, "_last_objections", []) or [
             {"criterion": "soundness", "objection": rebuttal[:500], "severity": 3, "status": "unresolved"}
         ]
@@ -838,10 +865,21 @@ class HypothesisDebateSystem:
         current_objections = objections
         final = None
 
+        # Skip additional rounds when challenger output was invalid — the
+        # round-2 proposer response and challenger followup would be against
+        # a garbled round-1, producing uninformative results.
+        if getattr(self.challenger, "_challenger_invalid", False):
+            logger.info("Challenger invalid in round 1 — skipping additional rounds")
+            max_r = 1
+
         for r in range(2, max_r + 1):
+            logger.info("Round %d: proposer responding to objections", r)
             response = self.proposer.respond_to_objections(topic, argument, current_objections)
+            logger.info("Round %d: challenger evaluating followup objections", r)
             current_objections = self.challenger.followup_objections(topic, response, current_objections)
             current_objections = _ensure_objections_are_dicts(current_objections)
+            unresolved_now_r = [o for o in current_objections if isinstance(o, dict) and o.get("status") != "resolved"]
+            logger.info("Round %d complete: %d unresolved objections remaining", r, len(unresolved_now_r))
             rounds.append({
                 "round": r,
                 "proposer": response,
@@ -858,6 +896,7 @@ class HypothesisDebateSystem:
             ]
             # Early stop after min rounds if no severe unresolved
             if r >= min_r and not any(_coerce_int(u.get("severity"), 0) >= 3 for u in unresolved_now):
+                logger.info("Round %d: early stop — no severe unresolved objections", r)
                 break
 
             # Ensemble disagreement can force another round
@@ -865,13 +904,18 @@ class HypothesisDebateSystem:
                 mid = self.moderator.evaluate_debate(topic, rounds, current_objections)
                 if not mid.get("needs_longer_debate"):
                     final = mid
+                    logger.info("Round %d: moderator accepted result (no longer debate needed)", r)
                     break
+                else:
+                    logger.info("Round %d: moderator requests longer debate (disagreement=%.2f)", r, mid.get("disagreement", 0))
         else:
             final = None
 
         if not final:
+            logger.info("Running final moderator evaluation after %d rounds", len(rounds))
             final = self.moderator.evaluate_debate(topic, rounds, current_objections)
             if final.get("needs_longer_debate") and len(rounds) < max_r:
+                logger.info("Moderator still wants longer debate; running extra round")
                 response = self.proposer.respond_to_objections(topic, argument, current_objections)
                 current_objections = self.challenger.followup_objections(topic, response, current_objections)
                 current_objections = _ensure_objections_are_dicts(current_objections)
@@ -879,6 +923,7 @@ class HypothesisDebateSystem:
                 final = self.moderator.evaluate_debate(topic, rounds, current_objections)
 
         if getattr(self.challenger, "_challenger_invalid", False):
+            logger.warning("Challenger output was invalid; capping score and forcing FAIL")
             final = {
                 **(final or {}),
                 "score": min(float((final or {}).get("score", 5.0)), 4.0),
@@ -891,7 +936,12 @@ class HypothesisDebateSystem:
             o for o in current_objections
             if isinstance(o, dict) and o.get("status") != "resolved"
         ]
-        delta = self.elo.update(topic.get("title", "general"), final["score"], final["passed"])
+        # Skip Elo updates when debate failed on infrastructure (garbled
+        # challenger) — the outcome is uninformative about hypothesis quality.
+        if getattr(self.challenger, "_challenger_invalid", False):
+            delta = 0.0
+        else:
+            delta = self.elo.update(topic.get("title", "general"), final["score"], final["passed"])
         # Feature 8: record seed-strategy outcome alongside kind-Elo
         # NOTE: outcome_status here is debate-derived (argument quality), NOT
         # experiment-derived. kind-Elo uses the same semantics — there is no
@@ -918,6 +968,9 @@ class HypothesisDebateSystem:
             ensemble_scores=final.get("ensemble_scores") or [],
             elo_delta=delta,
         )
+        logger.info("=== Debate complete: %s | score=%.2f | decision=%s | rounds=%d | elo_delta=%.1f | unresolved=%d ===",
+                     result.topic, result.score, result.moderator_decision,
+                     len(rounds), result.elo_delta, len(unresolved_now))
         (self.context.memory if self.context else memory).add_debate_entry(
             result.topic,
             result.proposer_argument[:2000],
@@ -968,6 +1021,7 @@ class HypothesisDebateSystem:
         repairable = {"baseline", "confounder", "evaluation", "statistical", "feasibility", "falsifiability", "soundness"}
         if not any(str(item.get("criterion")) in repairable for item in unresolved):
             return None
+        logger.info("Attempting contract repair for '%s' (%d repairable objections)", topic.get("title", "<untitled>"), len(unresolved))
         current = _as_dict(topic.get("structured_hypothesis"))
         if not current:
             return None
@@ -1019,16 +1073,22 @@ Hard requirements:
 
     def conduct_with_repair(self, topic: Dict[str, Any]) -> List[DebateResult]:
         """Debate once, then allow exactly one contract repair and re-debate."""
+        title = topic.get("title", "<untitled>")
+        logger.info("conduct_with_repair: initial debate for '%s'", title)
         first = self.conduct_debate(topic)
         if first.passed:
+            logger.info("conduct_with_repair: '%s' passed on first attempt", title)
             return [first]
+        logger.info("conduct_with_repair: '%s' failed, attempting contract repair", title)
         revised = self.revise_topic_from_objections(topic, first)
         if not revised:
+            logger.info("conduct_with_repair: repair failed for '%s', returning original result", title)
             return [first]
         # Preserve the candidate object's identity: the tournament/workflow
         # selects from its original topic list after this method returns.
         topic.clear()
         topic.update(revised)
+        logger.info("conduct_with_repair: re-debating revised topic '%s'", revised.get("title", "<untitled>"))
         second = self.conduct_debate(revised)
         return [first, second]
 
@@ -1039,15 +1099,19 @@ Hard requirements:
         debated once a hypothesis clears the bar — Planning should receive the
         accepted result without wasting LLM calls or re-debating failed topics.
         """
+        logger.info("=== Tournament start: %d candidates ===", len(topics))
         results: List[DebateResult] = []
         debated_titles = set()
-        for topic in topics:
+        for i, topic in enumerate(topics, 1):
             title = (topic.get("title") or "").strip()
             if not title or title.lower() in debated_titles:
                 continue
             debated_titles.add(title.lower())
+            logger.info("Tournament matchup %d/%d: '%s'", i, len(topics), title)
             attempts = self.conduct_with_repair(topic)
             results.extend(attempts)
             if attempts[-1].passed:
+                logger.info("Tournament winner found: '%s' (score=%.2f)", title, attempts[-1].score)
                 return sorted(results, key=lambda item: (item.passed, item.score), reverse=True)
+        logger.info("Tournament complete: no candidate passed (%d total results)", len(results))
         return sorted(results, key=lambda item: (item.passed, item.score), reverse=True)

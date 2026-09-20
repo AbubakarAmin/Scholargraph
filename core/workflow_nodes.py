@@ -39,6 +39,7 @@ def _create_agent(agent_class):
 
 
 def topic_discovery_node(state: ResearchState) -> ResearchState:
+    logger.info(f"Topic discovery starting at iteration {state['iteration']}")
     log_agent_action("Orchestrator", "start_topic_discovery", {"iteration": state["iteration"]})
     tracker = get_tracker()
     if tracker:
@@ -48,11 +49,13 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
         if topics:
             state["topics"] = topics
             state["current_phase"] = "hypothesis_debate"
+            logger.info(f"Topic discovery found {len(topics)} topic(s): {[topic['title'] for topic in topics[:3]]}")
             log_agent_action("Orchestrator", "topics_discovered", {"count": len(topics), "iteration": state["iteration"], "topics": [topic["title"] for topic in topics[:3]]})
         elif state["iteration"] >= 5:
             # Exhausting discovery is a failed research run, not a successful
             # completion.  Preserve that distinction so the artifact layer
             # writes a failure dossier rather than an empty normal summary.
+            logger.warning("No viable topic found after multiple attempts")
             message = "No viable, evidence-supported, sandbox-executable topic was discovered after multiple attempts"
             state["current_phase"] = "complete"
             state["should_continue"] = False
@@ -74,11 +77,12 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
         else:
             state["should_reset"] = True
             state["meta_feedback"].append("No topics discovered - resetting")
+            logger.warning(f"No topics discovered at iteration {state['iteration']}")
             log_agent_action("Orchestrator", "no_topics_found", {"iteration": state["iteration"]})
         return state
     except ResearchSourceUnavailable as exc:
         message = str(exc)
-        logger.warning(message)
+        logger.warning(f"Research sources unavailable: {message}")
         state["terminal_error"] = message
         state["meta_feedback"].append(message)
         state["current_phase"] = "complete"
@@ -86,7 +90,7 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
         log_agent_action("Orchestrator", "research_sources_unavailable", {"message": message})
         return state
     except Exception as exc:
-        logger.error(f"Topic discovery failed: {exc}")
+        logger.error(f"Topic discovery failed: {exc}", exc_info=True)
         if state["iteration"] >= 5:
             state["current_phase"] = "complete"
             state["meta_feedback"].append(f"Topic discovery failed after multiple attempts: {exc}")
@@ -97,6 +101,7 @@ def topic_discovery_node(state: ResearchState) -> ResearchState:
 
 
 def hypothesis_debate_node(state: ResearchState) -> ResearchState:
+    logger.info(f"Hypothesis debate starting with {len(state['topics'])} topic(s)")
     log_agent_action("Orchestrator", "start_hypothesis_debate", {"topics_remaining": len(state["topics"])})
     tracker = get_tracker()
     if tracker:
@@ -124,8 +129,10 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
         topics_tried = 0
         debater = _create_agent(HypothesisDebateSystem)
         if len(state["topics"]) >= 3 and hasattr(debater, "conduct_tournament"):
+            logger.info(f"Running tournament debate with {len(state['topics'])} topics")
             tournament_results = debater.conduct_tournament(state["topics"], rounds=1)
             state["debate_results"].extend(tournament_results)
+            logger.info(f"Tournament completed: {len(tournament_results)} result(s)")
             winner = next((result for result in tournament_results if result.passed), None)
             if winner:
                 state["selected_topic"] = next(
@@ -152,6 +159,7 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
             current_topic = state["topics"][0]
             state["selected_topic"] = current_topic
             topics_tried += 1
+            logger.info(f"Trying topic {topics_tried}: {current_topic['title']} ({len(state['topics'])} remaining)")
             log_agent_action("Orchestrator", "trying_topic", {"topic": current_topic["title"], "attempt": topics_tried, "topics_remaining": len(state["topics"])})
             # Both tournament and serial discovery use the same bounded
             # repair protocol.  Without this branch, a run with one or two
@@ -163,6 +171,7 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
             )
             state["debate_results"].extend(attempts)
             result = attempts[-1]
+            logger.info(f"Debate result for '{current_topic['title']}': passed={result.passed}, score={getattr(result, 'score', None)}")
             if result.passed:
                 state["hypothesis_passed"] = True
                 state["current_phase"] = "planning"
@@ -183,11 +192,12 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
             log_agent_action("Orchestrator", "topic_failed", {"topic": current_topic["title"], "topics_remaining": len(state["topics"])})
         state["should_reset"] = True
         state["meta_feedback"].append(f"All {topics_tried} topics failed hypothesis debate")
+        logger.warning(f"All {topics_tried} topics failed hypothesis debate")
         log_agent_action("Orchestrator", "all_topics_failed", {"topics_tried": topics_tried})
         return state
     except Exception as exc:
         message = f"Hypothesis debate subsystem crashed: {exc}"
-        logger.error(message)
+        logger.error(message, exc_info=True)
         state["meta_feedback"].append(message)
         state["terminal_error"] = message
         state["technical_failures"] = {
@@ -210,6 +220,7 @@ def hypothesis_debate_node(state: ResearchState) -> ResearchState:
 
 
 def planning_node(state: ResearchState) -> ResearchState:
+    logger.info("Planning starting")
     log_agent_action("Orchestrator", "start_planning", {})
     tracker = get_tracker()
     if tracker:
@@ -233,6 +244,7 @@ def planning_node(state: ResearchState) -> ResearchState:
             plan = planner.create_plan(state["selected_topic"])
 
         experiments = (plan or {}).get("experiments", [])
+        logger.info(f"Plan created with {len(plan.get('sections', []))} sections, {len(experiments)} experiment(s)")
         plan_errors = validate_experiments(experiments)
         if plan_errors:
             message = "; ".join(plan_errors)
@@ -277,7 +289,7 @@ def planning_node(state: ResearchState) -> ResearchState:
         log_agent_action("Orchestrator", "plan_created", {"sections": len(plan.get("sections", []))})
         return state
     except Exception as exc:
-        logger.error(f"Planning failed: {exc}")
+        logger.error(f"Planning failed: {exc}", exc_info=True)
         err_msg = f"Planning failed: {exc}"
         state["terminal_error"] = state.get("terminal_error") or err_msg
         state["meta_feedback"].append(err_msg)
@@ -289,6 +301,7 @@ def planning_node(state: ResearchState) -> ResearchState:
 
 def data_validation_node(state: ResearchState) -> ResearchState:
     """Validate an explicitly requested dataset before experiments begin."""
+    logger.info("Data validation starting")
     log_agent_action("Orchestrator", "start_data_validation", {})
     tracker = get_tracker()
     if tracker:
@@ -307,6 +320,7 @@ def data_validation_node(state: ResearchState) -> ResearchState:
         plan = state.get("plan") or {}
         dataset_path = plan.get("dataset_path") or plan.get("dataset_file")
         if not dataset_path:
+            logger.info("No external dataset requested; using synthetic data")
             state["data_validation"] = {
                 "passed": True,
                 "score": 10.0,
@@ -324,6 +338,7 @@ def data_validation_node(state: ResearchState) -> ResearchState:
         key = artifact.get("spec", {}).get("name") or Path(dataset_path).name
         state["data_artifacts"][key] = artifact
         state["data_validation"] = artifact.get("validation", {})
+        logger.info(f"Dataset validation for '{dataset_path}': passed={state['data_validation'].get('passed')}")
         if not state["data_validation"].get("passed"):
             state["terminal_error"] = "Dataset validation failed"
             state["meta_feedback"].append(json.dumps(state["data_validation"]))
@@ -333,7 +348,7 @@ def data_validation_node(state: ResearchState) -> ResearchState:
         state["current_phase"] = "writing_narrative"
         return state
     except Exception as exc:
-        logger.error(f"Data validation failed: {exc}")
+        logger.error(f"Data validation failed: {exc}", exc_info=True)
         state["terminal_error"] = f"Data validation failed: {exc}"
         state["current_phase"] = "complete"
         state["should_continue"] = False
@@ -420,6 +435,7 @@ def editor_repair_route(error_message: str, repair_count: int, max_repairs: int 
 
 
 def write_narrative_sections(state: ResearchState) -> ResearchState:
+    logger.info("Narrative writing starting")
     log_agent_action("Orchestrator", "start_writing_narrative", {})
     tracker = get_tracker()
     if tracker:
@@ -447,6 +463,7 @@ def write_narrative_sections(state: ResearchState) -> ResearchState:
             if section_name.lower() not in NARRATIVE_SECTION_NAMES:
                 continue
             if section_name not in state["draft_sections"]:
+                logger.info(f"Drafting narrative section: {section_name}")
                 state["draft_sections"][section_name] = writer.draft_section(
                     section_name, state["selected_topic"], state["plan"], {}
                 )
@@ -469,6 +486,7 @@ def write_narrative_sections(state: ResearchState) -> ResearchState:
             )
             if not revision_feedback:
                 continue
+            logger.info(f"Revising narrative section '{section_name}' with feedback (prior score: {score})")
             state["draft_sections"][section_name] = writer.draft_section(
                 section_name,
                 state["selected_topic"],
@@ -486,7 +504,7 @@ def write_narrative_sections(state: ResearchState) -> ResearchState:
         state["current_phase"] = "engineering"
         return state
     except Exception as exc:
-        logger.error(f"Writing failed: {exc}")
+        logger.error(f"Writing failed: {exc}", exc_info=True)
         state["meta_feedback"].append(f"Writing error: {exc}")
         state["error_count"] += 1
         if state["error_count"] >= 3:
@@ -498,6 +516,7 @@ def write_narrative_sections(state: ResearchState) -> ResearchState:
 
 
 def write_results_sections(state: ResearchState) -> ResearchState:
+    logger.info("Results writing starting")
     log_agent_action("Orchestrator", "start_writing_results", {})
     tracker = get_tracker()
     if tracker:
@@ -520,6 +539,7 @@ def write_results_sections(state: ResearchState) -> ResearchState:
                 names.append(required)
         for section_name in names:
             if section_name.lower() in RESULTS_SECTION_NAMES:
+                logger.info(f"Drafting results section: {section_name}")
                 state["draft_sections"][section_name] = writer.draft_section(section_name, state["selected_topic"], state["plan"], state["engineer_outputs"])
                 state["current_section"] = section_name
         checked = {}
@@ -555,6 +575,7 @@ def write_results_sections(state: ResearchState) -> ResearchState:
                     },
                 )
         failures = {name: result for name, result in checked.items() if not result["passed"]}
+        logger.info(f"Numeric verification: {len(checked)} section(s) checked, {len(failures)} failure(s)")
         state["results_verification"] = checked
         hard_failures = {
             name: result for name, result in failures.items()
@@ -574,6 +595,7 @@ def write_results_sections(state: ResearchState) -> ResearchState:
             state["should_continue"] = False
             return state
         if failures and state["results_redraft_count"] < 2:
+            logger.warning(f"Results redraft needed for section(s): {list(failures.keys())}")
             state["results_redraft_count"] += 1
             # Targeted artifact repair: re-draft only the failing sections and
             # feed their specific check failures back into the writer prompt.
@@ -602,13 +624,14 @@ def write_results_sections(state: ResearchState) -> ResearchState:
         state["current_phase"] = "supervision"
         return state
     except Exception as exc:
-        logger.error(f"Results writing failed: {exc}")
+        logger.error(f"Results writing failed: {exc}", exc_info=True)
         state["meta_feedback"].append(f"Results writing error: {exc}")
         state["current_phase"] = "supervision"
         return state
 
 
 def engineering_node(state: ResearchState) -> ResearchState:
+    logger.info("Engineering starting")
     log_agent_action("Orchestrator", "start_engineering", {})
     tracker = get_tracker()
     if tracker:
@@ -633,9 +656,10 @@ def engineering_node(state: ResearchState) -> ResearchState:
             # Defensive contract alignment: LLM aliases like experiment_name → name
             experiments = PlannerAgent._normalize_experiments(experiments)
             state["plan"]["experiments"] = experiments
-        plan_errors = validate_experiments(experiments)
-        plan_errors.extend(validate_dataset_identity(experiments, state.get("data_artifacts")))
-        if plan_errors:
+            plan_errors = validate_experiments(experiments)
+            plan_errors.extend(validate_dataset_identity(experiments, state.get("data_artifacts")))
+            if plan_errors:
+                logger.warning(f"Engineering found plan schema errors: {'; '.join(plan_errors)}")
             message = "; ".join(plan_errors)
             attempts = int((state.get("plan") or {}).get("schema_revision_attempts") or 0)
             if attempts >= 2:
@@ -676,6 +700,7 @@ def engineering_node(state: ResearchState) -> ResearchState:
             return state
         for experiment in experiments:
             name = experiment["name"]
+            logger.info(f"Processing experiment: {name}")
             contract = build_contract(experiment)
             prior_contract = state["experiment_contracts"].get(name)
             if prior_contract and prior_contract.get("contract_hash") != contract.get("contract_hash"):
@@ -696,6 +721,7 @@ def engineering_node(state: ResearchState) -> ResearchState:
         method_text = "\n".join(state["draft_sections"].get(section, "") for section in ("Methods", "Method", "Experiments"))
         branch_winner_name = None
         if experiments and any(isinstance(item, dict) and (item.get("variants") or item.get("alternatives")) for item in experiments):
+            logger.info("Running branching search for variant experiments")
             try:
                 if tracker:
                     tracker.message("Engineering: branching cheap probes…")
@@ -708,7 +734,7 @@ def engineering_node(state: ResearchState) -> ResearchState:
                 if winner and winner not in state["engineer_outputs"]:
                     state["engineer_outputs"][winner] = branched
             except Exception as exc:
-                logger.error(f"Branching search failed: {exc}")
+                logger.error(f"Branching search failed: {exc}", exc_info=True)
                 if tracker:
                     tracker.message(f"Branching search failed: {exc}", level="error")
         for experiment in experiments:
@@ -726,7 +752,7 @@ def engineering_node(state: ResearchState) -> ResearchState:
                 state["engineer_outputs"][exp_name]["contract_hash"] = state["experiment_contracts"][exp_name]["contract_hash"]
                 log_agent_action("Orchestrator", "experiment_run", {"experiment": exp_name})
             except Exception as exc:
-                logger.error(f"Experiment {exp_name} failed: {exc}")
+                logger.error(f"Experiment {exp_name} failed: {exc}", exc_info=True)
                 state["engineer_outputs"][exp_name] = {
                     "success": False,
                     "error": str(exc),
@@ -740,6 +766,7 @@ def engineering_node(state: ResearchState) -> ResearchState:
             state.get("experiment_contracts"),
         )
         state["evidence_gate"] = gate
+        logger.info(f"Engineering gate result: allowed={gate.get('allowed')}, reason={gate.get('reason_code')}")
         requests = engineer.consume_plan_revision_requests()
         if not gate.get("allowed"):
             state["technical_failures"] = {
@@ -793,7 +820,7 @@ def engineering_node(state: ResearchState) -> ResearchState:
         state["current_phase"] = "writing_results"
         return state
     except Exception as exc:
-        logger.error(f"Engineering failed: {exc}")
+        logger.error(f"Engineering failed: {exc}", exc_info=True)
         state["meta_feedback"].append(f"Engineering error: {exc}")
         state["error_count"] += 1
         if state["error_count"] >= 3:
@@ -806,6 +833,7 @@ def engineering_node(state: ResearchState) -> ResearchState:
 
 def independent_validation_node(state: ResearchState) -> ResearchState:
     """Replay engineer code, analyze outputs, and record independent findings."""
+    logger.info("Independent validation starting")
     log_agent_action("Orchestrator", "start_independent_validation", {})
     tracker = get_tracker()
     if tracker:
@@ -830,6 +858,7 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
             for name, output in state.get("engineer_outputs", {}).items()
             if output.get("success") and output.get("code")
         }
+        logger.info(f"Validating {len(code_artifacts)} code artifact(s): {list(code_artifacts.keys())}")
         if not code_artifacts:
             message = "Independent validation failed: no executable code artifacts"
             state["terminal_error"] = state.get("terminal_error") or message
@@ -878,6 +907,8 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
             state["execution_artifacts"],
             reports_by_experiment,
         )
+        blocking_count = sum(1 for f in state["verification_findings"] if f.get("blocking"))
+        logger.info(f"Verification complete: {len(state['verification_findings'])} finding(s), {blocking_count} blocking")
         if any(finding.get("blocking") for finding in state["verification_findings"]):
             message = "Independent validation produced blocking findings"
             state["terminal_error"] = state.get("terminal_error") or message
@@ -894,7 +925,7 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
         state["current_phase"] = "writing_results"
         return state
     except Exception as exc:
-        logger.error(f"Independent validation failed: {exc}")
+        logger.error(f"Independent validation failed: {exc}", exc_info=True)
         state["verification_findings"].append({
             "finding_id": "independent_validation:error",
             "severity": "error",
@@ -909,6 +940,7 @@ def independent_validation_node(state: ResearchState) -> ResearchState:
         state["should_continue"] = False
         return state
 def supervision_node(state: ResearchState) -> ResearchState:
+    logger.info("Supervision starting")
     log_agent_action("Orchestrator", "start_supervision", {})
     tracker = get_tracker()
     if tracker:
@@ -927,6 +959,7 @@ def supervision_node(state: ResearchState) -> ResearchState:
                 engineer_outputs=state.get("engineer_outputs"),
                 content_requirements=section_requirements.get(section_name.lower()),
             )
+            logger.info(f"Section '{section_name}' score: {score}")
             state["supervisor_scores"][section_name] = score
             state["supervisor_feedback"][section_name] = feedback
             if score < config.supervisor_threshold and get_tracker():
@@ -945,19 +978,21 @@ def supervision_node(state: ResearchState) -> ResearchState:
             })
         elif state["supervisor_scores"]:
             overall_score = sum(state["supervisor_scores"].values()) / len(state["supervisor_scores"])
+            logger.info(f"Overall supervision score: {overall_score:.2f} (threshold: {config.supervisor_threshold})")
             state["current_phase"] = "editing" if overall_score >= config.supervisor_threshold else "meta_evaluation"
             log_agent_action("Orchestrator", "quality_threshold_met" if overall_score >= config.supervisor_threshold else "quality_below_threshold", {"score": overall_score})
         else:
             state["current_phase"] = "meta_evaluation"
         return state
     except Exception as exc:
-        logger.error(f"Supervision failed: {exc}")
+        logger.error(f"Supervision failed: {exc}", exc_info=True)
         state["meta_feedback"].append(f"Supervision error: {exc}")
         state["current_phase"] = "meta_evaluation"
         return state
 
 
 def meta_evaluation_node(state: ResearchState) -> ResearchState:
+    logger.info("Meta evaluation starting")
     log_agent_action("Orchestrator", "start_meta_evaluation", {})
     tracker = get_tracker()
     if tracker:
@@ -972,18 +1007,21 @@ def meta_evaluation_node(state: ResearchState) -> ResearchState:
         state["meta_feedback"].append(agent.evaluate_system_performance(state))
         if agent.should_reset(state):
             state["should_reset"] = True
+            logger.info(f"Meta decision: reset at iteration {state['iteration']}")
             log_agent_action("Orchestrator", "meta_reset_triggered", {"iteration": state["iteration"]})
         elif agent.should_continue(state):
             state["should_continue"] = True
             state["iteration"] += 1
             state["current_phase"] = "writing_narrative"
+            logger.info(f"Meta decision: continue, new iteration {state['iteration']}")
             log_agent_action("Orchestrator", "meta_continue_triggered", {"iteration": state["iteration"]})
         else:
             state["should_continue"] = False
+            logger.info(f"Meta decision: stop at iteration {state['iteration']}")
             log_agent_action("Orchestrator", "meta_stop_triggered", {"iteration": state["iteration"]})
         return state
     except Exception as exc:
-        logger.error(f"Meta evaluation failed: {exc}")
+        logger.error(f"Meta evaluation failed: {exc}", exc_info=True)
         state["meta_feedback"].append(f"Meta evaluation error: {exc}")
         state["terminal_error"] = f"Meta evaluation failed: {exc}"
         state["should_continue"] = False
@@ -993,6 +1031,7 @@ def meta_evaluation_node(state: ResearchState) -> ResearchState:
 
 
 def editing_node(state: ResearchState) -> ResearchState:
+    logger.info("Editing starting")
     log_agent_action("Orchestrator", "start_editing", {})
     tracker = get_tracker()
     if tracker:
@@ -1005,7 +1044,9 @@ def editing_node(state: ResearchState) -> ResearchState:
         editor = _create_agent(EditorAgent)
         final_paper = editor.create_final_paper(state["selected_topic"], state["draft_sections"], state["plan"], state["engineer_outputs"], debate_results=state.get("debate_results"))
         state["final_paper"] = final_paper
+        logger.info(f"Final paper created: {len(final_paper)} chars")
         state["latex_output"] = editor.generate_latex(final_paper)
+        logger.info(f"LaTeX generated: {len(state['latex_output'])} chars")
         state["current_phase"] = "complete"
         log_agent_action("Orchestrator", "editing_complete", {})
         return state
@@ -1029,14 +1070,14 @@ def editing_node(state: ResearchState) -> ResearchState:
             })
             return state
         message = f"Editing failed terminally: {exc}"
-        logger.error(message)
+        logger.error(message, exc_info=True)
         state["meta_feedback"].append(message)
         state["terminal_error"] = state.get("terminal_error") or message
         state["current_phase"] = "complete"
         state["should_continue"] = False
         return state
     except Exception as exc:
-        logger.error(f"Editing failed: {exc}")
+        logger.error(f"Editing failed: {exc}", exc_info=True)
         state["meta_feedback"].append(f"Editing error: {exc}")
         state["current_phase"] = "complete"
         return state
@@ -1049,6 +1090,7 @@ def editing_node(state: ResearchState) -> ResearchState:
 
 def qa_literature_retrieval_node(state: ResearchState) -> ResearchState:
     """Retrieve literature for the user query using TopicHunter's shared retrieval."""
+    logger.info(f"QA literature retrieval starting for query: '{state.get('user_query', '')[:100]}'")
     log_agent_action("Orchestrator", "qa_literature_retrieval", {"query": state.get("user_query")})
     tracker = get_tracker()
     if tracker:
@@ -1069,6 +1111,7 @@ def qa_literature_retrieval_node(state: ResearchState) -> ResearchState:
             return state
         state["literature_context"] = lit
         state["current_phase"] = "qa_answer"
+        logger.info(f"QA retrieval complete: {len(lit.get('papers', []))} paper(s) found")
         log_agent_action("Orchestrator", "qa_literature_retrieved", {"paper_count": len(lit.get("papers", []))})
         return state
     except ResearchSourceUnavailable as exc:
@@ -1078,7 +1121,7 @@ def qa_literature_retrieval_node(state: ResearchState) -> ResearchState:
         log_agent_action("Orchestrator", "qa_research_sources_unavailable", {"message": str(exc)})
         return state
     except Exception as exc:
-        logger.error(f"QA literature retrieval failed: {exc}")
+        logger.error(f"QA literature retrieval failed: {exc}", exc_info=True)
         state["terminal_error"] = f"QA literature retrieval failed: {exc}"
         state["current_phase"] = "complete"
         state["should_continue"] = False
@@ -1087,6 +1130,7 @@ def qa_literature_retrieval_node(state: ResearchState) -> ResearchState:
 
 def qa_answer_node(state: ResearchState) -> ResearchState:
     """Produce a citation-backed synthesis answer from retrieved literature."""
+    logger.info("QA answer generation starting")
     log_agent_action("Orchestrator", "qa_answer", {})
     tracker = get_tracker()
     if tracker:
@@ -1159,6 +1203,7 @@ Return JSON:
             "query": query,
         }
         state["qa_citation_verification"] = citation_verification
+        logger.info(f"QA citation verification: passed={citation_verification.get('passed')}, score={citation_verification.get('score')}")
         if not citation_verification.get("passed"):
             state["meta_feedback"].append(
                 f"QA citation verification failed: {citation_verification.get('note', 'unknown')}"
@@ -1171,7 +1216,7 @@ Return JSON:
         })
         return state
     except Exception as exc:
-        logger.error(f"QA answer generation failed: {exc}")
+        logger.error(f"QA answer generation failed: {exc}", exc_info=True)
         state["terminal_error"] = f"QA answer generation failed: {exc}"
         state["current_phase"] = "complete"
         state["should_continue"] = False
@@ -1180,6 +1225,7 @@ Return JSON:
 
 def qa_verification_node(state: ResearchState) -> ResearchState:
     """Verify QA answer quality, citation integrity, and finalize the run."""
+    logger.info("QA verification starting")
     log_agent_action("Orchestrator", "qa_verification", {})
     tracker = get_tracker()
     if tracker:
@@ -1211,6 +1257,7 @@ def qa_verification_node(state: ResearchState) -> ResearchState:
             failed_count = len(citation_verification.get("failed", []))
             issues.append(f"Citation verification issues: score={score:.1f}, {failed_count} unresolved")
         if issues:
+            logger.warning(f"QA verification found {len(issues)} issue(s): {'; '.join(issues)}")
             state["meta_feedback"].append(f"QA verification notes: {'; '.join(issues)}")
         else:
             state["meta_feedback"].append("QA verification passed: answer, findings, bibliography, and citations all valid")
@@ -1224,7 +1271,7 @@ def qa_verification_node(state: ResearchState) -> ResearchState:
         })
         return state
     except Exception as exc:
-        logger.error(f"QA verification failed: {exc}")
+        logger.error(f"QA verification failed: {exc}", exc_info=True)
         state["meta_feedback"].append(f"QA verification error: {exc}")
         state["current_phase"] = "complete"
         state["should_continue"] = False

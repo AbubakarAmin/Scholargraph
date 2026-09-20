@@ -28,7 +28,7 @@ class ResearchMemory:
 
     def __init__(self):
         self.vector_db_path = Path(config.vector_db_path)
-        self.vector_db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.vector_db_path.mkdir(parents=True, exist_ok=True)
 
         self.dimension = config.embedding_dimension
         self.index = faiss.IndexFlatL2(self.dimension)
@@ -77,11 +77,12 @@ class ResearchMemory:
                     self.feedback_log = json.load(f)
 
         except Exception as e:
-            print(f"Warning: Could not load existing memory data: {e}")
+            logger.warning("Could not load existing memory data: %s", e, exc_info=True)
 
     def save(self):
         """Save all memory data to disk."""
         try:
+            self.vector_db_path.mkdir(parents=True, exist_ok=True)
             faiss.write_index(self.index, str(self.vector_db_path / "index.faiss"))
 
             with open(self.vector_db_path / "metadata.pkl", "wb") as f:
@@ -94,7 +95,7 @@ class ResearchMemory:
                 json.dump(self.feedback_log, f, indent=2)
 
         except Exception as e:
-            print(f"Error saving memory data: {e}")
+            logger.error("Failed to save memory data: %s", e, exc_info=True)
 
     @staticmethod
     def _active_run_defaults() -> Dict[str, Any]:
@@ -293,6 +294,13 @@ class ResearchMemory:
             "score": score,
         }
         self.debate_log.append(self._normalize_metadata(entry))
+        # Write debate log immediately (not deferred to save()) so that
+        # debate_log.json is always present even if the process crashes.
+        try:
+            with open(config.debate_log_path, "w", encoding="utf-8") as f:
+                json.dump(self.debate_log, f, indent=2)
+        except Exception as e:
+            logger.warning("Failed to write debate_log.json immediately: %s", e)
         self.save()
 
     def add_feedback_entry(

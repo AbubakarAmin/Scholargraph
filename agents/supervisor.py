@@ -6,6 +6,7 @@ Citation grounding + statistical validity gate soft scores.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,8 @@ from core.verification import hard_verify_section, verify_citations, classify_cl
 from core.run_log import get_tracker
 from core.research_db import research_db
 from core.contracts import ExperimentOutput, VerificationReport
+
+logger = logging.getLogger(__name__)
 
 
 REVIEW_CHECKLIST = (
@@ -55,6 +58,7 @@ class SupervisorAgent:
         engineer_outputs: Optional[Dict[str, ExperimentOutput]] = None,
         content_requirements: Optional[str] = None,
     ) -> Tuple[float, str]:
+        logger.info("Evaluating section: %s", section_name)
         log_agent_action("SupervisorAgent", "start_evaluation", {"section": section_name})
 
         # --- HARD CHECKS FIRST ---
@@ -74,6 +78,7 @@ class SupervisorAgent:
             f"math_checker: {math_fb}",
             f"code_checker: {code_fb}",
         ]
+        logger.info("Hard checks passed=%s for section: %s (citation=%.1f, math=%.1f, code=%.1f)", hard["passed"], section_name, hard["score"], math_score, code_score)
 
         if not hard["passed"]:
             tracker = get_tracker()
@@ -81,6 +86,7 @@ class SupervisorAgent:
                 tracker.bump("hard_check_fails")
             overall = min(hard_bundle_score, 4.0)
             overall_feedback = "HARD CHECK FAILED — deterministic checks block release.\n" + "\n".join(feedbacks)
+            logger.info("Hard check FAILED for section %s, blocking release (score=%.1f)", section_name, overall)
             self.feedback_memory.add_feedback_entry(
                 "SupervisorAgent",
                 section_name,
@@ -115,6 +121,10 @@ class SupervisorAgent:
             + 0.15 * hall_score
         )
         overall_feedback = "\n".join(feedbacks)
+        threshold = self.runtime_config.supervisor_threshold
+        verdict = "pass" if overall >= threshold else "revise"
+        logger.info("Final score for %s: %.2f (threshold=%.1f, verdict=%s)", section_name, overall, threshold, verdict)
+        logger.info("Feedback summary for %s: %s", section_name, overall_feedback[:500])
 
         tracker = get_tracker()
         self.feedback_memory.add_feedback_entry(

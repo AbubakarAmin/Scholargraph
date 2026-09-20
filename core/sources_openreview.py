@@ -83,7 +83,7 @@ class OpenReviewClient:
                 password=password,
             )
         except Exception as e:
-            logger.warning("OpenReview auth failed, disabling source: %s", e)
+            logger.warning("OpenReview auth failed, disabling source: %s", e, exc_info=True)
             self.enabled = False
             self._client = None
 
@@ -167,7 +167,7 @@ class OpenReviewClient:
                         break
                 offset += len(page)
         except Exception as e:
-            logger.warning("OpenReview fetch failed for %s: %s", venue_id, e)
+            logger.warning("OpenReview fetch failed for %s: %s", venue_id, e, exc_info=True)
             return []
         logger.info("OpenReview: %s -> %d papers with reviewer weaknesses", venue_id, len(results))
         return results

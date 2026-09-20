@@ -291,6 +291,7 @@ class TopicHunterAgent:
         if runtime_cfg is not None and not getattr(runtime_cfg, "openalex_enabled", True):
             log_agent_action("TopicHunter", "openalex_skipped_disabled", {"query": query[:80]})
             return []
+        logger.info("OpenAlex search: query=%r, limit=%d", query[:80], limit)
         from core.api_gateway import get_gateway
         try:
             if not get_gateway().is_available("openalex"):
@@ -330,10 +331,12 @@ class TopicHunterAgent:
                     ordered = sorted(((pos, word) for word, positions in inverted.items() for pos in positions))
                     row["abstract"] = " ".join(word for _, word in ordered)
             self._source_ok("openalex")
+            logger.info("OpenAlex returned %d results for query=%r", len(rows), query[:80])
             return rows
         except Exception as e:
             self._source_failed("openalex", e)
             log_agent_action("TopicHunter", "search_openalex_error", {"error": str(e)})
+            logger.warning("OpenAlex search failed for query=%r: %s", query[:80], e)
             return []
 
     def search_arxiv(self, query: str, max_results: int = 50) -> List[Dict[str, Any]]:
@@ -349,6 +352,7 @@ class TopicHunterAgent:
         if runtime_cfg is not None and not getattr(runtime_cfg, "arxiv_enabled", True):
             log_agent_action("TopicHunter", "arxiv_skipped_disabled", {"query": query[:80]})
             return []
+        logger.info("arXiv search: query=%r, max_results=%d", query[:80], max_results)
 
         from core.api_gateway import get_gateway
 
@@ -397,6 +401,7 @@ class TopicHunterAgent:
             results = get_gateway().request("arxiv", _do_search, retries=2, backoff_base=8.0, backoff_max=120.0)
             self._source_ok("arxiv")
             self._arxiv_consecutive_failures = 0
+            logger.info("arXiv returned %d results for query=%r", len(results or []), query[:80])
             return results or []
         except Exception as e:
             self._source_failed("arxiv", e)
@@ -435,6 +440,7 @@ class TopicHunterAgent:
         if not query:
             raise ValueError("retrieve_literature requires a non-empty query")
 
+        logger.info("QA literature retrieval starting for query=%r", query[:120])
         papers: List[Dict[str, Any]] = []
         seen: set = set()
 
@@ -544,6 +550,7 @@ class TopicHunterAgent:
         cross_run_context: List[Dict[str, Any]],
         negative_lessons: Optional[List[Dict[str, Any]]] = None,
         n_seeds: int = 6,
+        frontier_terms: Optional[List[Dict[str, str]]] = None,
     ) -> List[Dict[str, str]]:
         """LLM-driven seed generation (v3 fix #3).
 
@@ -556,6 +563,7 @@ class TopicHunterAgent:
         """
         if not getattr(self.runtime_config, "llm_seed_generation_enabled", True):
             return []
+        logger.info("Generating LLM seeds for domain=%r (n_seeds=%d)", domain, n_seeds)
         runtime_cfg = getattr(self, "runtime_config", None)
         if not domain:
             domain = getattr(runtime_cfg, "research_domain", None) if runtime_cfg is not None else None
@@ -569,6 +577,9 @@ Bad: "open problems in evaluation". Good: "speculative decoding verification ove
 
 Prior-run context (avoid re-proposing rejected/failed areas):
 {json.dumps(cross_run_context[-10:], sort_keys=True, default=str)[:1500]}
+
+Frontier terms from very recent papers (STRONGLY prefer these angles):
+{json.dumps([f"{t.get('method','')} + {t.get('evaluation','')}" for t in (frontier_terms or [])[:8]], default=str)[:500]}
 
 Return JSON with {n_seeds} DIVERSE seeds spread across different subfields
 and method families, each with a short strategy tag explaining its angle:
@@ -588,9 +599,11 @@ and method families, each with a short strategy tag explaining its angle:
                     seeds.append({"seed": item.strip(), "strategy": "llm_diverse"})
             if seeds:
                 log_agent_action("TopicHunter", "llm_seeds_generated", {"count": len(seeds)})
+                logger.info("LLM generated %d seeds: %s", len(seeds), [s["seed"][:60] for s in seeds])
             return seeds[:n_seeds]
         except Exception as e:
             log_agent_action("TopicHunter", "llm_seed_generation_error", {"error": str(e)})
+            logger.warning("LLM seed generation failed: %s", e)
             return []
 
     def _generate_dynamic_seeds(
@@ -616,6 +629,7 @@ and method families, each with a short strategy tag explaining its angle:
         if cross_run_context is None:
             cross_run_context = CrossRunMemory().get_prompt_context()
 
+        logger.info("Generating dynamic seeds: n_seeds=%d, domain=%r", n_seeds, domain)
         windowed_context = cross_run_context[-_REJECTION_HISTORY_WINDOW:]
 
         rejected_tokens: set = set()
@@ -645,6 +659,7 @@ and method families, each with a short strategy tag explaining its angle:
             cross_run_context,
             negative_lessons=negative_lessons,
             n_seeds=max(3, n_seeds // 2),
+            frontier_terms=self._load_cached_frontier_terms(domain or self.runtime_config.research_domain),
         )
         for d in llm_seeds:
             words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", d["seed"].lower()))
@@ -692,6 +707,9 @@ and method families, each with a short strategy tag explaining its angle:
 
         # Feature 4: frontier-seeded generation from very recent papers
         frontier_terms = self._harvest_frontier_terms(domain) if domain else []
+        logger.info("Seed generation: %d LLM seeds, %d kind-bias seeds, %d frontier terms, active_kind=%s",
+                     len(llm_seeds), len([s for s in seeds if s.get("strategy") == "kind_bias"]),
+                     len(frontier_terms), active_kind)
         for term_pair in frontier_terms:
             method = term_pair.get("method", "")
             evaluation = term_pair.get("evaluation", "")
@@ -997,6 +1015,7 @@ and method families, each with a short strategy tag explaining its angle:
         always <= the reject threshold, guaranteeing comparison happens first.
         """
         if not abstracts:
+            logger.info("Novelty check for %r: no abstracts, auto-novel", candidate_topic.get("title", "")[:60])
             return {
                 "max_similarity": 0.0,
                 "reject": False,
@@ -1006,6 +1025,8 @@ and method families, each with a short strategy tag explaining its angle:
             }
         reject_threshold = float(getattr(self.runtime_config, "novelty_similarity_reject", 0.90))
         comparison_trigger = min(_DEFAULT_COMPARISON_TRIGGER, reject_threshold)
+        logger.info("Novelty check for %r: %d abstracts, reject_threshold=%.2f, comparison_trigger=%.2f",
+                     candidate_topic.get("title", "")[:60], len(abstracts), reject_threshold, comparison_trigger)
 
         topic_desc = f"{candidate_topic.get('title','')} {candidate_topic.get('description','')} {candidate_topic.get('contribution','')}"
         topic_emb = generate_embedding(topic_desc)
@@ -1038,6 +1059,7 @@ and method families, each with a short strategy tag explaining its angle:
 
         # If near duplicate threshold reached (e.g. > 0.95), immediate reject
         if best_sim >= 0.95:
+            logger.info("Novelty check for %r: REJECTED as near-duplicate (sim=%.3f)", candidate_topic.get("title", "")[:60], best_sim)
             return {
                 "max_similarity": best_sim,
                 "reject": True,
@@ -1103,12 +1125,15 @@ Return JSON:
         # reject threshold AND no comparison could be obtained (e.g. LLM call
         # failed both attempts) — never because the trigger window was skipped.
         reject = is_duplicate or (best_sim >= reject_threshold and not comparisons)
+        verdict = "LIKELY_DUPLICATE" if reject else "NOVEL"
+        logger.info("Novelty check for %r: max_sim=%.3f, verdict=%s, comparisons=%d",
+                     candidate_topic.get("title", "")[:60], best_sim, verdict, len(comparisons))
         return {
             "max_similarity": best_sim,
             "reject": reject,
             "nearest": nearest,
             "novelty_comparisons": comparisons,
-            "verdict": "LIKELY_DUPLICATE" if reject else "NOVEL",
+            "verdict": verdict,
             "reason": f"Contribution comparison: {'rejected as duplicate/insufficient difference' if reject else 'novel contribution supported'}",
         }
 
@@ -1643,6 +1668,8 @@ Return the FULL corrected JSON, fixing ONLY the listed field(s).
         if not structured_hyp or not isinstance(structured_hyp, dict):
             return topic
 
+        logger.info("Pre-debate self-critique starting for %r", topic.get("title", "")[:60])
+
         prompt = f"""
 You are a hostile peer reviewer. Given this hypothesis, identify the top 3
 objections a reviewer would raise, then REWRITE the hypothesis to preempt them.
@@ -1734,10 +1761,13 @@ Return JSON:
                 "objections_found": len(objections),
                 "hypothesis_strengthened": True,
             })
+            logger.info("Pre-debate self-critique applied to %r: %d objections found, hypothesis strengthened",
+                         topic.get("title", "")[:60], len(objections))
             return topic
 
         except Exception as e:
             log_agent_action("TopicHunter", "pre_debate_critique_error", {"error": str(e)})
+            logger.warning("Pre-debate self-critique failed for %r: %s", topic.get("title", "")[:60], e)
             return topic
 
     def _reject(self, topic: Topic, reason: str, meta: Optional[Dict[str, Any]] = None):
@@ -1752,23 +1782,40 @@ Return JSON:
         topic_kind = topic.get("hypothesis_kind") or hypothesis_kind(topic.get("title", ""))
         lesson_type = meta.get("lesson_type") or "topic_rejection"
         reason_code = meta.get("reason_code") or reason
+        # Inject run_id for intra-run collision detection (Fix 5)
+        tracker = get_tracker()
+        current_run_id = tracker.run_id if tracker else None
+        meta_with_run = {**meta, "run_id": current_run_id}
+        # Skip recording intra-run self-collisions to prevent the exclusion
+        # corpus from growing with near-copies that tighten matching around
+        # the same theme within a single run.
+        if reason_code == "previously_failed_or_rejected" and current_run_id:
+            if CrossRunMemory().is_intra_run_collision("topic", topic.get("title", "?"), current_run_id):
+                log_agent_action("TopicHunter", "intra_run_collision_skipped", {
+                    "title": topic.get("title", "?")[:80],
+                    "reason": "already recorded this run",
+                })
+                if tracker:
+                    tracker.bump("rejected_topics")
+                    tracker.scratch("TopicHunter", "rejection", entry)
+                return
+        log_agent_action("TopicHunter", "topic_rejected", entry)
+        # Fix 13: Track rejected theme vocab for theme-level dedup
+        title_words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", (topic.get("title") or "").lower()))
+        if title_words:
+            theme_key = " ".join(sorted(title_words)[:8])
+            self._rejected_theme_vocab = getattr(self, "_rejected_theme_vocab", {})
+            self._rejected_theme_vocab[theme_key] = self._rejected_theme_vocab.get(theme_key, 0) + 1
         CrossRunMemory().record_rejection(
             "topic",
             topic.get("title", "?"),
             reason,
-            {
-                **meta,
-                "lesson_type": lesson_type,
-                "reason_code": reason_code,
-                "topic_kind": topic_kind,
-            },
+            meta_with_run,
         )
         self._excluded_titles_cache = None
-        tracker = get_tracker()
         if tracker:
             tracker.bump("rejected_topics")
             tracker.scratch("TopicHunter", "rejection", entry)
-        log_agent_action("TopicHunter", "topic_rejected", entry)
 
     def _excluded_titles(self) -> List[str]:
         if self._excluded_titles_cache is None:
@@ -1897,6 +1944,20 @@ no punctuation, no explanation.
         except Exception as e:
             log_agent_action("TopicHunter", "followup_query_error", {"error": str(e)})
             return None
+
+    def _load_cached_frontier_terms(self, domain: str) -> List[Dict[str, str]]:
+        """Load frontier terms from cache without harvesting (zero LLM cost)."""
+        if not getattr(self.runtime_config, "frontier_seeding_enabled", True):
+            return []
+        cache_path = Path(self.runtime_config.output_dir) / "source_cache" / "frontier_terms.json"
+        try:
+            if cache_path.exists():
+                cached = json.loads(cache_path.read_text())
+                if cached.get("domain") == domain:
+                    return cached.get("terms", [])
+        except Exception:
+            pass
+        return []
 
     def _harvest_frontier_terms(self, domain: str) -> List[Dict[str, str]]:
         """Sample very recent, high-signal papers for `domain` and extract
@@ -2174,6 +2235,8 @@ Return JSON: {{"terms": [{{"method": "...", "evaluation": "..."}}]}}
         abstracts = [
             (p.get("abstract") or "") for p in recent_papers if p.get("abstract")
         ][:25]
+        logger.info("Hunt for seed=%r: %d papers retrieved, %d with abstracts, %d citation signals, %d coupling gaps, %d contradictions",
+                     seed_hint[:60], len(recent_papers), len(abstracts), len(graph_signals), len(coupling_gaps), len(contradictions))
         evidence_map = build_cross_paper_evidence_map(recent_papers)
 
         # Phase 3.1: Precompute abstract embeddings once for all gaps
@@ -2360,11 +2423,19 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
         gaps = quality_gaps
 
         kept = []
+        formalize_consecutive_failures = 0
+        FORMALIZE_CIRCUIT_BREAKER = 3
+        # Fix 13: Theme-level dedup — track rejected theme families to block
+        # entire clusters when 3+ candidates share >80% vocabulary.
+        self._rejected_theme_vocab = getattr(self, "_rejected_theme_vocab", {})
+        THEME_DEDUP_THRESHOLD = 0.80
+        THEME_DEDUP_MIN_COUNT = 3
         for gap in gaps:
             # Budget guard: skip expensive gate chain if LLM budget exhausted
             if not _check_llm_budget():
                 log_agent_action("TopicHunter", "llm_budget_exhausted", {"seed": seed_hint, "at": "gate_chain", "used": _llm_calls_used["count"], "remaining_gaps": len(gaps) - len(kept)})
                 break
+            logger.info("Evaluating gap: %r (budget: %d/%d used)", gap.get("title", "")[:60], _llm_calls_used["count"], llm_budget)
             # Fix #7: cheap heuristic pre-filter before the expensive gate chain.
             # This intentionally runs before bridge validation too, since it's
             # nearly free and catches the worst-case "hallucinated, no relation
@@ -2374,6 +2445,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "lesson_type": "pre_filter_rejection",
                     "reason_code": "no_vocabulary_overlap_with_retrieved_papers",
                 })
+                logger.info("Gap REJECTED (ungrounded): %r", gap.get("title", "")[:60])
                 continue
 
             if not self._dataset_plan_admissible(gap):
@@ -2382,10 +2454,20 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "reason_code": "dataset_not_catalogued",
                     "dataset_plan": gap.get("dataset_plan"),
                 })
+                logger.info("Gap REJECTED (dataset): %r, plan=%r", gap.get("title", "")[:60], gap.get("dataset_plan"))
                 continue
 
             bridge_validation = validate_candidate_bridge_claim(gap, evidence_map)
             gap["bridge_validation"] = bridge_validation
+            # Fix 15: Skip bridge validation rejection when no literature was
+            # retrieved (empty evidence_map) — the warning is meaningless and
+            # wastes LLM calls downstream.
+            if not evidence_map and not bridge_validation["valid"]:
+                bridge_validation["valid"] = True
+                bridge_validation["soft_warning_applied"] = True
+                log_agent_action("TopicHunter", "bridge_validation_skip_no_literature", {
+                    "title": gap.get("title"),
+                })
             if not bridge_validation["valid"]:
                 # Fix #4: previously this was always a hard reject. Now, only a
                 # genuine content mismatch (the validator's own semantic check)
@@ -2412,6 +2494,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                         "lesson_type": "evidence_grounding_failure",
                         "reason_code": bridge_validation["reason"],
                     })
+                    logger.info("Gap REJECTED (bridge validation): %r, reason=%r", gap.get("title", "")[:60], bridge_validation["reason"])
                     continue
             # Soft warning: log but don't reject on bridge text mismatch
             if "soft_warning" in bridge_validation.get("reason", ""):
@@ -2470,6 +2553,26 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
             if prior:
                 self._reject(gap, "previously_failed_or_rejected", {"matched": prior})
                 continue
+            # Fix 13: Theme-level dedup — skip candidates that belong to a
+            # theme family already rejected 3+ times with similar vocabulary.
+            gap_words = set(re.findall(r"[a-z][a-z0-9_-]{2,}", (gap.get("title") or "").lower()))
+            blocked_theme = False
+            for theme_key, count in self._rejected_theme_vocab.items():
+                if count < THEME_DEDUP_MIN_COUNT:
+                    continue
+                theme_words = set(theme_key.split())
+                if gap_words and theme_words:
+                    overlap = len(gap_words & theme_words) / max(len(gap_words | theme_words), 1)
+                    if overlap >= THEME_DEDUP_THRESHOLD:
+                        blocked_theme = True
+                        break
+            if blocked_theme:
+                self._reject(gap, "theme_family_saturated", {
+                    "lesson_type": "theme_dedup",
+                    "reason_code": "theme_family_saturated",
+                })
+                logger.info("Gap REJECTED (theme saturated): %r", gap.get("title", "")[:60])
+                continue
             # 1. Screen research gap with literature evidence
             citation_signal = max((g.get("gap_score", 0) for g in graph_signals), default=0.0)
             gap_report = self.screen_research_gap(gap, gap.get("literature_evidence", []), citation_gap_signal=citation_signal)
@@ -2481,6 +2584,8 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "gap_type": gap_report.get("gap_type", "unsupported"),
                     "details": gap_report.get("why_existing_work_is_insufficient", ""),
                 })
+                logger.info("Gap REJECTED (screener): %r, status=%s, gap_type=%s",
+                             gap.get("title", "")[:60], gap_report.get("status"), gap_report.get("gap_type"))
                 continue
 
             # 2. Layered Novelty Assessment
@@ -2493,6 +2598,8 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "verdict": novelty_eval.get("verdict", "LIKELY_DUPLICATE"),
                     "details": novelty_eval.get("reason", ""),
                 })
+                logger.info("Gap REJECTED (novelty): %r, verdict=%s, max_sim=%.3f",
+                             gap.get("title", "")[:60], novelty_eval.get("verdict"), novelty_eval.get("max_similarity", 0))
                 continue
 
             # 3. Feasibility check against sandbox capability manifest
@@ -2504,16 +2611,27 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "reason_code": "sandbox_capability_violation",
                     "reasons": feas.get("reasons", []),
                 })
+                logger.info("Gap REJECTED (infeasible): %r, reasons=%s", gap.get("title", "")[:60], feas.get("reasons"))
                 continue
 
-            # 4. Hypothesis Formalization
+            # 4. Hypothesis Formalization (with circuit breaker)
+            if formalize_consecutive_failures >= FORMALIZE_CIRCUIT_BREAKER:
+                log_agent_action("TopicHunter", "formalize_circuit_breaker", {
+                    "consecutive_failures": formalize_consecutive_failures,
+                    "remaining_gaps": len(gaps) - len(kept),
+                })
+                logger.warning("Formalize circuit breaker: %d consecutive failures, pausing", formalize_consecutive_failures)
+                break
             formalized = self.formalize_hypothesis(gap, gap_report, novelty_eval)
             if not formalized:
+                formalize_consecutive_failures += 1
                 self._reject(gap, "missing_structured_hypothesis", {
                     "lesson_type": "admission_failure",
                     "reason_code": "structured_hypothesis_unavailable",
                 })
+                logger.info("Gap REJECTED (no hypothesis): %r", gap.get("title", "")[:60])
                 continue
+            formalize_consecutive_failures = 0
             admission = validate_topic_admission(formalized)
             gap["topic_admission"] = admission
             if not admission["admitted"]:
@@ -2522,6 +2640,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                     "reason_code": "non_executable_minimum_experiment",
                     "reasons": admission["errors"],
                 })
+                logger.info("Gap REJECTED (admission): %r, errors=%s", gap.get("title", "")[:60], admission["errors"])
                 continue
             gap["structured_hypothesis"] = formalized
             gap["falsifiable_prediction"] = formalized.get("falsification_condition", "")
@@ -2532,6 +2651,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 gap["gap_score"] = max(g.get("gap_score", 0) for g in graph_signals)
             gap["seed_strategy"] = seed_strategy  # Feature 8: seed-strategy provenance
             kept.append(gap)
+            logger.info("Gap PASSED all gates: %r", gap.get("title", "")[:60])
             try:
                 self.vector_memory.add_embedding(
                     generate_embedding(gap["title"] + " " + gap.get("description", "")),
@@ -2548,20 +2668,24 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                 )
             except Exception:
                 pass
+        logger.info("Hunt for seed=%r complete: %d gaps kept from %d generated", seed_hint[:60], len(kept), len(gaps))
         return kept
 
     def discover_topics(self, domain: str = None, n_parallel: int = 5) -> List[Topic]:
         self._excluded_titles_cache = None
         self._run_query_cache = {}  # Feature 5: reset cross-seed cache per invocation
         domain = domain or self.runtime_config.research_domain
+        logger.info("Starting topic discovery for domain=%r with n_parallel=%d", domain, n_parallel)
         log_agent_action("TopicHunter", "start_discovery", {"domain": domain, "parallel": n_parallel})
         cross_run_context = CrossRunMemory().get_prompt_context()
         seeds = self._generate_dynamic_seeds(n_parallel, cross_run_context, domain=domain)
+        logger.info("Generated %d seeds: %s", len(seeds), [s["seed"][:60] for s in seeds])
 
         all_topics: List[Dict[str, Any]] = []
         for seed in seeds:
             try:
                 topics = self._hunt_once(domain, seed["seed"], seed.get("strategy", "generic_fallback"))
+                logger.info("Seed %r (%s) produced %d topics", seed["seed"][:60], seed.get("strategy"), len(topics or []))
                 all_topics.extend(topics or [])
             except Exception as e:
                 log_agent_action("TopicHunter", "hunt_error", {"seed": seed["seed"], "error": str(e)})
@@ -2590,6 +2714,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
         # surface the same idea in different wording; exact-title dedup misses
         # that and debate slots get burned on redundant candidates.
         unique = self._suppress_near_duplicates(unique)
+        logger.info("After dedup: %d unique topics (from %d total)", len(unique), len(all_topics))
 
         # Second-pass targeted retrieval from top bridge candidates
         if unique:
@@ -2598,6 +2723,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
             top_bridges = [b for b in bridges if b.get("method_signal") and b.get("target_setting_signal")][:3]
             if top_bridges:
                 second_pass_topics = self._execute_second_pass(top_bridges, domain)
+                logger.info("Second pass added %d topics from %d bridges", len(second_pass_topics), len(top_bridges))
                 for t in second_pass_topics:
                     title = (t.get("title") or "").lower().strip()
                     if title and title not in seen:
@@ -2605,6 +2731,7 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
                         unique.append(t)
 
         ranked = self.rank_topics_by_potential(unique)
+        logger.info("Final ranking produced %d topics", len(ranked))
 
         # Fix #1: aggregate the rejection funnel for this run so bottleneck
         # gates are visible without having to grep individual log entries.
@@ -2617,11 +2744,17 @@ JSON: {{"gaps": [{{"title": "...", "description": "...", "rationale": "...", "im
             "total_kept": len(ranked),
             "by_reason": dict(sorted(funnel.items(), key=lambda kv: -kv[1])),
         })
+        logger.info("Rejection funnel: %d rejected, %d kept. Reasons: %s",
+                     len(self.rejection_log), len(ranked), dict(sorted(funnel.items(), key=lambda kv: -kv[1])))
 
         log_agent_action("TopicHunter", "discovery_complete", {
             "num_topics": len(ranked),
             "rejected": len(self.rejection_log),
         })
+        logger.info("Discovery complete: %d topics passed all gates, %d rejected", len(ranked), len(self.rejection_log))
+        for src, health in self.source_health.items():
+            status = "ok" if health.get("ok") else f"failed: {health.get('error', '?')}"
+            logger.info("Source %s: %s", src, status)
         if not ranked:
             self._iteration_failures += 1
         else:

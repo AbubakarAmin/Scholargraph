@@ -67,6 +67,8 @@ class LLMClient:
     ) -> str:
         model_id = model or config.resolve_model("default")
         gateway = get_gateway()
+        logger.debug("LLM chat request: provider=%s model=%s temp=%.2f prompt_len=%d",
+                      self.provider, model_id, temperature, len(prompt))
         try:
             result = gateway.request(
                 "llm",
@@ -77,7 +79,24 @@ class LLMClient:
                 result = _THINKING_TAG_RE.sub("", result).strip()
             return result
         except Exception as e:
-            logger.warning("LLM chat failed (%s/%s): %s", self.provider, model_id, e)
+            # Fix 11: Fallback — try with a backup model on connection errors
+            fallback_model = getattr(config, "llm_model_fallback", None)
+            if fallback_model and fallback_model != model_id and "Connection" in str(e):
+                logger.warning("LLM primary model %s failed (%s), trying fallback %s",
+                               model_id, str(e)[:100], fallback_model)
+                try:
+                    result = gateway.request(
+                        "llm",
+                        self._chat_raw,
+                        prompt, temperature, fallback_model, max_tokens, system,
+                    )
+                    if result:
+                        result = _THINKING_TAG_RE.sub("", result).strip()
+                    return result
+                except Exception as fallback_err:
+                    logger.warning("LLM fallback also failed (%s/%s): %s",
+                                   self.provider, fallback_model, fallback_err)
+            logger.warning("LLM chat failed (%s/%s): %s", self.provider, model_id, e, exc_info=True)
             try:
                 from .run_log import get_tracker
 
@@ -85,8 +104,8 @@ class LLMClient:
                 if tracker:
                     tracker.bump("llm_failures")
                     tracker.message(f"LLM call failed ({self.provider}/{model_id}): {e}", level="error")
-            except Exception:
-                pass
+            except Exception as tracker_err:
+                logger.debug("Failed to record LLM failure: %s", tracker_err)
             return ""
 
     def _chat_raw(
@@ -124,7 +143,8 @@ class LLMClient:
         )
         try:
             return response.candidates[0].content.parts[0].text
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to parse Gemini response: %s", e)
             return getattr(response, "text", "") or ""
 
     def _chat_openai(
@@ -157,10 +177,11 @@ class LLMClient:
 
     def embed(self, text: str, model: Optional[str] = None) -> np.ndarray:
         """Generate embedding. Always uses Gemini — regardless of LLM provider."""
+        logger.debug("Embedding request: text_len=%d", len(text))
         try:
             return self._embed_gemini(text, model)
         except Exception as e:
-            logger.warning("Gemini embedding failed: %s", e)
+            logger.warning("Gemini embedding failed: %s", e, exc_info=True)
             return np.zeros(config.embedding_dimension)
 
     def _embed_raw(self, text: str, model: Optional[str]) -> np.ndarray:
@@ -261,8 +282,8 @@ def call_llm(
             tracker.bump("llm_calls")
             tracker.bump("llm_tokens_in", amount=input_tokens_est)
             tracker.bump("llm_tokens_out", amount=output_tokens_est)
-    except Exception:
-        pass
+    except Exception as tracker_err:
+        logger.debug("Failed to record LLM stats: %s", tracker_err)
     return result
 
 

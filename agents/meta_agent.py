@@ -5,6 +5,7 @@ MetaAgent — observability, operator chat, light mid-run control, give-up guard
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, List, Optional
 
 from core.config import config
@@ -16,6 +17,8 @@ from core.memory import memory
 from core.run_log import CrossRunMemory, get_tracker, build_run_summary, read_events, emit_event
 from core.contracts import MetaChatResult, MetaDashboard
 from core.state import ResearchState
+
+logger = logging.getLogger(__name__)
 
 
 class MetaAgent:

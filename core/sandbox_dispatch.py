@@ -78,17 +78,33 @@ def execute(
     seed: int = 42,
 ) -> Dict[str, Any]:
     """Execute one seed run using the configured backend."""
-    if _use_docker():
-        from .container_sandbox import execute_containerized
+    use_docker = _use_docker()
+    backend = "docker" if use_docker else "ast"
+    logger.info("Sandbox execute started (backend=%s, seed=%s, timeout=%s)", backend, seed, timeout_sec)
 
-        return execute_containerized(
-            code,
-            timeout_sec=timeout_sec,
-            seed=seed,
-            memory=config.sandbox_docker_memory,
-            cpus=config.sandbox_docker_cpus,
-        )
-    return execute_sandboxed(code, timeout_sec=timeout_sec, seed=seed)
+    try:
+        if use_docker:
+            from .container_sandbox import execute_containerized
+
+            result = execute_containerized(
+                code,
+                timeout_sec=timeout_sec,
+                seed=seed,
+                memory=config.sandbox_docker_memory,
+                cpus=config.sandbox_docker_cpus,
+            )
+        else:
+            result = execute_sandboxed(code, timeout_sec=timeout_sec, seed=seed)
+    except TimeoutError:
+        logger.info("Sandbox execution timed out (backend=%s, seed=%s, timeout=%s)", backend, seed, timeout_sec)
+        raise
+    except Exception as exc:
+        logger.info("Sandbox execution failed (backend=%s, seed=%s, error=%s)", backend, seed, exc)
+        raise
+
+    status = result.get("status", "unknown") if isinstance(result, dict) else "unknown"
+    logger.info("Sandbox execution finished (backend=%s, seed=%s, status=%s)", backend, seed, status)
+    return result
 
 
 def execute_multi_seed(

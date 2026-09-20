@@ -6,6 +6,7 @@ God's-eye view of runs, keys, events, scratchpad, cross-run memory.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -21,7 +22,6 @@ from pydantic import BaseModel
 from fastapi import Request
 from fastapi.responses import EventSourceResponse
 import asyncio
-import json
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -41,6 +41,10 @@ from core.research_db import research_db
 from core.capabilities import DEFAULT_MANIFESTS
 from core.datasets import DATASET_CATALOG
 
+logger = logging.getLogger(__name__)
+
+from fastapi.responses import JSONResponse
+
 app = FastAPI(title="ScholarGraph Control Deck", version="2.0")
 app.add_middleware(
     CORSMiddleware,
@@ -49,6 +53,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Log every unhandled exception with full traceback."""
+    logger.exception("Unhandled exception in %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        detail={"error": str(exc), "type": type(exc).__name__},
+    )
 
 STATIC = Path(__file__).parent / "static"
 STATIC.mkdir(exist_ok=True)
@@ -86,7 +100,8 @@ def load_keys() -> Dict[str, Any]:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to load keys from %s: %s", path, e)
             return {}
     return {}
 
@@ -250,6 +265,7 @@ def test_llm():
             "model": config.resolve_model("cheap"),
         }
     except Exception as e:
+        logger.error("LLM test failed: %s", e, exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -267,8 +283,8 @@ def dashboard(run_id: Optional[str] = None):
             summary = {}
             try:
                 summary = json.loads(found.get("summary_json") or "{}")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to parse run summary for %s: %s", target_run_id, e)
             dash = {
                 "run_id": found["run_id"],
                 "status": found["status"],
@@ -473,7 +489,8 @@ async def admin_stream(request: Request):
                 dash = dashboard()
                 payload = {"type": "dashboard", "payload": dash}
                 yield json.dumps(payload) + "\n\n"
-            except Exception:
+            except Exception as e:
+                logger.debug("SSE stream dashboard error: %s", e)
                 yield json.dumps({"type": "heartbeat"}) + "\n\n"
             await asyncio.sleep(10)
     return EventSourceResponse(event_generator())
@@ -672,6 +689,8 @@ def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = N
         if domain:
             apply_runtime_keys({"RESEARCH_DOMAIN": domain})
         validate_config()
+        from core.logging_config import setup_logging
+        setup_logging()
         from core.state import initialize_state
         from main import create_checkpointer, create_research_graph, create_qa_mode_graph, save_results
         from core.context import create_run_context
@@ -682,6 +701,8 @@ def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = N
             # old terminal_error / __end__ state never haunts a re-run.
             research_db._delete_checkpoints(resume_run_id)
             tracker = start_run(resume_run_id)
+            from core.logging_config import attach_run_log
+            attach_run_log(tracker.run_id)
             existing_state = _load_state_from_db(resume_run_id)
             # Re-runs always start fresh: clear terminal_error and signal
             # reset so the graph re-enters topic_discovery instead of
@@ -693,6 +714,8 @@ def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = N
             state = existing_state if existing_state else initialize_state(mode=mode)
         else:
             tracker = start_run()
+            from core.logging_config import attach_run_log
+            attach_run_log(tracker.run_id)
             state = initialize_state(mode=mode)
         pipeline = ResearchPipeline(
             create_research_graph,
@@ -718,6 +741,7 @@ def _run_pipeline(domain: Optional[str] = None, resume_run_id: Optional[str] = N
         if terminal_error:
             tracker.message(terminal_error, level="error")
     except Exception as e:
+        logger.exception("Pipeline crashed")
         _set_run_error(str(e))
         if tracker:
             tracker.message(f"ERROR: {e}", level="error")
@@ -769,8 +793,8 @@ def resume_run(run_id: str):
             ws = json.loads(prev.get("summary_json") or "{}").get("workspace", {})
             prev_mode = ws.get("mode", "full_research") or "full_research"
             prev_query = ws.get("user_query")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to load previous run config: %s", e)
         _run_thread = threading.Thread(
             target=_run_pipeline, args=(None, run_id, prev_mode, prev_query), daemon=True
         )

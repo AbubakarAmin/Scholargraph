@@ -6,6 +6,7 @@ Replaces lossy JSON handoffs with durable source-of-truth logs.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -14,6 +15,8 @@ from typing import Any, Dict, List, Optional
 
 from .config import config
 from .research_db import research_db
+
+logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 
@@ -415,6 +418,19 @@ class CrossRunMemory:
             {"kind": kind, "item": item, "reason": reason, "rejection_reason": self._reason_tag(reason), "meta": meta or {}, "content_class": "structured_signal", "retrieval_eligible": True, "outcome_status": "rejected"},
         )
 
+    def is_intra_run_collision(self, kind: str, item: str, current_run_id: str) -> bool:
+        """Check if a rejection was already recorded in the SAME run (self-collision)."""
+        if not current_run_id:
+            return False
+        for row in reversed(self.load("rejection", limit=50)):
+            if row.get("kind") != kind:
+                continue
+            row_item = str(row.get("item") or "").strip()
+            row_run = str((row.get("meta") or {}).get("run_id") or "").strip()
+            if row_item == item and row_run == current_run_id:
+                return True
+        return False
+
     def excluded_topic_titles(self, limit: int = 100) -> List[str]:
         """Titles previously rejected or failed in debate — TopicHunter must not resurface them."""
         titles: List[str] = []
@@ -449,6 +465,16 @@ class CrossRunMemory:
             return "evidence_consistency"
         if any(token in lowered for token in ("api", "dependency", "import")):
             return "dependency_or_api"
+        if "missing_structured_hypothesis" in lowered or "missing" in lowered:
+            return "formalize_failure"
+        if "dataset_not_catalogued" in lowered or "dataset" in lowered:
+            return "dataset_gap"
+        if "previously_failed_or_rejected" in lowered or "duplicate" in lowered:
+            return "self_collision"
+        if "unsupported_research_gap" in lowered or "corpus" in lowered or "literature" in lowered:
+            return "unsupported_gap"
+        if "bridge" in lowered:
+            return "bridge_mismatch"
         return "other"
 
     def record_run(self, summary: Dict[str, Any]):
@@ -543,6 +569,7 @@ class CrossRunMemory:
                 if len(negative) >= limit:
                     break
             return negative
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to load negative result lessons: %s", e)
             return []
 

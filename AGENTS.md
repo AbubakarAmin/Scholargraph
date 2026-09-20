@@ -22,6 +22,7 @@ python main.py --mode qa --query "your question"  # QA literature synthesis mode
 - Matplotlib is forced to `Agg` backend process-wide (`core/config.py:18`) to avoid Tcl crashes on Windows.
 - `run_ui.py` kills existing processes on the same port before binding — no manual cleanup needed.
 - Config defaults in `core/config.py` may differ from `env_example.txt` (e.g., `DEBATE_PASS_THRESHOLD` is `7.0` in code, `7.5` in env_example.txt). Code wins at runtime.
+- `logs/` contains per-run log files (`<run_id>.log`) and a global rotating `scholargraph.log`. All errors are logged with full tracebacks via `exc_info=True`.
 
 ## Project structure
 

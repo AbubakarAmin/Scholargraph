@@ -6,6 +6,7 @@ Bidirectional Engineer → Planner revision path; baselines required.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,8 @@ from core.run_log import get_tracker, CrossRunMemory
 from core.capabilities import SANDBOX_CAPABILITY_MANIFEST, check_plan_feasibility
 from core.verification import preregister_power
 from core.datasets import list_datasets, get_dataset_info, download_hf_dataset, load_local_dataset
+
+logger = logging.getLogger(__name__)
 
 
 class PlannerAgent:
@@ -40,10 +43,13 @@ class PlannerAgent:
         return self.context.memory if self.context else memory
 
     def create_plan(self, topic: Topic) -> Plan:
+        logger.info("Starting plan creation")
+        logger.info("Planning for topic: %s", topic.get("title"))
         log_agent_action("PlannerAgent", "start_planning", {"topic": topic.get("title")})
         lessons = json.dumps(CrossRunMemory().get_prompt_context(), sort_keys=True)
 
         plan = self._generate_plan_structure(topic, lessons)
+        logger.info("Plan structure generated: %d sections", len(plan.get("sections", [])))
         plan["dataset_catalog"] = list_datasets()
 
         # Retain upstream lineage to StructuredHypothesis
@@ -67,10 +73,13 @@ class PlannerAgent:
         plan["contributions"] = self._ensure_falsifiable_contributions(plan, topic)
         plan["experiments"] = self._generate_experiments(topic, plan)
         plan["experiments"] = self._normalize_experiments(plan["experiments"])
+        logger.info("Experiments planned: %d experiments", len(plan.get("experiments", [])))
 
         unfalsifiable = self._flag_unfalsifiable(plan)
         missing_baselines = self._flag_missing_baselines(plan)
         if unfalsifiable or missing_baselines:
+            logger.info("Plan repair needed: %d unfalsifiable, %d missing baselines",
+                         len(unfalsifiable), len(missing_baselines))
             plan = self._repair_plan(plan, topic, unfalsifiable, missing_baselines)
             plan["experiments"] = self._normalize_experiments(plan.get("experiments") or [])
 
@@ -103,6 +112,7 @@ class PlannerAgent:
 
         feasibility_errors = check_plan_feasibility(plan, SANDBOX_CAPABILITY_MANIFEST)
         if feasibility_errors:
+            logger.info("Capability rescoping required: %d feasibility errors", len(feasibility_errors))
             self._apply_capability_rescope(plan, topic, feasibility_errors)
             plan["methodology"] = str(plan.get("methodology", "")).replace("GPU", "CPU-compatible").replace("download", "use bundled")
             plan["compute_budget"] = "CPU-only, bounded synthetic or bundled small dataset"
@@ -126,12 +136,17 @@ class PlannerAgent:
 
         # Resolve datasets for each experiment: get info, download if small
         plan["dataset_resolutions"] = self._resolve_experiment_datasets(plan)
+        logger.info("Dataset requirements resolved: %d experiments mapped", len(plan.get("dataset_resolutions", [])))
 
         log_agent_action("PlannerAgent", "plan_created", {
             "sections": len(plan.get("sections", [])),
             "experiments": len(plan.get("experiments", [])),
             "unfalsifiable": len(plan["unfalsifiable_flags"]),
         })
+        logger.info("Plan creation complete: %d sections, %d experiments, %d unfalsifiable flags",
+                     len(plan.get("sections", [])),
+                     len(plan.get("experiments", [])),
+                     len(plan.get("unfalsifiable_flags", [])))
         return plan
 
     def _resolve_experiment_datasets(self, plan: Plan) -> List[Dict[str, Any]]:
@@ -323,6 +338,9 @@ class PlannerAgent:
         distinguish "Planner ignored constraints" from "task infeasible".
         """
         log_agent_action("PlannerAgent", "revise_plan", revision_request)
+        logger.info("Revision requested: reason=%s, experiment=%s",
+                     revision_request.get("reason", "N/A"),
+                     revision_request.get("experiment", "N/A"))
         tracker = get_tracker()
         if tracker:
             tracker.bump("plan_revisions")
@@ -357,6 +375,7 @@ Requirements:
 Return full updated plan fragment as JSON with keys: methodology, contributions, experiments, revision_notes
 """
         response = call_llm(prompt, temperature=0.4, tier="strong")
+        logger.info("Revision LLM response received, parsing and validating")
         schema_errors: List[str] = []
         for attempt in range(3):
             parsed = parse_json_from_llm(response) or {}
@@ -387,6 +406,7 @@ Return JSON with keys: methodology, contributions, experiments, revision_notes
         feasibility_errors = check_plan_feasibility(plan, SANDBOX_CAPABILITY_MANIFEST)
         if feasibility_errors:
             # Re-prompt once with explicit constraint violations before failing closed.
+            logger.info("Revised plan has %d feasibility violations, re-prompting LLM", len(feasibility_errors))
             constraint_detail = "; ".join(feasibility_errors)
             fix_prompt = f"""
 Your revised plan violated the capability manifest:
@@ -430,6 +450,9 @@ Keep the same experiment structure and schema. Return JSON with keys: methodolog
             revision_request.get("reason", "revise"),
             meta={"experiment": revision_request.get("experiment")},
         )
+        logger.info("Plan revision complete: %d experiments, %d revision history entries",
+                     len(plan.get("experiments", [])),
+                     len(plan.get("revision_history", [])))
         return plan
 
     def _flag_unfalsifiable(self, plan: Plan) -> List[str]:

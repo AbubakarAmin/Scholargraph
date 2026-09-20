@@ -6,6 +6,7 @@ These are deterministic — not LLM vibe scores.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import time
@@ -17,6 +18,8 @@ import requests
 from .config import config
 from .llm import call_llm
 from .utils import call_llm_json, parse_json_from_llm
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

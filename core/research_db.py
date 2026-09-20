@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import sqlite3
 import threading
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import config
+
+logger = logging.getLogger(__name__)
 
 
 class ResearchDatabase:
@@ -75,6 +78,15 @@ class ResearchDatabase:
     def finish_run(self, run_id: str, status: str, phase: str, summary: Dict[str, Any]):
         with self.lock, self._connect() as con:
             con.execute("UPDATE research_runs SET ended_at=?, status=?, phase=?, summary_json=? WHERE run_id=?", (self._now(), status, phase, json.dumps(summary, default=str), run_id))
+
+    def get_stale_running_runs(self) -> List[Dict[str, Any]]:
+        """Find runs stuck in 'running' status (from prior crashes/kills)."""
+        with self.lock, self._connect() as con:
+            rows = con.execute(
+                "SELECT run_id, started_at, summary_json FROM research_runs WHERE status='running'"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def update_run_summary(self, run_id: str, updates: Dict[str, Any]):
         """Merge additional JSON-safe details into a completed run summary."""
         with self.lock, self._connect() as con:

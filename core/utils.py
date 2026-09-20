@@ -15,10 +15,6 @@ import numpy as np
 from .config import config
 from .llm import generate_embedding
 
-logging.basicConfig(
-    level=getattr(logging, config.log_level),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -126,19 +122,48 @@ def parse_json_from_llm(response: str) -> Optional[Any]:
     Returns dict OR list — callers must type-check the result before calling
     dict-only methods like ``.get`` (a bare JSON array is a valid model output).
     Strips `` blocks before extraction to prevent thinking-trace contamination.
+    Prefers the LAST complete JSON block (reasoning models emit thinking first).
     """
     if not isinstance(response, str) or not response:
         return None
     response = strip_thinking_tags(response)
-    try:
-        if "[" in response and response.find("[") < (response.find("{") if "{" in response else 10**9):
-            start, end = response.find("["), response.rfind("]") + 1
-            return json.loads(response[start:end])
-        if "{" in response:
-            start, end = response.find("{"), response.rfind("}") + 1
-            return json.loads(response[start:end])
-    except Exception:
-        return None
+    # After stripping thinking tags, also strip any residual chain-of-thought
+    # that may not be inside formal <think> tags (reasoning models sometimes
+    # emit plain-text reasoning before the JSON).
+    cleaned = response
+    # Find all JSON blocks (object or array) in the response.
+    # Track (start, end, parsed_value) so we can pick the outermost block.
+    json_blocks: list = []
+    # Try objects
+    for m in re.finditer(r'\{', cleaned):
+        start = m.start()
+        # Find matching closing brace from the end
+        end = cleaned.rfind('}', start)
+        if end > start:
+            candidate = cleaned[start:end + 1]
+            try:
+                parsed = json.loads(candidate)
+                json_blocks.append((start, end, parsed))
+            except Exception:
+                pass
+    # Try arrays
+    for m in re.finditer(r'\[', cleaned):
+        start = m.start()
+        end = cleaned.rfind(']', start)
+        if end > start:
+            candidate = cleaned[start:end + 1]
+            try:
+                parsed = json.loads(candidate)
+                json_blocks.append((start, end, parsed))
+            except Exception:
+                pass
+    if json_blocks:
+        # Prefer the outermost block (smallest start, largest end span).
+        # When spans are equal (same block found as both dict and array),
+        # prefer the one found later (array closing bracket tends to be
+        # more reliable for arrays wrapping dicts).
+        outermost = max(json_blocks, key=lambda b: (b[1] - b[0], -b[0]))
+        return outermost[2]
     return None
 
 
